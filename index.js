@@ -1,4 +1,4 @@
-    const express = require("express");
+const express = require("express");
 const app = express();
 
 app.use(express.urlencoded({ extended: false }));
@@ -48,7 +48,7 @@ async function claudeReply(phone, customerMessage) {
 SHOP: Circle, near Benz Gate. Hours: Mon-Sat 8am-6pm.
 PRICES: A4=GHS 3.20, A3=GHS 6.40, A2=GHS 16.00 per sheet.
 PAYMENT: MTN MoMo 0552719245 (Kow Habib Baisie).
-RULES: Be friendly. Understand Ghanaian Pidgin. Keep replies under 150 words. Guide customers to order. Never say you are AI. To order send size + quantity e.g "50 A4".`,
+RULES: Be friendly. Understand Ghanaian Pidgin. Keep replies under 150 words. Guide customers to order. Never say you are AI. To order send size and quantity e.g 50 A4.`,
         messages: history
       })
     });
@@ -69,16 +69,16 @@ RULES: Be friendly. Understand Ghanaian Pidgin. Keep replies under 150 words. Gu
 function smartFallback(msg) {
   const m = msg.toLowerCase();
   if (m.match(/price|cost|how much|charge|rate/))
-    return "📋 *Our DTF Prices:*\n• A4 → GHS 3.20\n• A3 → GHS 6.40\n• A2 → GHS 16.00\n\nSend order like _\"50 A4\"_ ✅";
+    return "Our DTF Prices: A4 GHS 3.20, A3 GHS 6.40, A2 GHS 16.00. Send order like 50 A4";
   if (m.match(/location|where|address/))
-    return "📍 *MIGO PRINT SHOP*\nCircle, near Benz Gate 😊";
+    return "MIGO PRINT SHOP - Circle, near Benz Gate";
   if (m.match(/time|open|hours/))
-    return "🕐 Mon–Sat: 8am–6pm\nSunday: Closed";
+    return "Mon-Sat 8am-6pm. Sunday Closed.";
   if (m.match(/dtf|print|do you|services/))
-    return "✅ Yes! We do *DTF printing* on all fabrics!\n\n• A4 → GHS 3.20\n• A3 → GHS 6.40\n• A2 → GHS 16.00\n\nSend _\"50 A4\"_ to order! 💪";
+    return "Yes! We do DTF printing on all fabrics! A4 GHS 3.20, A3 GHS 6.40, A2 GHS 16.00. Send 50 A4 to order!";
   if (m.match(/pay|momo|payment|account/))
-    return "📲 *MTN MoMo:*\n📱 *0552719245*\n👤 *Kow Habib Baisie*\n\nSend receipt after payment 🙏";
-  return "👋 Welcome to *MIGO PRINT SHOP!*\n📍 Circle, near Benz Gate\n\n📋 Prices:\n• A4 → GHS 3.20\n• A3 → GHS 6.40\n• A2 → GHS 16.00\n\nSend order like _\"50 A4\"_ ✅";
+    return "MTN MoMo: 0552719245 (Kow Habib Baisie). Send receipt after payment.";
+  return "Welcome to MIGO PRINT SHOP! Circle, near Benz Gate. Prices: A4 GHS 3.20, A3 GHS 6.40, A2 GHS 16.00. Send order like 50 A4";
 }
 
 function parseOrder(text) {
@@ -105,22 +105,19 @@ function parseOrder(text) {
 function buildBill(items, phone) {
   const total = items.reduce((sum, i) => sum + (i.qty * CONFIG.PRICES[i.size]), 0);
   const itemsStr = items.map(i => `${i.qty} x ${i.size}`).join(", ");
-  let bill = "🧾 *MIGO PRINT SHOP — INVOICE*\n";
-  bill += "━━━━━━━━━━━━━━━━━━━━━━\n";
+  let bill = "MIGO PRINT SHOP - INVOICE\n";
+  bill += "------------------------\n";
   for (const item of items) {
     const sub = item.qty * CONFIG.PRICES[item.size];
-    bill += `📄 ${item.qty} x ${item.size} sheets\n`;
-    bill += `   @ GHS ${CONFIG.PRICES[item.size].toFixed(2)} = *GHS ${sub.toFixed(2)}*\n`;
+    bill += `${item.qty} x ${item.size} @ GHS ${CONFIG.PRICES[item.size].toFixed(2)} = GHS ${sub.toFixed(2)}\n`;
   }
-  bill += "━━━━━━━━━━━━━━━━━━━━━━\n";
-  bill += `💰 *TOTAL: GHS ${total.toFixed(2)}*\n\n`;
-  bill += "📲 *Pay via MTN MoMo* 🟡\n";
-  bill += "━━━━━━━━━━━━━━━━━━━━━━\n";
-  bill += `   📱 *${CONFIG.MOMO}*\n`;
-  bill += `   👤 *${CONFIG.MOMO_NAME}*\n`;
-  bill += "━━━━━━━━━━━━━━━━━━━━━━\n\n";
-  bill += "📩 Send your receipt after payment to confirm.\n\n";
-  bill += "Thank you for choosing *MIGO PRINT SHOP!* 🙏";
+  bill += "------------------------\n";
+  bill += `TOTAL: GHS ${total.toFixed(2)}\n\n`;
+  bill += `Pay via MTN MoMo:\n`;
+  bill += `Number: ${CONFIG.MOMO}\n`;
+  bill += `Name: ${CONFIG.MOMO_NAME}\n\n`;
+  bill += "Send your receipt after payment to confirm.\n";
+  bill += "Thank you for choosing MIGO PRINT SHOP!";
   orders.set(phone, { items, total, itemsStr, paid: false, createdAt: Date.now() });
   scheduleReminders(phone, total);
   return bill;
@@ -128,9 +125,9 @@ function buildBill(items, phone) {
 
 function scheduleReminders(phone, total) {
   [
-    { min: 10, msg: `⏰ *Payment Reminder*\n\nYour order of *GHS ${total.toFixed(2)}* is awaiting payment.\n\n📱 MoMo: *${CONFIG.MOMO}*\n👤 ${CONFIG.MOMO_NAME}\n\nSend receipt after payment. 🙏` },
-    { min: 30, msg: `⚠️ *Second Reminder*\n\nPayment of *GHS ${total.toFixed(2)}* not received.\n\nPay to *${CONFIG.MOMO}* and send receipt.` },
-    { min: 60, msg: `🚨 *Final Reminder*\n\nYour order will be cancelled without payment.\n\nPay *GHS ${total.toFixed(2)}* to MoMo: *${CONFIG.MOMO}* now!` }
+    { min: 10, msg: `Payment Reminder: Your order of GHS ${total.toFixed(2)} is awaiting payment. MoMo: ${CONFIG.MOMO} (${CONFIG.MOMO_NAME}). Send receipt after payment.` },
+    { min: 30, msg: `Second Reminder: Payment of GHS ${total.toFixed(2)} not received. Pay to ${CONFIG.MOMO} and send receipt.` },
+    { min: 60, msg: `Final Reminder: Your order will be cancelled without payment. Pay GHS ${total.toFixed(2)} to MoMo: ${CONFIG.MOMO} now!` }
   ].forEach(({ min, msg }) => {
     setTimeout(async () => {
       const order = orders.get(phone);
@@ -161,6 +158,10 @@ function isReceipt(msg) {
   return !!msg.toLowerCase().match(/paid|payment|sent|transferred|momo|receipt|done|proof|i paid|i have paid|confirm/);
 }
 
+function xml(msg) {
+  return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${msg}</Message></Response>`;
+}
+
 app.post("/webhook", async (req, res) => {
   res.set("Content-Type", "text/xml");
   const msg = (req.body.Body || "").trim();
@@ -169,26 +170,26 @@ app.post("/webhook", async (req, res) => {
   console.log(`MSG: ${from} - ${msg}`);
   try {
     if (numMedia > 0 && !isReceipt(msg)) {
-      return res.send(`✅ *Design File Received!*\n\n📁 File saved.\n\n⏳ Complete payment to proceed.\n\nTo order: _"50 A4"_ or _"20 A3"_ ✅`);
+      return res.send(xml("Design File Received! Your file has been saved. Complete payment to proceed. To order send: 50 A4 or 20 A3"));
     }
     if (isReceipt(msg)) {
       const order = orders.get(from);
       if (order && !order.paid) {
         order.paid = true;
-        await sendMsg(from, "🎉 Thank you for your payment!", "https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif");
-        return res.send(`✅ *Payment Confirmed!*\n\n🧾 Items: ${order.itemsStr}\n💰 GHS ${order.total.toFixed(2)}\n\n🖨️ Job in production!\nWe notify you when ready.\n\nThank you! *MIGO PRINT SHOP* 🙏`);
+        await sendMsg(from, "Thank you for your payment!", "https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif");
+        return res.send(xml(`Payment Confirmed! Items: ${order.itemsStr}. Amount: GHS ${order.total.toFixed(2)}. Your job is in production! We will notify you when ready. Thank you! MIGO PRINT SHOP`));
       }
-      return res.send(`✅ Receipt received! Team will confirm shortly.\n\n*MIGO PRINT SHOP* 🙏`);
+      return res.send(xml("Receipt received! Our team will confirm shortly. MIGO PRINT SHOP"));
     }
     const items = parseOrder(msg);
     if (items.length > 0) {
-      return res.send(`${buildBill(items, from)}`);
+      return res.send(xml(buildBill(items, from)));
     }
     const reply = await claudeReply(from, msg);
-    res.send(`${reply}`);
+    res.send(xml(reply));
   } catch (err) {
     console.log("Webhook error:", err.message);
-    res.send(`Sorry, something went wrong. Please try again. 🙏`);
+    res.send(xml("Sorry, something went wrong. Please try again."));
   }
 });
 
@@ -205,10 +206,10 @@ app.post("/momo", async (req, res) => {
       if (order && !order.paid) {
         if (amount >= order.total) {
           order.paid = true;
-          await sendMsg(phone, "✅ *Payment Confirmed!*\n\n🖨️ Job in production!\nWe notify you when ready. 🙏");
+          await sendMsg(phone, "Payment Confirmed! Your job is in production! We will notify you when ready. Thank you!");
         } else {
           const balance = order.total - amount;
-          await sendMsg(phone, `⚠️ *Partial Payment*\nPaid: GHS ${amount.toFixed(2)}\nBalance: GHS ${balance.toFixed(2)}\n\nPay remaining to: *${CONFIG.MOMO}*`);
+          await sendMsg(phone, `Partial Payment received. Paid: GHS ${amount.toFixed(2)}. Balance: GHS ${balance.toFixed(2)}. Pay remaining to: ${CONFIG.MOMO}`);
         }
       }
     }
@@ -217,31 +218,16 @@ app.post("/momo", async (req, res) => {
 });
 
 app.get("/jobs", (req, res) => {
-  let html = `
-🖨️ MIGO PRINT SHOP
-
-${orders.size} orders
-
-`;
+  let html = "<html><head><title>MIGO Jobs</title><meta name='viewport' content='width=device-width,initial-scale=1'><style>body{font-family:Arial;padding:15px;background:#f5f5f5;}h1{color:#ff6600;}.job{background:#fff;padding:12px;margin:8px 0;border-radius:8px;}</style></head><body>";
+  html += `<h1>MIGO PRINT SHOP</h1><p>${orders.size} orders</p>`;
   orders.forEach((o, phone) => {
-    html += `
-${phone.replace("whatsapp:+","")}
-${o.itemsStr}
-GHS ${o.total.toFixed(2)}
-${o.paid?"✅ PAID":"⏳ PENDING"}
-`;
+    html += `<div class='job'><strong>${phone.replace("whatsapp:+","")}</strong><br>${o.itemsStr}<br>GHS ${o.total.toFixed(2)}<br>${o.paid ? "PAID" : "PENDING"}</div>`;
   });
-  html += ``;
+  html += "</body></html>";
   res.send(html);
 });
 
-app.get("/", (req, res) => res.send(`
-🖨️ MIGO PRINT SHOP
-
-✅ Running with Claude AI
-
-📋 View Jobs`));
+app.get("/", (req, res) => res.send("<html><body style='font-family:Arial;padding:20px;text-align:center;'><h2>MIGO PRINT SHOP</h2><p style='color:green;'>Running with Claude AI</p><a href='/jobs' style='background:#ff6600;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;'>View Jobs</a></body></html>"));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 MIGO PRINT SHOP running on port ${PORT}`));
-                  
+app.listen(PORT, () => console.log(`MIGO PRINT SHOP running on port ${PORT}`));
