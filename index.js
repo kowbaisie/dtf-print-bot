@@ -82,25 +82,7 @@ async function claudeReply(phone, customerMessage) {
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
         max_tokens: 400,
-        system: `You are a professional WhatsApp customer service assistant for MIGO PRINT SHOP, a DTF printing business in Accra, Ghana.
-SHOP INFO:
-- Name: MIGO PRINT SHOP
-- Location: Circle branch, near Benz Gate, closer to Calvary Church
-- Hours: Monday-Saturday 8am-6pm, Sunday closed
-- Service: DTF (Direct to Film) printing on all fabrics
-PRICES:
-- A4 = GHS 3.20 per sheet
-- A3 = GHS 6.40 per sheet
-- A2 = GHS 16.00 per sheet
-PAYMENT: MTN MoMo 0552719245 (Kow Habib Baisie)
-PERSONALITY:
-- Professional but friendly
-- Understand Ghanaian Pidgin (boss, chaley, dey, abeg, saa etc)
-- No greetings unless customer greets first
-- Keep replies SHORT and direct
-- Never reveal you are AI
-- Ask for clarification when unclear
-- Only give prices when asked`,
+        system: "You are a professional WhatsApp assistant for MIGO PRINT SHOP, a DTF printing business in Accra, Ghana.\nPRICES: A4=GHS 3.20, A3=GHS 6.40, A2=GHS 16.00\nLOCATION: Circle branch, near Benz Gate\nPAYMENT: MTN MoMo 0552719245 (Kow Habib Baisie)\nBe friendly, short, direct. Understand Ghanaian Pidgin. Never reveal you are AI.",
         messages: history
       })
     });
@@ -117,7 +99,7 @@ PERSONALITY:
 
 async function claudeCalculate(items, files) {
   try {
-    const itemList = Object.entries(items).map(([size, qty]) => `${qty} x ${size}`).join(", ");
+    const itemList = Object.entries(items).map(([size, qty]) => qty + " x " + size).join(", ");
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -128,24 +110,19 @@ async function claudeCalculate(items, files) {
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
         max_tokens: 500,
-        system: `You are a precise calculator for MIGO PRINT SHOP DTF printing.
-PRICES: A4=GHS 3.20, A3=GHS 6.40, A2=GHS 16.00 per sheet.
-Calculate accurately. Double check your math. Return ONLY JSON.`,
+        system: "You are a calculator for MIGO PRINT SHOP. PRICES: A4=GHS 3.20, A3=GHS 6.40, A2=GHS 16.00. Return ONLY valid JSON.",
         messages: [{
           role: "user",
-          content: `Calculate this order:
-Items: ${itemList}
-Files: ${files.join(", ")}
-Return JSON only:
-{"items":[{"size":"A4","qty":20,"unitPrice":3.20,"subtotal":64.00}],"total":64.00,"itemsStr":"20 x A4","verified":true}`
+          content: "Calculate: " + itemList + ". Return JSON: {items:[{size,qty,unitPrice,subtotal}],total,itemsStr}"
         }]
       })
     });
     const data = await response.json();
     if (data.error || !data.content) return null;
     const text = data.content[0].text;
-    const jsonMatch = text.match(/{[sS]*}/);
-    if (jsonMatch) return JSON.parse(jsonMatch[0]);
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start !== -1 && end !== -1) return JSON.parse(text.slice(start, end + 1));
     return null;
   } catch (err) {
     console.log("Calculate error:", err.message);
@@ -157,13 +134,30 @@ function parseOrder(text) {
   if (!text) return {};
   const msg = text.toLowerCase();
   const totals = {};
-  const patterns = [/(d+)s*x?s*(a[234])/gi, /(a[234])s*x?s*(d+)/gi];
-  for (const pattern of patterns) {
-    let match;
-    while ((match = pattern.exec(msg)) !== null) {
-      let qty, size;
-      if (/^d+$/.test(match[1])) { qty = parseInt(match[1]); size = match[2].toUpperCase(); }
-      else { size = match[1].toUpperCase(); qty = parseInt(match[2]); }
+  const words = msg.split(/\s+/);
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    const next = words[i + 1] || "";
+    if (/^\d+$/.test(w) && /^a[234]$/.test(next)) {
+      const qty = parseInt(w);
+      const size = next.toUpperCase();
+      if (CONFIG.PRICES[size] && qty > 0) totals[size] = (totals[size] || 0) + qty;
+    }
+    if (/^a[234]$/.test(w) && /^\d+$/.test(next)) {
+      const size = w.toUpperCase();
+      const qty = parseInt(next);
+      if (CONFIG.PRICES[size] && qty > 0) totals[size] = (totals[size] || 0) + qty;
+    }
+    const m1 = w.match(/^(\d+)x?(a[234])$/);
+    if (m1) {
+      const qty = parseInt(m1[1]);
+      const size = m1[2].toUpperCase();
+      if (CONFIG.PRICES[size] && qty > 0) totals[size] = (totals[size] || 0) + qty;
+    }
+    const m2 = w.match(/^(a[234])x?(\d+)$/);
+    if (m2) {
+      const size = m2[1].toUpperCase();
+      const qty = parseInt(m2[2]);
       if (CONFIG.PRICES[size] && qty > 0) totals[size] = (totals[size] || 0) + qty;
     }
   }
@@ -171,49 +165,40 @@ function parseOrder(text) {
 }
 
 function mergeItems(a, b) {
-  const result = { ...a };
-  for (const [size, qty] of Object.entries(b)) result[size] = (result[size] || 0) + qty;
+  const result = Object.assign({}, a);
+  for (const size in b) result[size] = (result[size] || 0) + b[size];
   return result;
 }
 
 function calcReadyTime(items) {
   const a4eq = (items.A4 || 0) + ((items.A3 || 0) * 2) + ((items.A2 || 0) * 4);
   const now = new Date();
-  let hoursNeeded;
-  if (a4eq <= 50) hoursNeeded = 2;
-  else if (a4eq <= 100) hoursNeeded = 3;
-  else if (a4eq <= 200) hoursNeeded = 4;
-  else if (a4eq <= 400) hoursNeeded = 6;
-  else if (a4eq <= 800) hoursNeeded = 8;
-  else hoursNeeded = 24;
-  const readyTime = new Date(now.getTime() + hoursNeeded * 60 * 60 * 1000);
-  const readyHour = readyTime.getHours();
-  if (readyHour >= 18 || readyHour < 8) return "Tomorrow by 12:00 PM";
-  const period = readyHour >= 12 ? "PM" : "AM";
-  const displayHour = readyHour > 12 ? readyHour - 12 : readyHour;
-  const mins = readyTime.getMinutes();
-  const minsStr = mins > 0 ? `:${String(mins).padStart(2, "0")}` : "";
-  if (readyTime.getDate() === now.getDate()) return `Today by ${displayHour}${minsStr}${period}`;
-  return `Tomorrow by ${displayHour}${minsStr}${period}`;
+  let h = a4eq <= 50 ? 2 : a4eq <= 100 ? 3 : a4eq <= 200 ? 4 : a4eq <= 400 ? 6 : a4eq <= 800 ? 8 : 24;
+  const ready = new Date(now.getTime() + h * 3600000);
+  const rh = ready.getHours();
+  if (rh >= 18 || rh < 8) return "Tomorrow by 12:00 PM";
+  const period = rh >= 12 ? "PM" : "AM";
+  const dh = rh > 12 ? rh - 12 : rh;
+  const mins = ready.getMinutes();
+  const ms = mins > 0 ? ":" + String(mins).padStart(2, "0") : "";
+  return (ready.getDate() === now.getDate() ? "Today" : "Tomorrow") + " by " + dh + ms + period;
 }
 
-function buildBill(calcResult) {
-  const { items, total } = calcResult;
-  let bill = "👋 Hello!\n\n🧾 *YOUR DTF PRINT BILL*\n━━━━━━━━━━━━━━━━━━━━━━\n";
-  for (const item of items) bill += `📄 ${item.qty} x ${item.size} @ GHS ${item.unitPrice.toFixed(2)} = *GHS ${item.subtotal.toFixed(2)}*\n`;
-  bill += `━━━━━━━━━━━━━━━━━━━━━━\n💰 *TOTAL: GHS ${total.toFixed(2)}*\n\n📲 *Pay via MTN MoMo* 🟡\n━━━━━━━━━━━━━━━━━━━━━━\n   📱 Number: *${CONFIG.MOMO}*\n   👤 Name: *${CONFIG.MOMO_NAME}*\n━━━━━━━━━━━━━━━━━━━━━━\n\n📩 Please send your payment receipt to *COMPLETE* and *SPEED UP* your order 🚀🙏`;
-  return bill;
+function buildBill(r) {
+  let b = "\u{1F44B} Hello!\n\n\u{1F9FE} *YOUR DTF PRINT BILL*\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n";
+  for (const item of r.items) b += "\u{1F4C4} " + item.qty + " x " + item.size + " @ GHS " + item.unitPrice.toFixed(2) + " = *GHS " + item.subtotal.toFixed(2) + "*\n";
+  b += "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u{1F4B0} *TOTAL: GHS " + r.total.toFixed(2) + "*\n\n\u{1F4F2} *Pay via MTN MoMo*\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n   \u{1F4F1} Number: *" + CONFIG.MOMO + "*\n   \u{1F464} Name: *" + CONFIG.MOMO_NAME + "*\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n\u{1F4E9} Send receipt to *COMPLETE* your order \u{1F680}\u{1F64F}";
+  return b;
 }
 
-function buildSummary(calcResult) {
-  const { items, total } = calcResult;
-  let summary = "📋 *ORDER SUMMARY*\n━━━━━━━━━━━━━━━━━━━━━━\n";
-  for (const item of items) summary += `📄 ${item.qty} x ${item.size} = GHS ${item.subtotal.toFixed(2)}\n`;
-  summary += `━━━━━━━━━━━━━━━━━━━━━━\n💰 *TOTAL: GHS ${total.toFixed(2)}*\n\n✅ Please *confirm* this order to proceed.\n❌ Or let us know if you need any changes.`;
-  return summary;
+function buildSummary(r) {
+  let s = "\u{1F4CB} *ORDER SUMMARY*\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n";
+  for (const item of r.items) s += "\u{1F4C4} " + item.qty + " x " + item.size + " = GHS " + item.subtotal.toFixed(2) + "\n";
+  s += "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u{1F4B0} *TOTAL: GHS " + r.total.toFixed(2) + "*\n\n\u2705 Please *confirm* this order.\n\u274C Or tell us if anything is wrong.";
+  return s;
 }
 
-// ✅ BUG FIXED: removed broken "to !== from"
+// BUG FIXED: removed broken "to !== from"
 async function sendMsg(to, body, mediaUrl) {
   if (!BOT_ACTIVE) return;
   const params = new URLSearchParams();
@@ -222,34 +207,26 @@ async function sendMsg(to, body, mediaUrl) {
   params.append("Body", body);
   if (mediaUrl) params.append("MediaUrl", mediaUrl);
   try {
-    const response = await fetch(
-      `https://api.twilio.com/2010-04-01/Accounts/${CONFIG.TWILIO_SID}/Messages.json`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: "Basic " + Buffer.from(`${CONFIG.TWILIO_SID}:${CONFIG.TWILIO_TOKEN}`).toString("base64"),
-          "Content-Type": "application/x-www-form-urlencoded"
-        },
-        body: params
-      }
-    );
-    const result = await response.json();
-    if (result.error_code) console.log(`❌ Twilio error: ${result.error_message}`);
-    else console.log(`✅ Sent to ${to}: ${body.substring(0, 50)}...`);
+    const res = await fetch("https://api.twilio.com/2010-04-01/Accounts/" + CONFIG.TWILIO_SID + "/Messages.json", {
+      method: "POST",
+      headers: {
+        Authorization: "Basic " + Buffer.from(CONFIG.TWILIO_SID + ":" + CONFIG.TWILIO_TOKEN).toString("base64"),
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: params
+    });
+    const result = await res.json();
+    if (result.error_code) console.log("Twilio error:", result.error_message);
+    else console.log("Sent to " + to + ":", body.substring(0, 40));
   } catch (err) { console.log("Send error:", err.message); }
 }
 
 function scheduleReminders(phone, total) {
-  [
-    { min: 10, msg: `⏰ *Payment Reminder*\n\nYour order of *GHS ${total.toFixed(2)}* is awaiting payment.\n\n📱 MoMo: *${CONFIG.MOMO}*\n👤 ${CONFIG.MOMO_NAME}\n\n📩 Send your receipt to complete your order. 🙏` },
-    { min: 30, msg: `⚠️ *Second Reminder*\n\nYour payment of *GHS ${total.toFixed(2)}* has not been received.\n\nPay to: 📱 *${CONFIG.MOMO}* (${CONFIG.MOMO_NAME})\n\nSend receipt to proceed. 🙏` },
-    { min: 60, msg: `🚨 *Final Reminder*\n\nYour order will be *cancelled* if payment not received.\n\nPay *GHS ${total.toFixed(2)}* to:\n📱 *${CONFIG.MOMO}* (${CONFIG.MOMO_NAME}) now!\n\nThank you 🙏` }
-  ].forEach(({ min, msg }) => {
-    setTimeout(async () => {
-      const session = sessions.get(phone);
-      if (session && !session.paid) await sendMsg(phone, msg);
-    }, min * 60 * 1000);
-  });
+  const t = total.toFixed(2);
+  const m = CONFIG.MOMO, n = CONFIG.MOMO_NAME;
+  setTimeout(async () => { const s = sessions.get(phone); if (s && !s.paid) await sendMsg(phone, "Payment Reminder: GHS " + t + " pending. Pay to " + m + " (" + n + "). Send receipt to proceed."); }, 10 * 60000);
+  setTimeout(async () => { const s = sessions.get(phone); if (s && !s.paid) await sendMsg(phone, "Second Reminder: GHS " + t + " still pending. Pay to " + m + " (" + n + "). Send receipt."); }, 30 * 60000);
+  setTimeout(async () => { const s = sessions.get(phone); if (s && !s.paid) await sendMsg(phone, "FINAL REMINDER: Order will be cancelled. Pay GHS " + t + " to " + m + " (" + n + ") NOW!"); }, 60 * 60000);
 }
 
 function scheduleClarificationReminders(phone) {
@@ -259,30 +236,24 @@ function scheduleClarificationReminders(phone) {
   const remind = async () => {
     const s = sessions.get(phone);
     if (!s || s.unknownFiles.length === 0) return;
-    if (s.clarifyRemindersToday >= 5) {
-      s.clarificationDay++;
-      s.clarifyRemindersToday = 0;
-      if (s.clarificationDay >= 2) return;
-    }
+    if (s.clarifyRemindersToday >= 5) { s.clarificationDay++; s.clarifyRemindersToday = 0; if (s.clarificationDay >= 2) return; }
     s.clarificationCount++;
     s.clarifyRemindersToday++;
-    const fileList = s.unknownFiles.map(f => `📄 ${f}`).join("\n");
-    await sendMsg(phone, `📋 *Clarification Needed*\n\nWe still need size and quantity for:\n${fileList}\n\nReply e.g: _"logo1.png → 20 A4"_\n\nThank you! 🙏`);
-    const interval = s.clarificationCount <= 3 ? 5 * 60 * 1000 : 60 * 60 * 1000;
-    s.clarificationTimer = setTimeout(remind, interval);
+    const fl = s.unknownFiles.map(f => f).join(", ");
+    await sendMsg(phone, "Clarification needed for: " + fl + ". Please reply with size and quantity e.g: logo.png 20 A4");
+    s.clarificationTimer = setTimeout(remind, (s.clarificationCount <= 3 ? 5 : 60) * 60000);
   };
-  session.clarificationTimer = setTimeout(remind, 5 * 60 * 1000);
+  session.clarificationTimer = setTimeout(remind, 5 * 60000);
 }
 
 async function processBill(phone) {
   const session = getSession(phone);
   clearTimers(session);
   if (Object.keys(session.knownItems).length === 0 && session.unknownFiles.length === 0) return;
-  await sendMsg(phone, "📦 *Order received. Thank you!*\n\nWe will send you the cost shortly. ⏳");
+  await sendMsg(phone, "Order received! We will send you the cost shortly.");
   if (Object.keys(session.knownItems).length === 0) {
     if (session.unknownFiles.length > 0) {
-      const fileList = session.unknownFiles.map(f => `📄 ${f}`).join("\n");
-      await sendMsg(phone, `📋 *Clarification Needed*\n\nPlease provide size and quantity for:\n${fileList}\n\ne.g. _"logo1.png → 20 A4"_ 🙏`);
+      await sendMsg(phone, "Please provide size and quantity for: " + session.unknownFiles.join(", ") + ". e.g: logo.png 20 A4");
       scheduleClarificationReminders(phone);
     }
     return;
@@ -291,7 +262,7 @@ async function processBill(phone) {
   if (!calcResult) {
     const items = Object.entries(session.knownItems).map(([size, qty]) => ({ size, qty, unitPrice: CONFIG.PRICES[size], subtotal: qty * CONFIG.PRICES[size] }));
     const total = items.reduce((sum, i) => sum + i.subtotal, 0);
-    await sendSummaryAndBill(phone, { items, total, itemsStr: items.map(i => `${i.qty} x ${i.size}`).join(", ") }, session);
+    await sendSummaryAndBill(phone, { items, total, itemsStr: items.map(i => i.qty + " x " + i.size).join(", ") }, session);
     return;
   }
   await sendSummaryAndBill(phone, calcResult, session);
@@ -304,7 +275,7 @@ async function sendSummaryAndBill(phone, calcResult, session) {
   session.confirmTimer = setTimeout(async () => {
     const s = sessions.get(phone);
     if (s && s.phase === "CONFIRMING" && s.pendingBill) await sendBill(phone, s.pendingBill, s);
-  }, 5 * 60 * 1000);
+  }, 5 * 60000);
 }
 
 async function sendBill(phone, calcResult, session) {
@@ -314,74 +285,74 @@ async function sendBill(phone, calcResult, session) {
   session.phase = "WAITING_RECEIPT";
   await sendMsg(phone, buildBill(calcResult));
   if (session.unknownFiles.length > 0) {
-    const fileList = session.unknownFiles.map(f => `📄 ${f}`).join("\n");
-    await sendMsg(phone, `⚠️ *Note:* These files were not included:\n${fileList}\n\nPlease clarify size/quantity. 🙏`);
+    await sendMsg(phone, "Note: These files were not included: " + session.unknownFiles.join(", ") + ". Please clarify size/quantity.");
     scheduleClarificationReminders(phone);
   }
   scheduleReminders(phone, calcResult.total);
 }
 
-function isFinished(msg) { return /(yes|yeah|yep|yh|done|finish|finished|proceed|go ahead|send|okay|ok|fine|alright|sure|correct|right|that.?s all|thats all)/i.test(msg); }
-function isNo(msg) { return /(no|nope|nah|not yet|wait|still|more|adding|hold on)/i.test(msg); }
-function isConfirm(msg) { return /(yes|yeah|confirm|correct|right|ok|okay|proceed|go ahead|sure|fine|alright)/i.test(msg); }
+function isFinished(msg) {
+  return ["yes","yeah","yep","done","finish","finished","proceed","okay","ok","fine","alright","sure","correct","right"].some(w => msg.toLowerCase().includes(w));
+}
+function isNo(msg) {
+  return ["no","nope","nah","not yet","wait","still","more","adding","hold on"].some(w => msg.toLowerCase().includes(w));
+}
+function isConfirm(msg) {
+  return ["yes","yeah","confirm","correct","right","ok","okay","proceed","sure","fine","alright"].some(w => msg.toLowerCase().includes(w));
+}
 function isReceipt(msg, numMedia) {
   const m = msg.toLowerCase();
-  const payWords = /(paid|momo receipt|payment receipt|i have paid|payment done|i paid|receipt|transaction|confirm payment|transferred|sent payment)/;
-  const fileWords = /(sent files|uploaded|design|image files)/;
-  if (numMedia > 0 && !payWords.test(m)) return false;
-  if (fileWords.test(m) && !payWords.test(m)) return false;
-  return payWords.test(m);
+  const hasPay = ["paid","momo receipt","payment receipt","i have paid","payment done","i paid","receipt","transaction","confirm payment","transferred","sent payment"].some(w => m.includes(w));
+  const hasFile = ["sent files","uploaded","design","image files"].some(w => m.includes(w));
+  if (numMedia > 0 && !hasPay) return false;
+  if (hasFile && !hasPay) return false;
+  return hasPay;
 }
 
 async function handleAdmin(msg, from) {
   const m = msg.trim();
-  if (m === "h") { BOT_ACTIVE = false; await sendMsg(from, "🔴 *Bot STOPPED.*\nType *admin j* to restart."); return true; }
-  if (m === "j") { BOT_ACTIVE = true; await sendMsg(from, "🟢 *Bot STARTED.* Resuming all customer replies."); return true; }
+  if (m === "h") { BOT_ACTIVE = false; await sendMsg(from, "Bot STOPPED. Type admin j to restart."); return true; }
+  if (m === "j") { BOT_ACTIVE = true; await sendMsg(from, "Bot STARTED. Resuming customer replies."); return true; }
   if (m.startsWith("override ")) {
     const parts = m.split(" ");
-    const customerPhone = `whatsapp:+233${parts[1].replace(/^0/, "")}`;
-    const customMsg = parts.slice(2).join(" ");
-    await sendMsg(customerPhone, customMsg);
-    await sendMsg(from, `✅ Sent to ${parts[1]}: "${customMsg}"`);
+    const cp = "whatsapp:+233" + parts[1].replace(/^0/, "");
+    const cm = parts.slice(2).join(" ");
+    await sendMsg(cp, cm);
+    await sendMsg(from, "Sent to " + parts[1] + ": " + cm);
     return true;
   }
   if (m.startsWith("info ")) {
     const parts = m.split(" ");
-    const customerPhone = `whatsapp:+233${parts[1].replace(/^0/, "")}`;
+    const cp = "whatsapp:+233" + parts[1].replace(/^0/, "");
     const info = parts.slice(2).join(" ");
-    const session = getSession(customerPhone);
+    const session = getSession(cp);
     const newItems = parseOrder(info);
     if (Object.keys(newItems).length > 0) {
       session.knownItems = mergeItems(session.knownItems, newItems);
       session.unknownFiles = [];
       clearTimers(session);
-      await processBill(customerPhone);
-      await sendMsg(from, `✅ Info added for ${parts[1]}. Bill recalculated.`);
+      await processBill(cp);
+      await sendMsg(from, "Info added for " + parts[1] + ". Bill recalculated.");
     } else {
-      await sendMsg(from, `⚠️ Could not parse: "${info}". Try: "admin info 0244123456 20 A4"`);
+      await sendMsg(from, "Could not parse: " + info + ". Try: admin info 0244123456 20 A4");
     }
     return true;
   }
   if (m.startsWith("ready ")) {
     const parts = m.split(" ");
-    const customerPhone = `whatsapp:+233${parts[1].replace(/^0/, "")}`;
-    const session = getSession(customerPhone);
-    session.orderReady = true;
-    await sendMsg(customerPhone, `✅ *Your order is ready for pickup!* 🎉\n\n📍 *${CONFIG.SHOP_NAME}*\n${CONFIG.LOCATION}\n\nPlease come with your payment receipt. 🙏`);
-    setTimeout(async () => {
-      await sendMsg(customerPhone, `⭐ *How was your experience?*\n\n1️⃣ Poor\n2️⃣ Fair\n3️⃣ Good\n4️⃣ Very Good\n5️⃣ Excellent\n\nReply 1-5 😊`);
-      ratings.set(customerPhone, true);
-    }, 30 * 60 * 1000);
-    await sendMsg(from, `✅ Ready notification sent to ${parts[1]}.`);
+    const cp = "whatsapp:+233" + parts[1].replace(/^0/, "");
+    getSession(cp).orderReady = true;
+    await sendMsg(cp, "Your order is ready for pickup! Come to MIGO PRINT SHOP, " + CONFIG.LOCATION + ". Bring your receipt.");
+    setTimeout(async () => { await sendMsg(cp, "How was your experience? Rate us 1-5: 1=Poor 2=Fair 3=Good 4=Very Good 5=Excellent"); ratings.set(cp, true); }, 30 * 60000);
+    await sendMsg(from, "Ready notification sent to " + parts[1] + ".");
     return true;
   }
   if (m.startsWith("status ")) {
     const parts = m.split(" ");
-    const customerPhone = `whatsapp:+233${parts[1].replace(/^0/, "")}`;
-    const session = sessions.get(customerPhone);
-    if (session) {
-      await sendMsg(from, `📊 *Status for ${parts[1]}*\nPhase: ${session.phase}\nItems: ${JSON.stringify(session.knownItems)}\nUnknown: ${session.unknownFiles.length}\nTotal: GHS ${session.total}\nPaid: ${session.paid}`);
-    } else { await sendMsg(from, `No session for ${parts[1]}`); }
+    const cp = "whatsapp:+233" + parts[1].replace(/^0/, "");
+    const s = sessions.get(cp);
+    if (s) await sendMsg(from, "Status " + parts[1] + ": Phase=" + s.phase + " Items=" + JSON.stringify(s.knownItems) + " Total=" + s.total + " Paid=" + s.paid);
+    else await sendMsg(from, "No session for " + parts[1]);
     return true;
   }
   return false;
@@ -389,7 +360,7 @@ async function handleAdmin(msg, from) {
 
 function xml(msg) {
   if (!msg) return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
-  return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${msg}</Message></Response>`;
+  return '<?xml version="1.0" encoding="UTF-8"?><Response><Message>' + msg + '</Message></Response>';
 }
 
 app.post("/webhook", async (req, res) => {
@@ -399,8 +370,8 @@ app.post("/webhook", async (req, res) => {
   const from = req.body.From;
   const numMedia = parseInt(req.body.NumMedia || "0");
   const filenames = [];
-  for (let i = 0; i < numMedia; i++) filenames.push(req.body[`MediaFilename${i}`] || `file_${i + 1}`);
-  console.log(`📩 ${from} | "${msg}" | Media: ${numMedia} | Files: ${filenames.join(", ")}`);
+  for (let i = 0; i < numMedia; i++) filenames.push(req.body["MediaFilename" + i] || "file_" + (i + 1));
+  console.log("MSG from " + from + ": " + msg + " | media:" + numMedia);
   if (msg.toLowerCase().startsWith(CONFIG.ADMIN_KEY + " ")) {
     const handled = await handleAdmin(msg.substring(CONFIG.ADMIN_KEY.length + 1).trim(), from);
     if (handled) return;
@@ -412,28 +383,28 @@ app.post("/webhook", async (req, res) => {
     const rating = parseInt(msg);
     if (rating >= 1 && rating <= 5) {
       ratings.delete(from);
-      const responses = ["", "😔 *Sorry to hear that.* Tell us what went wrong. 🙏", "😔 *Sorry.* We will improve. 🙏", "🙏 *Thank you!* We will do better!", "😊 *Thank you!* We appreciate your feedback! 🙏", "🎉 *Thank you so much!* See you next time! 😊❤️"];
-      await sendMsg(from, responses[rating]);
+      const resp = ["","Sorry to hear that. Tell us what went wrong.","Sorry, we will improve.","Thank you! We will do better!","Thank you! We appreciate your feedback!","Thank you so much! See you next time!"];
+      await sendMsg(from, resp[rating]);
       return;
     }
   }
   if (isReceipt(msg, numMedia)) {
-    const amountMatch = msg.match(/GHS?s*([d,]+.?d*)/i);
-    if (amountMatch && session.total > 0) {
-      const paid = parseFloat(amountMatch[1].replace(",", ""));
+    const am = msg.match(/GHS[\s]*(\d+\.?\d*)/i);
+    if (am && session.total > 0) {
+      const paid = parseFloat(am[1]);
       if (paid < session.total) {
-        await sendMsg(from, `📩 *Receipt Received* ✅\n\n⚠️ Payment of *GHS ${paid.toFixed(2)}* is less than total *GHS ${session.total.toFixed(2)}*.\n\n❌ *Balance: GHS ${(session.total - paid).toFixed(2)}*\n\nPay balance to:\n📱 *${CONFIG.MOMO}* (${CONFIG.MOMO_NAME}) 🙏`);
+        await sendMsg(from, "Receipt received. Payment of GHS " + paid.toFixed(2) + " is less than total GHS " + session.total.toFixed(2) + ". Balance: GHS " + (session.total - paid).toFixed(2) + ". Pay balance to " + CONFIG.MOMO + ".");
         return;
       }
     }
-    await sendMsg(from, "📩 *Receipt Received!* ✅\n\nThank you! Processing your payment. 🙏\n\n*MIGO PRINT SHOP*");
+    await sendMsg(from, "Receipt received! Thank you. Processing your payment. MIGO PRINT SHOP.");
     return;
   }
   if (session.phase === "CONFIRMING" && session.pendingBill) {
     if (isConfirm(msg)) { clearTimers(session); await sendBill(from, session.pendingBill, session); session.pendingBill = null; return; }
-    if (/(change|wrong|mistake|incorrect|different|update|modify|adjust|not right|error)/i.test(msg)) {
+    if (["change","wrong","mistake","incorrect","different","update","modify","error"].some(w => msg.toLowerCase().includes(w))) {
       clearTimers(session);
-      await sendMsg(from, "😊 *No problem!* Tell us what to change and we will recalculate. 🙏");
+      await sendMsg(from, "No problem! Tell us what to change and we will recalculate.");
       session.phase = "COLLECTING"; session.knownItems = {}; session.pendingBill = null; return;
     }
   }
@@ -454,8 +425,8 @@ app.post("/webhook", async (req, res) => {
     session.files.push(...filenames);
   }
   if (Object.keys(newItems).length > 0) {
-    const textItems = parseOrder(msg);
-    session.knownItems = mergeItems(session.knownItems, Object.keys(textItems).length > 0 ? textItems : newItems);
+    const ti = parseOrder(msg);
+    session.knownItems = mergeItems(session.knownItems, Object.keys(ti).length > 0 ? ti : newItems);
   }
   if (session.unknownFiles.length > 0 && Object.keys(newItems).length > 0) { session.unknownFiles = []; clearTimers(session); }
   session.phase = "COLLECTING";
@@ -469,44 +440,44 @@ function resetBillTimer(phone, session) {
     if (!s || s.phase !== "COLLECTING") return;
     if (Object.keys(s.knownItems).length === 0 && s.unknownFiles.length === 0 && s.files.length === 0) return;
     s.phase = "ASKED_FINISHED";
-    await sendMsg(phone, "🤔 Have you *finished sending*?\n\nReply *Yes* to get your bill or *No* to continue. 😊");
+    await sendMsg(phone, "Have you finished sending? Reply YES to get your bill or NO to continue.");
     s.billTimer = setTimeout(async () => {
       const s2 = sessions.get(phone);
       if (s2 && s2.phase === "ASKED_FINISHED") { s2.phase = "COLLECTING"; await processBill(phone); }
-    }, 2 * 60 * 1000);
-  }, 2 * 60 * 1000);
+    }, 2 * 60000);
+  }, 2 * 60000);
 }
 
 app.post("/momo", async (req, res) => {
   try {
     const sms = req.body.message || req.body.body || req.body.text || "";
-    const amountMatch = sms.match(/GHSs*([d,]+.?d*)/i);
-    const phoneMatch = sms.match(/(+?233d{9}|0d{9})/);
-    if (!amountMatch || !phoneMatch) return res.sendStatus(200);
-    const amount = parseFloat(amountMatch[1].replace(",", ""));
-    const phone = `whatsapp:+${phoneMatch[1].replace(/^0/, "233")}`;
+    const am = sms.match(/GHS[\s]*(\d+\.?\d*)/i);
+    const pm = sms.match(/(233\d{9}|0\d{9})/);
+    if (!am || !pm) return res.sendStatus(200);
+    const amount = parseFloat(am[1]);
+    const phone = "whatsapp:+" + pm[1].replace(/^0/, "233");
     const session = sessions.get(phone);
     if (!session) return res.sendStatus(200);
     if (amount >= session.total) {
       session.paid = true;
-      await sendMsg(phone, `✅ *PAYMENT CONFIRMED!* 🎉\n\n💰 Amount: *GHS ${amount.toFixed(2)}*\n📋 Items: ${session.itemsStr}\n\n🖨️ Job is *in production!*\n⏱️ *Ready:* ${calcReadyTime(session.knownItems)}\n📍 ${CONFIG.LOCATION}\n\nThank you for choosing *MIGO PRINT SHOP!* 🙏`);
+      await sendMsg(phone, "PAYMENT CONFIRMED! GHS " + amount.toFixed(2) + " received. Items: " + session.itemsStr + ". Job in production! Ready: " + calcReadyTime(session.knownItems) + ". Pickup: " + CONFIG.LOCATION + ". Thank you!");
     } else if (amount > 0) {
-      await sendMsg(phone, `⚠️ *Partial Payment*\n\n💰 Paid: *GHS ${amount.toFixed(2)}*\nTotal: *GHS ${session.total.toFixed(2)}*\n❌ Balance: *GHS ${(session.total - amount).toFixed(2)}*\n\nPay balance to:\n📱 *${CONFIG.MOMO}* (${CONFIG.MOMO_NAME}) 🙏`);
+      await sendMsg(phone, "Partial payment GHS " + amount.toFixed(2) + " received. Total: GHS " + session.total.toFixed(2) + ". Balance: GHS " + (session.total - amount).toFixed(2) + ". Pay balance to " + CONFIG.MOMO + ".");
     }
     res.sendStatus(200);
-  } catch (err) { console.log("MoMo error:", err.message); res.sendStatus(200); }
+  } catch (err) { res.sendStatus(200); }
 });
 
 app.get("/jobs", (req, res) => {
-  let html = `<html><head><title>MIGO Jobs</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font-family:Arial;padding:15px;background:#f5f5f5;}h1{color:#ff6600;}.job{background:#fff;padding:12px;margin:8px 0;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}.paid{color:green;font-weight:bold;}.pending{color:orange;font-weight:bold;}.collecting{color:blue;font-weight:bold;}</style></head><body><h1>🖨️ MIGO PRINT SHOP</h1><p>Bot: <strong style="color:${BOT_ACTIVE?'green':'red'}">${BOT_ACTIVE?'🟢 Active':'🔴 Paused'}</strong></p><p>${sessions.size} sessions</p>`;
+  let h = "<html><head><title>MIGO</title><meta name='viewport' content='width=device-width,initial-scale=1'><style>body{font-family:Arial;padding:15px;background:#f5f5f5;}h1{color:#f60;}.j{background:#fff;padding:12px;margin:8px 0;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,.1);}.p{color:green;font-weight:bold;}.w{color:orange;font-weight:bold;}.c{color:blue;font-weight:bold;}</style></head><body><h1>MIGO PRINT SHOP</h1><p>Bot: <b style='color:" + (BOT_ACTIVE?"green":"red") + "'>" + (BOT_ACTIVE?"Active":"Paused") + "</b></p><p>" + sessions.size + " sessions</p>";
   sessions.forEach((s, phone) => {
-    const items = Object.entries(s.knownItems).map(([sz,q])=>`${q}x${sz}`).join(", ");
-    html += `<div class="job"><strong>${phone.replace("whatsapp:+","")}</strong><br>Phase: <span class="${s.paid?'paid':s.phase==='COLLECTING'?'collecting':'pending'}">${s.phase}</span><br>Items: ${items||"none"}<br>${s.total>0?`Total: GHS ${s.total.toFixed(2)}<br>`:""}${s.unknownFiles.length>0?`⚠️ Unknown: ${s.unknownFiles.length}<br>`:""}Paid: ${s.paid?"✅ YES":"❌ NO"}</div>`;
+    const items = Object.entries(s.knownItems).map(([sz,q]) => q+"x"+sz).join(",");
+    h += "<div class='j'><b>" + phone.replace("whatsapp:+","") + "</b><br>Phase: " + s.phase + "<br>Items: " + (items||"none") + "<br>" + (s.total>0?"Total: GHS "+s.total.toFixed(2)+"<br>":"") + "Paid: " + (s.paid?"YES":"NO") + "</div>";
   });
-  res.send(html + "</body></html>");
+  res.send(h + "</body></html>");
 });
 
-app.get("/", (req, res) => res.send(`<html><body style="font-family:Arial;padding:20px;text-align:center;"><h2>🖨️ MIGO PRINT SHOP</h2><p>WhatsApp Bot v9 ✅</p><p style="color:${BOT_ACTIVE?'green':'red'};font-weight:bold;">${BOT_ACTIVE?'✅ Bot Active':'🔴 Bot Paused'}</p><a href="/jobs" style="background:#ff6600;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;">📋 View Dashboard</a></body></html>`));
+app.get("/", (req, res) => res.send("<html><body style='font-family:Arial;padding:20px;text-align:center'><h2>MIGO PRINT SHOP</h2><p>Bot v10</p><p style='color:" + (BOT_ACTIVE?"green":"red") + "'>" + (BOT_ACTIVE?"Active":"Paused") + "</p><a href='/jobs' style='background:#f60;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none'>View Jobs</a></body></html>"));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 MIGO PRINT SHOP v9 running on port ${PORT}`));
+app.listen(PORT, () => console.log("MIGO PRINT SHOP v10 running on port " + PORT));
