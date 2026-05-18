@@ -15,7 +15,7 @@ const CONFIG = {
   TWILIO_TOKEN: process.env.TWILIO_AUTH_TOKEN,
   TWILIO_NUMBER: "whatsapp:+14155238886",
   ANTHROPIC_KEY: process.env.ANTHROPIC_API_KEY,
-  ADMIN: "whatsapp:+233552719245",
+  ADMIN_KEY: "admin",
 };
 
 // ─── GLOBAL STATE ──────────────────────────────────────────────────────────
@@ -445,20 +445,20 @@ function isReceipt(msg, numMedia) {
 }
 
 // ─── ADMIN COMMANDS ────────────────────────────────────────────────────────
-async function handleAdmin(msg) {
+async function handleAdmin(msg, from) {
   const m = msg.trim();
 
   // STOP bot
   if (m === "h") {
     BOT_ACTIVE = false;
-    await sendMsg(CONFIG.ADMIN, "🔴 *Bot STOPPED.* All customer replies paused.\nType *j* to restart.");
+    await sendMsg(from, "🔴 *Bot STOPPED.* All customer replies paused.\nType *j* to restart.");
     return true;
   }
 
   // START bot
   if (m === "j") {
     BOT_ACTIVE = true;
-    await sendMsg(CONFIG.ADMIN, "🟢 *Bot STARTED.* Resuming all customer replies.");
+    await sendMsg(from, "🟢 *Bot STARTED.* Resuming all customer replies.");
     return true;
   }
 
@@ -468,7 +468,7 @@ async function handleAdmin(msg) {
     const customerPhone = `whatsapp:+233${parts[1].replace(/^0/, "")}`;
     const customMsg = parts.slice(2).join(" ");
     await sendMsg(customerPhone, customMsg);
-    await sendMsg(CONFIG.ADMIN, `✅ Message sent to ${parts[1]}: "${customMsg}"`);
+    await sendMsg(from, `✅ Message sent to ${parts[1]}: "${customMsg}"`);
     return true;
   }
 
@@ -485,9 +485,9 @@ async function handleAdmin(msg) {
       session.unknownFiles = [];
       clearTimers(session);
       await processBill(customerPhone);
-      await sendMsg(CONFIG.ADMIN, `✅ Info added for ${parts[1]}. Bill recalculated.`);
+      await sendMsg(from, `✅ Info added for ${parts[1]}. Bill recalculated.`);
     } else {
-      await sendMsg(CONFIG.ADMIN, `⚠️ Could not parse order from: "${info}". Try format: "info 0244123456 20 A4"`);
+      await sendMsg(from, `⚠️ Could not parse order from: "${info}". Try format: "admin info 0244123456 20 A4"`);
     }
     return true;
   }
@@ -514,7 +514,7 @@ async function handleAdmin(msg) {
       );
       ratings.set(customerPhone, true);
     }, 30 * 60 * 1000);
-    await sendMsg(CONFIG.ADMIN, `✅ Ready notification sent to ${parts[1]}.`);
+    await sendMsg(from, `✅ Ready notification sent to ${parts[1]}.`);
     return true;
   }
 
@@ -567,11 +567,11 @@ app.post("/webhook", async (req, res) => {
   console.log(`📩 ${from} | "${msg}" | Media: ${numMedia} | Files: ${filenames.join(", ")}`);
 
   // ── ADMIN COMMANDS ──
-  if (from === CONFIG.ADMIN) {
-    const handled = await handleAdmin(msg);
+  if (msg.toLowerCase().startsWith(CONFIG.ADMIN_KEY + " ")) {
+    const adminMsg = msg.substring(CONFIG.ADMIN_KEY.length + 1).trim();
+    const handled = await handleAdmin(adminMsg, from);
     if (handled) return;
-    // If not a command, admin is chatting — don't process as customer
-    return;
+    // Continue processing as customer if not a valid command
   }
 
   // ── BOT PAUSED ──
