@@ -833,5 +833,5 @@ app.get("/", (req, res) => res.send(`
 `));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 MIGO PRINT SHOP v7 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 MIGO PRINT SHOP v8 running on port ${PORT}`));
 
