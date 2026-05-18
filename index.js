@@ -269,7 +269,7 @@ function buildSummary(calcResult) {
 
 // ─── SEND MESSAGE ──────────────────────────────────────────────────────────
 async function sendMsg(to, body, mediaUrl) {
-  if (!BOT_ACTIVE && to !== CONFIG.ADMIN) return;
+  if (!BOT_ACTIVE && to !== from) return;
   const params = new URLSearchParams();
   params.append("From", CONFIG.TWILIO_NUMBER);
   params.append("To", to);
@@ -524,7 +524,7 @@ async function handleAdmin(msg, from) {
     const customerPhone = `whatsapp:+233${parts[1].replace(/^0/, "")}`;
     const session = sessions.get(customerPhone);
     if (session) {
-      await sendMsg(CONFIG.ADMIN,
+      await sendMsg(from,
         `📊 *Status for ${parts[1]}*\n` +
         `Phase: ${session.phase}\n` +
         `Items: ${JSON.stringify(session.knownItems)}\n` +
@@ -533,7 +533,7 @@ async function handleAdmin(msg, from) {
         `Paid: ${session.paid}`
       );
     } else {
-      await sendMsg(CONFIG.ADMIN, `No session found for ${parts[1]}`);
+      await sendMsg(from, `No session found for ${parts[1]}`);
     }
     return true;
   }
@@ -834,3 +834,4 @@ app.get("/", (req, res) => res.send(`
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 MIGO PRINT SHOP v7 running on port ${PORT}`));
+
