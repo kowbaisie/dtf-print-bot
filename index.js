@@ -1,10 +1,3 @@
-// ============================================================
-// MIGO DTF PRINT SHOP — WhatsApp Bot (v10)
-// Updates: greeting replies, summary confirmation, better bill
-// ============================================================
-
-const express = require('express');
-const twilio = require('twilio');
 const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
