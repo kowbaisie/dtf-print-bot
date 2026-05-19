@@ -1,595 +1,491 @@
-const express = require("express");
-const app = express();
+// ============================================================
+// MIGO DTF PRINT SHOP — WhatsApp Bot (Fixed v9)
+// Fix: proper TwiML responses + async Twilio API for delays
+// ============================================================
 
+const express = require('express');
+const twilio = require('twilio');
+const Anthropic = require('@anthropic-ai/sdk');
+
+const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-const CONFIG = {
-  SHOP_NAME: "MIGO PRINT SHOP",
-  LOCATION: "Circle branch, near Benz Gate, closer to Calvary Church",
-  MOMO: "0552719245",
-  MOMO_NAME: "Kow Habib Baisie",
-  PRICES: { A4: 3.20, A3: 6.40, A2: 16.00 },
-  TWILIO_SID: process.env.TWILIO_ACCOUNT_SID,
-  TWILIO_TOKEN: process.env.TWILIO_AUTH_TOKEN,
-  TWILIO_NUMBER: "whatsapp:+14155238886",
-  ANTHROPIC_KEY: process.env.ANTHROPIC_API_KEY,
-  ADMIN_KEY: "admin",
-};
+// ── Config ────────────────────────────────────────────────────
+const ACCOUNT_SID   = process.env.TWILIO_ACCOUNT_SID;
+const AUTH_TOKEN    = process.env.TWILIO_AUTH_TOKEN;
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const FROM_NUMBER   = 'whatsapp:+14155238886'; // Twilio sandbox
 
-const sessions = new Map();
-const conversations = new Map();
-const ratings = new Map();
-let BOT_ACTIVE = true;
+const client    = twilio(ACCOUNT_SID, AUTH_TOKEN);
+const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 
-function newSession() {
-  return {
-    phase: "COLLECTING",
-    knownItems: {},
-    unknownFiles: [],
-    files: [],
-    clarificationTimer: null,
-    clarificationCount: 0,
-    clarificationDay: 0,
-    clarifyRemindersToday: 0,
-    billTimer: null,
-    confirmTimer: null,
-    pendingBill: null,
-    total: 0,
-    itemsStr: "",
-    paid: false,
-    orderReady: false,
-    lastActivity: Date.now(),
-  };
-}
+// ── Prices ────────────────────────────────────────────────────
+const PRICES  = { A4: 3.20, A3: 6.40, A2: 16.00 };
+const A4_EQ   = { A4: 1,    A3: 2,    A2: 4    };
 
+// ── State ─────────────────────────────────────────────────────
+const sessions = new Map(); // phone -> session
+const timers   = new Map(); // phone -> { timerName: timeoutHandle }
+let   botActive = true;
+
+// ── Session helpers ───────────────────────────────────────────
 function getSession(phone) {
-  if (!sessions.has(phone)) sessions.set(phone, newSession());
+  if (!sessions.has(phone)) {
+    sessions.set(phone, {
+      phone,
+      files:               [],   // [{ size, qty, source }]
+      unknownFiles:        [],   // [{ name, url }]
+      state:               'receiving',
+      totalBill:           null,
+      a4eq:                0,
+      paymentReceived:     0,
+      unknownReminderCount: 0,
+      ratingAsked:         false,
+    });
+  }
   return sessions.get(phone);
 }
 
-function clearTimers(session) {
-  if (session.billTimer) clearTimeout(session.billTimer);
-  if (session.confirmTimer) clearTimeout(session.confirmTimer);
-  if (session.clarificationTimer) clearTimeout(session.clarificationTimer);
-  session.billTimer = null;
-  session.confirmTimer = null;
-  session.clarificationTimer = null;
+function clearTimers(phone) {
+  const t = timers.get(phone);
+  if (t) Object.values(t).forEach(h => h && clearTimeout(h));
+  timers.delete(phone);
 }
 
-function getHistory(phone) {
-  if (!conversations.has(phone)) conversations.set(phone, []);
-  return conversations.get(phone);
+function setTimer(phone, name, ms, fn) {
+  if (!timers.has(phone)) timers.set(phone, {});
+  const t = timers.get(phone);
+  if (t[name]) clearTimeout(t[name]);
+  t[name] = setTimeout(fn, ms);
 }
 
-function addToHistory(phone, role, content) {
-  const history = getHistory(phone);
-  history.push({ role, content });
-  if (history.length > 20) history.shift();
-}
-
-async function claudeReply(phone, customerMessage) {
+// ── Twilio sender (async, for delayed messages) ───────────────
+async function sendMsg(to, body) {
+  const dest = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
   try {
-    const history = getHistory(phone);
-    addToHistory(phone, "user", customerMessage);
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": CONFIG.ANTHROPIC_KEY,
-        "anthropic-version": "2023-06-01"
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 400,
-        system: "You are a professional WhatsApp customer service assistant for MIGO PRINT SHOP, a DTF printing business in Accra, Ghana.\nSHOP INFO:\n- Name: MIGO PRINT SHOP\n- Location: Circle branch, near Benz Gate, closer to Calvary Church\n- Hours: Monday-Saturday 8am-6pm, Sunday closed\n- Service: DTF (Direct to Film) printing on all fabrics\nPRICES:\n- A4 = GHS 3.20 per sheet\n- A3 = GHS 6.40 per sheet\n- A2 = GHS 16.00 per sheet\nPAYMENT: MTN MoMo 0552719245 (Kow Habib Baisie)\nPERSONALITY:\n- Professional but friendly\n- Understand Ghanaian Pidgin (boss, chaley, dey, abeg, saa etc)\n- No greetings unless customer greets first\n- Keep replies SHORT and direct\n- Never reveal you are AI\n- Ask for clarification when unclear\n- Only give prices when asked",
-        messages: history
-      })
+    const m = await client.messages.create({ from: FROM_NUMBER, to: dest, body });
+    console.log(`✅ Sent to ${dest}: "${body.slice(0, 60)}..."`);
+    return m.sid;
+  } catch (err) {
+    console.error(`❌ Send failed to ${dest}:`, err.message);
+  }
+}
+
+// ── Order parsing ─────────────────────────────────────────────
+function quickParse(text) {
+  // Fallback if Claude is unavailable
+  const upper = (text || '').toUpperCase();
+  const size  = ['A2','A3','A4'].find(s => upper.includes(s)) || null;
+  const match = text && text.match(/(\d+)/);
+  const qty   = match ? parseInt(match[1]) : null;
+  return { size, qty, isUnknown: !size || !qty, isMoreOf: null };
+}
+
+async function extractOrder(msg, filename, session) {
+  const prompt = `You are an order parser for a DTF print shop in Accra, Ghana.
+Extract print order info from the customer input below.
+
+Customer message: "${msg || ''}"
+Filename: "${filename || ''}"
+Existing items: ${JSON.stringify(session.files)}
+
+Rules:
+- Detect paper size: A4, A3, A2 only
+- Detect quantity (integer number of sheets/copies)
+- Customer text ALWAYS wins over filename
+- Words like "more", "add", "extra" mean add to same size
+- Ghanaian pidgin (boss, chaley, dey, abeg) is normal
+- Respond ONLY with valid JSON, no markdown, no extra text:
+  {"size":"A4|A3|A2|null","qty":number|null,"isUnknown":boolean,"isMoreOf":"A4|A3|A2|null"}
+- isUnknown=true when size OR qty cannot be determined
+- isMoreOf = size string if customer says "more" of an existing size, else null`;
+
+  try {
+    const r = await anthropic.messages.create({
+      model:      'claude-sonnet-4-20250514',
+      max_tokens: 150,
+      messages:   [{ role: 'user', content: prompt }],
     });
-    const data = await response.json();
-    if (data.error || !data.content) return null;
-    const reply = data.content[0].text;
-    addToHistory(phone, "assistant", reply);
-    return reply;
-  } catch (err) {
-    console.log("Claude error:", err.message);
-    return null;
+    const raw = r.content.map(c => c.text || '').join('').trim();
+    return JSON.parse(raw.replace(/```json|```/g, '').trim());
+  } catch (e) {
+    console.error('Claude parse error:', e.message, '— using fallback');
+    return quickParse(msg || filename);
   }
 }
 
-async function claudeCalculate(items, files) {
-  try {
-    const itemList = Object.entries(items).map(([size, qty]) => qty + " x " + size).join(", ");
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": CONFIG.ANTHROPIC_KEY,
-        "anthropic-version": "2023-06-01"
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 500,
-        system: "You are a precise calculator for MIGO PRINT SHOP DTF printing.\nPRICES: A4=GHS 3.20, A3=GHS 6.40, A2=GHS 16.00 per sheet.\nCalculate accurately. Double check your math. Return ONLY JSON.",
-        messages: [{
-          role: "user",
-          content: "Calculate this order:\nItems: " + itemList + "\nFiles: " + files.join(", ") + '\nReturn JSON only:\n{"items":[{"size":"A4","qty":20,"unitPrice":3.20,"subtotal":64.00}],"total":64.00,"itemsStr":"20 x A4","verified":true}'
-        }]
-      })
+// ── Bill builder ──────────────────────────────────────────────
+function calcBill(files) {
+  const totals = { A4: 0, A3: 0, A2: 0 };
+  for (const f of files) {
+    if (f.size && totals[f.size] !== undefined) totals[f.size] += f.qty || 0;
+  }
+  let subtotal = 0, a4eq = 0;
+  const lines = [];
+  for (const [size, qty] of Object.entries(totals)) {
+    if (qty > 0) {
+      const price = PRICES[size] * qty;
+      subtotal += price;
+      a4eq     += qty * A4_EQ[size];
+      lines.push(`${size}: ${qty} sheet${qty !== 1 ? 's' : ''} × GHS ${PRICES[size].toFixed(2)} = GHS ${price.toFixed(2)}`);
+    }
+  }
+  return { totals, lines, subtotal, a4eq };
+}
+
+function readyTime(a4eq) {
+  if (a4eq <= 50)  return '2 hours';
+  if (a4eq <= 100) return '3 hours';
+  if (a4eq <= 200) return '4 hours';
+  if (a4eq <= 400) return '6 hours';
+  if (a4eq <= 800) return '8 hours';
+  return 'Next day by 12pm';
+}
+
+function buildBill(session) {
+  const { lines, subtotal, a4eq } = calcBill(session.files);
+  const ready = readyTime(a4eq);
+  const now   = new Date().toLocaleString('en-GH', { timeZone: 'Africa/Accra' });
+
+  session.totalBill = subtotal;
+  session.a4eq      = a4eq;
+
+  return [
+    '━━━━━━━━━━━━━━━━━━',
+    '🧾 MIGO PRINT SHOP',
+    '📍 Circle – Near Benz Gate',
+    '━━━━━━━━━━━━━━━━━━',
+    'ORDER SUMMARY',
+    '',
+    ...lines,
+    '',
+    '━━━━━━━━━━━━━━━━━━',
+    `TOTAL: GHS ${subtotal.toFixed(2)}`,
+    '━━━━━━━━━━━━━━━━━━',
+    '💳 PAYMENT',
+    'MoMo: 0552719245',
+    'Name: Kow Habib Baisie',
+    '',
+    `⏱ Est. Ready: ${ready} after payment confirmed`,
+    `📅 Order Time: ${now}`,
+    '━━━━━━━━━━━━━━━━━━',
+    'Thank you for choosing Migo! 🙏',
+  ].join('\n');
+}
+
+// ── Order flow helpers ────────────────────────────────────────
+async function sendBill(phone, session) {
+  session.state = 'awaiting_payment';
+
+  await sendMsg(phone, 'Order received. Thank you. We will send you the cost soon. 🙏');
+
+  setTimeout(async () => {
+    const bill = buildBill(session);
+    await sendMsg(phone, bill);
+
+    // Payment reminders
+    setTimer(phone, 'pay1', 10 * 60 * 1000, () => {
+      if (session.state === 'awaiting_payment')
+        sendMsg(phone, `⏰ Reminder: Please pay GHS ${session.totalBill.toFixed(2)} to MoMo 0552719245 (Kow Habib Baisie) to confirm your order.`);
     });
-    const data = await response.json();
-    if (data.error || !data.content) return null;
-    const text = data.content[0].text;
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    if (start !== -1 && end !== -1) return JSON.parse(text.slice(start, end + 1));
-    return null;
-  } catch (err) {
-    console.log("Calculate error:", err.message);
-    return null;
-  }
+    setTimer(phone, 'pay2', 30 * 60 * 1000, () => {
+      if (session.state === 'awaiting_payment')
+        sendMsg(phone, `🔔 2nd reminder: GHS ${session.totalBill.toFixed(2)} still pending to 0552719245. Please don't lose your slot!`);
+    });
+    setTimer(phone, 'pay3', 60 * 60 * 1000, () => {
+      if (session.state === 'awaiting_payment')
+        sendMsg(phone, `⚠️ Final reminder: Please pay GHS ${session.totalBill.toFixed(2)} to MoMo 0552719245 to complete your order.`);
+    });
+  }, 2500);
 }
 
-// ✅ SAFE parseOrder - no regex backslash issues
-function parseOrder(text) {
-  if (!text) return {};
-  const msg = text.toLowerCase();
-  const totals = {};
-  const words = msg.split(/\s+/);
+function startReceiveTimer(phone, session) {
+  setTimer(phone, 'checkin', 2 * 60 * 1000, async () => {
+    if (session.state !== 'receiving') return;
+    session.state = 'asked_done';
+    await sendMsg(phone, 'Have you finished sending? 😊');
 
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i];
-    const next = words[i + 1] || "";
-
-    // "20 a4" or "20 a3"
-    if (/^\d+$/.test(w) && /^a[234]$/.test(next)) {
-      const qty = parseInt(w);
-      const size = next.toUpperCase();
-      if (CONFIG.PRICES[size] && qty > 0) totals[size] = (totals[size] || 0) + qty;
-    }
-
-    // "a4 20" or "a3 20"
-    if (/^a[234]$/.test(w) && /^\d+$/.test(next)) {
-      const size = w.toUpperCase();
-      const qty = parseInt(next);
-      if (CONFIG.PRICES[size] && qty > 0) totals[size] = (totals[size] || 0) + qty;
-    }
-
-    // "20xa4" or "20a4"
-    const m1 = w.match(/^(\d+)x?(a[234])$/);
-    if (m1) {
-      const qty = parseInt(m1[1]);
-      const size = m1[2].toUpperCase();
-      if (CONFIG.PRICES[size] && qty > 0) totals[size] = (totals[size] || 0) + qty;
-    }
-
-    // "a4x20" or "a420"
-    const m2 = w.match(/^(a[234])x?(\d+)$/);
-    if (m2) {
-      const size = m2[1].toUpperCase();
-      const qty = parseInt(m2[2]);
-      if (CONFIG.PRICES[size] && qty > 0) totals[size] = (totals[size] || 0) + qty;
-    }
-  }
-  return totals;
-}
-
-function mergeItems(a, b) {
-  const result = Object.assign({}, a);
-  for (const size in b) {
-    result[size] = (result[size] || 0) + b[size];
-  }
-  return result;
-}
-
-function calcReadyTime(items) {
-  const a4eq = (items.A4 || 0) + ((items.A3 || 0) * 2) + ((items.A2 || 0) * 4);
-  const now = new Date();
-  let hoursNeeded;
-  if (a4eq <= 50) hoursNeeded = 2;
-  else if (a4eq <= 100) hoursNeeded = 3;
-  else if (a4eq <= 200) hoursNeeded = 4;
-  else if (a4eq <= 400) hoursNeeded = 6;
-  else if (a4eq <= 800) hoursNeeded = 8;
-  else hoursNeeded = 24;
-  const readyTime = new Date(now.getTime() + hoursNeeded * 60 * 60 * 1000);
-  const readyHour = readyTime.getHours();
-  if (readyHour >= 18 || readyHour < 8) return "Tomorrow by 12:00 PM";
-  const period = readyHour >= 12 ? "PM" : "AM";
-  const displayHour = readyHour > 12 ? readyHour - 12 : readyHour;
-  const mins = readyTime.getMinutes();
-  const minsStr = mins > 0 ? ":" + String(mins).padStart(2, "0") : "";
-  if (readyTime.getDate() === now.getDate()) return "Today by " + displayHour + minsStr + period;
-  return "Tomorrow by " + displayHour + minsStr + period;
-}
-
-function buildBill(calcResult) {
-  const items = calcResult.items;
-  const total = calcResult.total;
-  let bill = "👋 Hello!\n\n🧾 *YOUR DTF PRINT BILL*\n━━━━━━━━━━━━━━━━━━━━━━\n";
-  for (const item of items) {
-    bill += "📄 " + item.qty + " x " + item.size + " @ GHS " + item.unitPrice.toFixed(2) + " = *GHS " + item.subtotal.toFixed(2) + "*\n";
-  }
-  bill += "━━━━━━━━━━━━━━━━━━━━━━\n";
-  bill += "💰 *TOTAL: GHS " + total.toFixed(2) + "*\n\n";
-  bill += "📲 *Pay via MTN MoMo* 🟡\n";
-  bill += "━━━━━━━━━━━━━━━━━━━━━━\n";
-  bill += "   📱 Number: *" + CONFIG.MOMO + "*\n";
-  bill += "   👤 Name: *" + CONFIG.MOMO_NAME + "*\n";
-  bill += "━━━━━━━━━━━━━━━━━━━━━━\n\n";
-  bill += "📩 Please send your payment receipt to *COMPLETE* and *SPEED UP* your order 🚀🙏";
-  return bill;
-}
-
-function buildSummary(calcResult) {
-  const items = calcResult.items;
-  const total = calcResult.total;
-  let summary = "📋 *ORDER SUMMARY*\n━━━━━━━━━━━━━━━━━━━━━━\n";
-  for (const item of items) {
-    summary += "📄 " + item.qty + " x " + item.size + " = GHS " + item.subtotal.toFixed(2) + "\n";
-  }
-  summary += "━━━━━━━━━━━━━━━━━━━━━━\n";
-  summary += "💰 *TOTAL: GHS " + total.toFixed(2) + "*\n\n";
-  summary += "✅ Please *confirm* this order to proceed.\n";
-  summary += "❌ Or let us know if you need any changes.";
-  return summary;
-}
-
-// ✅ BUG FIXED: removed broken "to !== from"
-async function sendMsg(to, body, mediaUrl) {
-  if (!BOT_ACTIVE) return;
-  const params = new URLSearchParams();
-  params.append("From", CONFIG.TWILIO_NUMBER);
-  params.append("To", to);
-  params.append("Body", body);
-  if (mediaUrl) params.append("MediaUrl", mediaUrl);
-  try {
-    const response = await fetch(
-      "https://api.twilio.com/2010-04-01/Accounts/" + CONFIG.TWILIO_SID + "/Messages.json",
-      {
-        method: "POST",
-        headers: {
-          Authorization: "Basic " + Buffer.from(CONFIG.TWILIO_SID + ":" + CONFIG.TWILIO_TOKEN).toString("base64"),
-          "Content-Type": "application/x-www-form-urlencoded"
-        },
-        body: params
-      }
-    );
-    const result = await response.json();
-    if (result.error_code) {
-      console.log("❌ Twilio error: " + result.error_message);
-    } else {
-      console.log("✅ Sent to " + to + ": " + body.substring(0, 50) + "...");
-    }
-  } catch (err) {
-    console.log("Send error:", err.message);
-  }
-}
-
-function scheduleReminders(phone, total) {
-  const r1 = "⏰ *Payment Reminder*\n\nYour order of *GHS " + total.toFixed(2) + "* is awaiting payment.\n\n📱 MoMo: *" + CONFIG.MOMO + "*\n👤 " + CONFIG.MOMO_NAME + "\n\n📩 Send your receipt to complete your order. 🙏";
-  const r2 = "⚠️ *Second Reminder*\n\nYour payment of *GHS " + total.toFixed(2) + "* has not been received.\n\nPay to: 📱 *" + CONFIG.MOMO + "* (" + CONFIG.MOMO_NAME + ")\n\nSend receipt to proceed. 🙏";
-  const r3 = "🚨 *Final Reminder*\n\nYour order will be *cancelled* if payment not received.\n\nPay *GHS " + total.toFixed(2) + "* to:\n📱 *" + CONFIG.MOMO + "* (" + CONFIG.MOMO_NAME + ") now!\n\nThank you 🙏";
-  setTimeout(async () => { const s = sessions.get(phone); if (s && !s.paid) await sendMsg(phone, r1); }, 10 * 60 * 1000);
-  setTimeout(async () => { const s = sessions.get(phone); if (s && !s.paid) await sendMsg(phone, r2); }, 30 * 60 * 1000);
-  setTimeout(async () => { const s = sessions.get(phone); if (s && !s.paid) await sendMsg(phone, r3); }, 60 * 60 * 1000);
-}
-
-function scheduleClarificationReminders(phone) {
-  const session = getSession(phone);
-  session.clarificationCount = 0;
-  session.clarifyRemindersToday = 0;
-  const remind = async () => {
-    const s = sessions.get(phone);
-    if (!s || s.unknownFiles.length === 0) return;
-    if (s.clarifyRemindersToday >= 5) {
-      s.clarificationDay++;
-      s.clarifyRemindersToday = 0;
-      if (s.clarificationDay >= 2) return;
-    }
-    s.clarificationCount++;
-    s.clarifyRemindersToday++;
-    const fileList = s.unknownFiles.map(f => "📄 " + f).join("\n");
-    await sendMsg(phone, "📋 *Clarification Needed*\n\nWe still need size and quantity for:\n" + fileList + "\n\nReply e.g: _\"logo1.png → 20 A4\"_\n\nThank you! 🙏");
-    const interval = s.clarificationCount <= 3 ? 5 * 60 * 1000 : 60 * 60 * 1000;
-    s.clarificationTimer = setTimeout(remind, interval);
-  };
-  session.clarificationTimer = setTimeout(remind, 5 * 60 * 1000);
-}
-
-async function processBill(phone) {
-  const session = getSession(phone);
-  clearTimers(session);
-  if (Object.keys(session.knownItems).length === 0 && session.unknownFiles.length === 0) return;
-  await sendMsg(phone, "📦 *Order received. Thank you!*\n\nWe will send you the cost shortly. ⏳");
-  if (Object.keys(session.knownItems).length === 0) {
-    if (session.unknownFiles.length > 0) {
-      const fileList = session.unknownFiles.map(f => "📄 " + f).join("\n");
-      await sendMsg(phone, "📋 *Clarification Needed*\n\nPlease provide size and quantity for:\n" + fileList + "\n\ne.g. _\"logo1.png → 20 A4\"_ 🙏");
-      scheduleClarificationReminders(phone);
-    }
-    return;
-  }
-  const calcResult = await claudeCalculate(session.knownItems, session.files);
-  if (!calcResult) {
-    const items = Object.entries(session.knownItems).map(([size, qty]) => ({
-      size, qty, unitPrice: CONFIG.PRICES[size], subtotal: qty * CONFIG.PRICES[size]
-    }));
-    const total = items.reduce((sum, i) => sum + i.subtotal, 0);
-    await sendSummaryAndBill(phone, { items, total, itemsStr: items.map(i => i.qty + " x " + i.size).join(", ") }, session);
-    return;
-  }
-  await sendSummaryAndBill(phone, calcResult, session);
-}
-
-async function sendSummaryAndBill(phone, calcResult, session) {
-  session.pendingBill = calcResult;
-  session.phase = "CONFIRMING";
-  await sendMsg(phone, buildSummary(calcResult));
-  session.confirmTimer = setTimeout(async () => {
-    const s = sessions.get(phone);
-    if (s && s.phase === "CONFIRMING" && s.pendingBill) await sendBill(phone, s.pendingBill, s);
-  }, 5 * 60 * 1000);
-}
-
-async function sendBill(phone, calcResult, session) {
-  clearTimers(session);
-  session.total = calcResult.total;
-  session.itemsStr = calcResult.itemsStr;
-  session.phase = "WAITING_RECEIPT";
-  await sendMsg(phone, buildBill(calcResult));
-  if (session.unknownFiles.length > 0) {
-    const fileList = session.unknownFiles.map(f => "📄 " + f).join("\n");
-    await sendMsg(phone, "⚠️ *Note:* These files were not included:\n" + fileList + "\n\nPlease clarify size/quantity. 🙏");
-    scheduleClarificationReminders(phone);
-  }
-  scheduleReminders(phone, calcResult.total);
-}
-
-function isFinished(msg) {
-  const m = msg.toLowerCase();
-  return ["yes","yeah","yep","yh","done","finish","finished","proceed","send","okay","ok","fine","alright","sure","correct","right"].some(w => m.includes(w));
-}
-
-function isNo(msg) {
-  const m = msg.toLowerCase();
-  return ["no","nope","nah","not yet","wait","still","more","adding","hold on"].some(w => m.includes(w));
-}
-
-function isConfirm(msg) {
-  const m = msg.toLowerCase();
-  return ["yes","yeah","confirm","correct","right","ok","okay","proceed","sure","fine","alright"].some(w => m.includes(w));
-}
-
-function isReceipt(msg, numMedia) {
-  const m = msg.toLowerCase();
-  const hasPay = ["paid","momo receipt","payment receipt","i have paid","payment done","i paid","receipt","transaction","confirm payment","transferred","sent payment"].some(w => m.includes(w));
-  const hasFile = ["sent files","uploaded","design","image files"].some(w => m.includes(w));
-  if (numMedia > 0 && !hasPay) return false;
-  if (hasFile && !hasPay) return false;
-  return hasPay;
-}
-
-async function handleAdmin(msg, from) {
-  const m = msg.trim();
-  if (m === "h") {
-    BOT_ACTIVE = false;
-    await sendMsg(from, "🔴 *Bot STOPPED.*\nType *admin j* to restart.");
-    return true;
-  }
-  if (m === "j") {
-    BOT_ACTIVE = true;
-    await sendMsg(from, "🟢 *Bot STARTED.* Resuming all customer replies.");
-    return true;
-  }
-  if (m.startsWith("override ")) {
-    const parts = m.split(" ");
-    const customerPhone = "whatsapp:+233" + parts[1].replace(/^0/, "");
-    const customMsg = parts.slice(2).join(" ");
-    await sendMsg(customerPhone, customMsg);
-    await sendMsg(from, "✅ Sent to " + parts[1] + ": \"" + customMsg + "\"");
-    return true;
-  }
-  if (m.startsWith("info ")) {
-    const parts = m.split(" ");
-    const customerPhone = "whatsapp:+233" + parts[1].replace(/^0/, "");
-    const info = parts.slice(2).join(" ");
-    const session = getSession(customerPhone);
-    const newItems = parseOrder(info);
-    if (Object.keys(newItems).length > 0) {
-      session.knownItems = mergeItems(session.knownItems, newItems);
-      session.unknownFiles = [];
-      clearTimers(session);
-      await processBill(customerPhone);
-      await sendMsg(from, "✅ Info added for " + parts[1] + ". Bill recalculated.");
-    } else {
-      await sendMsg(from, "⚠️ Could not parse: \"" + info + "\". Try: \"admin info 0244123456 20 A4\"");
-    }
-    return true;
-  }
-  if (m.startsWith("ready ")) {
-    const parts = m.split(" ");
-    const customerPhone = "whatsapp:+233" + parts[1].replace(/^0/, "");
-    const session = getSession(customerPhone);
-    session.orderReady = true;
-    await sendMsg(customerPhone, "✅ *Your order is ready for pickup!* 🎉\n\n📍 *" + CONFIG.SHOP_NAME + "*\n" + CONFIG.LOCATION + "\n\nPlease come with your payment receipt. 🙏");
-    setTimeout(async () => {
-      await sendMsg(customerPhone, "⭐ *How was your experience?*\n\n1️⃣ Poor\n2️⃣ Fair\n3️⃣ Good\n4️⃣ Very Good\n5️⃣ Excellent\n\nReply 1-5 😊");
-      ratings.set(customerPhone, true);
-    }, 30 * 60 * 1000);
-    await sendMsg(from, "✅ Ready notification sent to " + parts[1] + ".");
-    return true;
-  }
-  if (m.startsWith("status ")) {
-    const parts = m.split(" ");
-    const customerPhone = "whatsapp:+233" + parts[1].replace(/^0/, "");
-    const session = sessions.get(customerPhone);
-    if (session) {
-      await sendMsg(from, "📊 *Status for " + parts[1] + "*\nPhase: " + session.phase + "\nItems: " + JSON.stringify(session.knownItems) + "\nUnknown: " + session.unknownFiles.length + "\nTotal: GHS " + session.total + "\nPaid: " + session.paid);
-    } else {
-      await sendMsg(from, "No session for " + parts[1]);
-    }
-    return true;
-  }
-  return false;
-}
-
-function xml(msg) {
-  if (!msg) return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
-  return '<?xml version="1.0" encoding="UTF-8"?><Response><Message>' + msg + '</Message></Response>';
-}
-
-app.post("/webhook", async (req, res) => {
-  res.set("Content-Type", "text/xml");
-  res.send(xml(""));
-
-  const msg = (req.body.Body || "").trim();
-  const from = req.body.From;
-  const numMedia = parseInt(req.body.NumMedia || "0");
-  const filenames = [];
-  for (let i = 0; i < numMedia; i++) {
-    filenames.push(req.body["MediaFilename" + i] || "file_" + (i + 1));
-  }
-
-  console.log("📩 " + from + " | \"" + msg + "\" | Media: " + numMedia + " | Files: " + filenames.join(", "));
-
-  if (msg.toLowerCase().startsWith(CONFIG.ADMIN_KEY + " ")) {
-    const handled = await handleAdmin(msg.substring(CONFIG.ADMIN_KEY.length + 1).trim(), from);
-    if (handled) return;
-  }
-
-  if (!BOT_ACTIVE) return;
-
-  const session = getSession(from);
-  session.lastActivity = Date.now();
-
-  if (ratings.get(from)) {
-    const rating = parseInt(msg);
-    if (rating >= 1 && rating <= 5) {
-      ratings.delete(from);
-      const responses = ["", "😔 *Sorry to hear that.* Tell us what went wrong. 🙏", "😔 *Sorry.* We will improve. 🙏", "🙏 *Thank you!* We will do better!", "😊 *Thank you!* We appreciate your feedback! 🙏", "🎉 *Thank you so much!* See you next time! 😊❤️"];
-      await sendMsg(from, responses[rating]);
-      return;
-    }
-  }
-
-  if (isReceipt(msg, numMedia)) {
-    const amountMatch = msg.match(/GHS[\s]*([\d,]+\.?\d*)/i);
-    if (amountMatch && session.total > 0) {
-      const paid = parseFloat(amountMatch[1].replace(",", ""));
-      if (paid < session.total) {
-        const balance = session.total - paid;
-        await sendMsg(from, "📩 *Receipt Received* ✅\n\n⚠️ Payment of *GHS " + paid.toFixed(2) + "* is less than total *GHS " + session.total.toFixed(2) + "*.\n\n❌ *Balance: GHS " + balance.toFixed(2) + "*\n\nPay balance to:\n📱 *" + CONFIG.MOMO + "* (" + CONFIG.MOMO_NAME + ") 🙏");
-        return;
-      }
-    }
-    await sendMsg(from, "📩 *Receipt Received!* ✅\n\nThank you! Processing your payment. 🙏\n\n*MIGO PRINT SHOP*");
-    return;
-  }
-
-  if (session.phase === "CONFIRMING" && session.pendingBill) {
-    if (isConfirm(msg)) {
-      clearTimers(session);
-      await sendBill(from, session.pendingBill, session);
-      session.pendingBill = null;
-      return;
-    }
-    if (["change","wrong","mistake","incorrect","different","update","modify","adjust","not right","error"].some(w => msg.toLowerCase().includes(w))) {
-      clearTimers(session);
-      await sendMsg(from, "😊 *No problem!* Tell us what to change and we will recalculate. 🙏");
-      session.phase = "COLLECTING";
-      session.knownItems = {};
-      session.pendingBill = null;
-      return;
-    }
-  }
-
-  if (session.phase === "ASKED_FINISHED") {
-    if (isNo(msg)) { session.phase = "COLLECTING"; clearTimers(session); resetBillTimer(from, session); return; }
-    if (isFinished(msg)) { session.phase = "COLLECTING"; clearTimers(session); await processBill(from); return; }
-  }
-
-  let newItems = parseOrder(msg);
-  if (Object.keys(newItems).length === 0 && filenames.length > 0) {
-    for (const fn of filenames) newItems = mergeItems(newItems, parseOrder(fn));
-  }
-
-  if (numMedia > 0) {
-    for (const fn of filenames) {
-      const fnHasItems = Object.keys(parseOrder(fn)).length > 0;
-      const msgHasItems = Object.keys(parseOrder(msg)).length > 0;
-      if (!fnHasItems && !msgHasItems) {
-        if (!session.unknownFiles.includes(fn)) session.unknownFiles.push(fn);
-      }
-    }
-    session.files.push(...filenames);
-  }
-
-  if (Object.keys(newItems).length > 0) {
-    const textItems = parseOrder(msg);
-    session.knownItems = mergeItems(session.knownItems, Object.keys(textItems).length > 0 ? textItems : newItems);
-  }
-
-  if (session.unknownFiles.length > 0 && Object.keys(newItems).length > 0) {
-    session.unknownFiles = [];
-    clearTimers(session);
-  }
-
-  session.phase = "COLLECTING";
-  resetBillTimer(from, session);
-});
-
-function resetBillTimer(phone, session) {
-  if (session.billTimer) clearTimeout(session.billTimer);
-  session.billTimer = setTimeout(async () => {
-    const s = sessions.get(phone);
-    if (!s || s.phase !== "COLLECTING") return;
-    if (Object.keys(s.knownItems).length === 0 && s.unknownFiles.length === 0 && s.files.length === 0) return;
-    s.phase = "ASKED_FINISHED";
-    await sendMsg(phone, "🤔 Have you *finished sending*?\n\nReply *Yes* to get your bill or *No* to continue. 😊");
-    s.billTimer = setTimeout(async () => {
-      const s2 = sessions.get(phone);
-      if (s2 && s2.phase === "ASKED_FINISHED") { s2.phase = "COLLECTING"; await processBill(phone); }
-    }, 2 * 60 * 1000);
-  }, 2 * 60 * 1000);
-}
-
-app.post("/momo", async (req, res) => {
-  try {
-    const sms = req.body.message || req.body.body || req.body.text || "";
-    console.log("📲 MoMo SMS:", sms);
-    const amountMatch = sms.match(/GHS[\s]*([\d,]+\.?\d*)/i);
-    const phoneMatch = sms.match(/(233\d{9}|0\d{9})/);
-    if (!amountMatch || !phoneMatch) return res.sendStatus(200);
-    const amount = parseFloat(amountMatch[1].replace(",", ""));
-    const phone = "whatsapp:+" + phoneMatch[1].replace(/^0/, "233");
-    const session = sessions.get(phone);
-    if (!session) return res.sendStatus(200);
-    if (amount >= session.total) {
-      session.paid = true;
-      await sendMsg(phone, "✅ *PAYMENT CONFIRMED!* 🎉\n\n💰 Amount: *GHS " + amount.toFixed(2) + "*\n📋 Items: " + session.itemsStr + "\n\n🖨️ Job is *in production!*\n⏱️ *Ready:* " + calcReadyTime(session.knownItems) + "\n📍 " + CONFIG.LOCATION + "\n\nThank you for choosing *MIGO PRINT SHOP!* 🙏");
-    } else if (amount > 0) {
-      const balance = session.total - amount;
-      await sendMsg(phone, "⚠️ *Partial Payment*\n\n💰 Paid: *GHS " + amount.toFixed(2) + "*\nTotal: *GHS " + session.total.toFixed(2) + "*\n❌ Balance: *GHS " + balance.toFixed(2) + "*\n\nPay balance to:\n📱 *" + CONFIG.MOMO + "* (" + CONFIG.MOMO_NAME + ") 🙏");
-    }
-    res.sendStatus(200);
-  } catch (err) { console.log("MoMo error:", err.message); res.sendStatus(200); }
-});
-
-app.get("/jobs", (req, res) => {
-  let html = "<html><head><title>MIGO Jobs</title><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>body{font-family:Arial;padding:15px;background:#f5f5f5;}h1{color:#ff6600;}.job{background:#fff;padding:12px;margin:8px 0;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}.paid{color:green;font-weight:bold;}.pending{color:orange;font-weight:bold;}.collecting{color:blue;font-weight:bold;}</style></head><body>";
-  html += "<h1>🖨️ MIGO PRINT SHOP</h1><p>Bot: <strong style=\"color:" + (BOT_ACTIVE ? "green" : "red") + "\">" + (BOT_ACTIVE ? "🟢 Active" : "🔴 Paused") + "</strong></p><p>" + sessions.size + " sessions</p>";
-  sessions.forEach((s, phone) => {
-    const items = Object.entries(s.knownItems).map(([sz, q]) => q + "x" + sz).join(", ");
-    const cls = s.paid ? "paid" : s.phase === "COLLECTING" ? "collecting" : "pending";
-    html += "<div class=\"job\"><strong>" + phone.replace("whatsapp:+", "") + "</strong><br>Phase: <span class=\"" + cls + "\">" + s.phase + "</span><br>Items: " + (items || "none") + "<br>" + (s.total > 0 ? "Total: GHS " + s.total.toFixed(2) + "<br>" : "") + (s.unknownFiles.length > 0 ? "⚠️ Unknown: " + s.unknownFiles.length + "<br>" : "") + "Paid: " + (s.paid ? "✅ YES" : "❌ NO") + "</div>";
+    // No reply in 2 more mins → proceed
+    setTimer(phone, 'nodone', 2 * 60 * 1000, async () => {
+      if (session.state === 'asked_done') await sendBill(phone, session);
+    });
   });
-  res.send(html + "</body></html>");
+}
+
+function addFileToSession(session, info, rawText, filename) {
+  const size = info.size;
+  const qty  = info.qty;
+  if (!size || !qty) return;
+
+  if (info.isMoreOf) {
+    const ex = session.files.find(f => f.size === info.isMoreOf);
+    if (ex) { ex.qty += qty; return; }
+  }
+  const ex = session.files.find(f => f.size === size);
+  if (ex) ex.qty += qty;
+  else session.files.push({ size, qty, source: rawText || filename || 'file' });
+}
+
+// ── Intent detection ──────────────────────────────────────────
+function isDone(msg) {
+  return /\b(yes|yeah|yep|done|finished|finish|complete|ok|okay|yh|^y$|sure|sent|thats.?all|all.?sent)\b/i.test(msg);
+}
+function isNotDone(msg) {
+  return /\b(no|not yet|still|more|wait|nope|nah|adding)\b/i.test(msg);
+}
+
+// ── Main message handler ──────────────────────────────────────
+// Returns string → send as TwiML reply
+// Returns null  → send empty TwiML (silence)
+async function handleMessage(from, body, mediaUrl, mediaType, filename) {
+  if (!botActive) return null;
+
+  const msg     = (body || '').trim();
+  const session = getSession(from);
+
+  // ── Admin commands (any state) ────────────────────────────
+  if (msg.toLowerCase().startsWith('admin ')) {
+    return handleAdmin(from, msg);
+  }
+
+  console.log(`📩 ${from} [${session.state}]: "${msg || '[media]'}"`);
+
+  // ── RECEIVING: silent phase ───────────────────────────────
+  if (session.state === 'receiving') {
+    if (mediaUrl || msg) {
+      const info = await extractOrder(msg, filename, session);
+      if (info.isUnknown || (!info.size && !info.qty)) {
+        session.unknownFiles.push({ name: filename || msg.slice(0, 30) || 'unknown file', url: mediaUrl });
+      } else {
+        addFileToSession(session, info, msg, filename);
+      }
+    }
+    startReceiveTimer(from, session); // resets on every message
+    return null; // SILENT
+  }
+
+  // ── ASKED DONE ───────────────────────────────────────────
+  if (session.state === 'asked_done') {
+    clearTimers(from);
+
+    if (isNotDone(msg)) {
+      session.state = 'receiving';
+      startReceiveTimer(from, session);
+      return null; // SILENT — customer still sending
+
+    } else if (isDone(msg)) {
+      await sendBill(from, session);
+      return null;
+
+    } else {
+      // Could be more files in response to "finished?"
+      if (mediaUrl || msg) {
+        const info = await extractOrder(msg, filename, session);
+        if (!info.isUnknown && info.size && info.qty) {
+          addFileToSession(session, info, msg, filename);
+        } else if (mediaUrl) {
+          session.unknownFiles.push({ name: filename || 'file', url: mediaUrl });
+        }
+      }
+      // Treat as "still sending"
+      session.state = 'receiving';
+      startReceiveTimer(from, session);
+      return null;
+    }
+  }
+
+  // ── AWAITING PAYMENT ─────────────────────────────────────
+  if (session.state === 'awaiting_payment') {
+    const lower = msg.toLowerCase();
+    if (lower.match(/paid|sent money|i.ve paid|done paying|payment/)) {
+      return `Thank you! We'll confirm your payment shortly. MoMo: 0552719245 (Kow Habib Baisie) 🙏`;
+    }
+    if (lower.match(/how much|total|bill|balance/)) {
+      return `Your total is GHS ${session.totalBill?.toFixed(2) || '—'}. Please send to MoMo 0552719245 (Kow Habib Baisie).`;
+    }
+    return null; // silence for everything else
+  }
+
+  // ── READY ─────────────────────────────────────────────────
+  if (session.state === 'ready') {
+    const n = parseInt(msg);
+    if (!isNaN(n)) {
+      if (n === 5) return `🎉 Thank you! We're thrilled you loved it!`;
+      if (n === 4) return `😊 Thank you! We appreciate your feedback!`;
+      if (n === 3) return `🙏 Thank you! We'll work to do better!`;
+      if (n <= 2)  return `😔 We're sorry. Please tell us what went wrong.`;
+    }
+    return null;
+  }
+
+  // ── PROCESSING (paid, waiting to be printed) ─────────────
+  if (session.state === 'processing') {
+    const lower = msg.toLowerCase();
+    if (lower.match(/ready|done|when|collect/)) {
+      return `Your order is being prepared! We'll message you as soon as it's ready for pickup. 🙏`;
+    }
+    return null;
+  }
+
+  return null;
+}
+
+// ── Admin commands ────────────────────────────────────────────
+async function handleAdmin(from, msg) {
+  const parts = msg.trim().split(/\s+/);
+  const cmd   = (parts[1] || '').toLowerCase();
+
+  if (cmd === 'h') {
+    botActive = false;
+    return '🔴 Bot stopped.';
+  }
+  if (cmd === 'j') {
+    botActive = true;
+    return '🟢 Bot started.';
+  }
+
+  if (cmd === 'override') {
+    // admin override 0244xxxxxx Your message here
+    const phone   = `whatsapp:+233${parts[2]?.replace(/^0/, '')}`;
+    const message = parts.slice(3).join(' ');
+    if (!message) return '❌ Usage: admin override 0244xxx message';
+    await sendMsg(phone, message);
+    return `✅ Sent to ${parts[2]}.`;
+  }
+
+  if (cmd === 'info') {
+    // admin info 0244xxx 20 A4
+    const phone = `whatsapp:+233${parts[2]?.replace(/^0/, '')}`;
+    const qty   = parseInt(parts[3]);
+    const size  = (parts[4] || '').toUpperCase();
+    if (!PRICES[size] || isNaN(qty)) return '❌ Usage: admin info 0244xxx 20 A4';
+    const session = getSession(phone);
+    addFileToSession(session, { size, qty, isUnknown: false, isMoreOf: null }, 'admin', null);
+    return `✅ Added ${qty} ${size} for ${parts[2]}.`;
+  }
+
+  if (cmd === 'ready') {
+    // admin ready 0244xxx
+    const phone   = `whatsapp:+233${parts[2]?.replace(/^0/, '')}`;
+    const session = sessions.get(phone);
+    if (!session) return `❌ No active session for ${parts[2]}.`;
+    session.state = 'ready';
+    clearTimers(phone);
+    await sendMsg(phone, '✅ Your order is ready for pickup at Migo Print Shop — Circle branch, near Benz Gate, closer to Calvary Church!');
+    // Rating after 30 mins
+    setTimer(phone, 'rating', 30 * 60 * 1000, async () => {
+      if (!session.ratingAsked) {
+        session.ratingAsked = true;
+        await sendMsg(phone, '⭐ How was your experience? Reply 1-5');
+      }
+    });
+    return `✅ Ready notification sent to ${parts[2]}.`;
+  }
+
+  if (cmd === 'status') {
+    // admin status 0244xxx
+    const phone   = `whatsapp:+233${parts[2]?.replace(/^0/, '')}`;
+    const session = sessions.get(phone);
+    if (!session) return `❌ No session for ${parts[2]}.`;
+    return [
+      `📊 Status for ${parts[2]}`,
+      `State: ${session.state}`,
+      `Files: ${JSON.stringify(session.files)}`,
+      `Unknown: ${session.unknownFiles.length}`,
+      `Total: GHS ${session.totalBill?.toFixed(2) || 'not billed'}`,
+      `Paid: GHS ${session.paymentReceived.toFixed(2)}`,
+    ].join('\n');
+  }
+
+  return '❓ Commands: admin h|j|override|info|ready|status';
+}
+
+// ── Webhook ───────────────────────────────────────────────────
+app.post('/webhook', async (req, res) => {
+  const twiml = new twilio.twiml.MessagingResponse();
+
+  const from      = req.body.From    || '';
+  const body      = req.body.Body    || '';
+  const mediaUrl  = req.body.MediaUrl0;
+  const mediaType = req.body.MediaContentType0;
+  const filename  = req.body.MediaFilename || '';
+
+  console.log(`📩 Webhook: from=${from}, body="${body}", media=${mediaUrl ? 'YES' : 'no'}`);
+
+  try {
+    const reply = await handleMessage(from, body, mediaUrl, mediaType, filename);
+    if (reply) twiml.message(reply);
+    // null → empty <Response/> (intentional silence)
+  } catch (err) {
+    console.error('❌ Webhook error:', err.message);
+  }
+
+  res.set('Content-Type', 'text/xml');
+  res.send(twiml.toString());
 });
 
-app.get("/", (req, res) => {
-  res.send("<html><body style=\"font-family:Arial;padding:20px;text-align:center;\"><h2>🖨️ MIGO PRINT SHOP</h2><p>WhatsApp Bot v10 ✅</p><p style=\"color:" + (BOT_ACTIVE ? "green" : "red") + ";font-weight:bold;\">" + (BOT_ACTIVE ? "✅ Bot Active" : "🔴 Bot Paused") + "</p><a href=\"/jobs\" style=\"background:#ff6600;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;\">📋 View Dashboard</a></body></html>");
+// ── MoMo payment endpoint ─────────────────────────────────────
+app.post('/momo', async (req, res) => {
+  // Payload from SMS Forwarder by Zerogic
+  const { amount, phone, sms } = req.body;
+  console.log(`💰 MoMo: amount=${amount}, phone=${phone}`);
+
+  const paid = parseFloat(amount) || 0;
+  if (!paid) return res.json({ status: 'ignored', reason: 'no amount' });
+
+  // Match session by last 9 digits of phone
+  const tail = (phone || '').replace(/\D/g, '').slice(-9);
+  let matched = null, matchedKey = null;
+
+  for (const [key, session] of sessions.entries()) {
+    if (key.replace(/\D/g, '').slice(-9) === tail) {
+      matched = session; matchedKey = key; break;
+    }
+  }
+
+  if (!matched) {
+    console.warn('⚠️ No session matched for MoMo phone:', phone);
+    return res.json({ status: 'no_match' });
+  }
+
+  matched.paymentReceived += paid;
+  const balance = (matched.totalBill || 0) - matched.paymentReceived;
+
+  if (balance <= 0.01) {
+    // Full payment confirmed
+    const eta = readyTime(matched.a4eq || 0);
+    matched.state = 'processing';
+    clearTimers(matchedKey);
+    await sendMsg(matchedKey,
+      `✅ Payment confirmed! GHS ${paid.toFixed(2)} received.\n\nYour order will be ready in ${eta}. We'll notify you when it's done! 🙏`
+    );
+  } else {
+    // Partial payment
+    await sendMsg(matchedKey,
+      `✅ GHS ${paid.toFixed(2)} received. Thank you!\n\n⚠️ Balance remaining: GHS ${balance.toFixed(2)}\n\nPlease send balance to MoMo: 0552719245 (Kow Habib Baisie).`
+    );
+  }
+
+  res.json({ status: 'ok', paid, balance: Math.max(0, balance) });
 });
 
+// ── Health check ──────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({
+    status:   'running',
+    bot:      botActive ? 'active' : 'stopped',
+    sessions: sessions.size,
+    uptime:   process.uptime().toFixed(0) + 's',
+    time:     new Date().toISOString(),
+  });
+});
+
+// ── Start ─────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("🚀 MIGO PRINT SHOP v10 running on port " + PORT));
+app.listen(PORT, () => {
+  console.log(`🚀 MIGO Print Bot v9 running on port ${PORT}`);
+  console.log(`   Twilio SID : ${ACCOUNT_SID ? ACCOUNT_SID.slice(0,10) + '…' : 'NOT SET ❌'}`);
+  console.log(`   Auth Token : ${AUTH_TOKEN ? '✅ set' : 'NOT SET ❌'}`);
+  console.log(`   Anthropic  : ${ANTHROPIC_KEY ? '✅ set' : 'NOT SET ❌'}`);
+});
