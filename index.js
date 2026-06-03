@@ -1828,17 +1828,18 @@ app.post('/webhook', async (req, res) => {
   if (event !== 'message' && event !== 'messages.upsert' && event !== 'messages.received') return;
 
   // WasenderAPI messages.received payload structure:
-  // payload.data.messages[0].key.cleanedSenderPn = phone number
-  // payload.data.messages[0].message.conversation = text body
-  // payload.data.messages[0].messageBody = text body (alternative)
+  // payload.data.messages = OBJECT (not array) with key and message fields
   const rawData = payload.data || {};
-  const msgs    = rawData.messages || [];
-  const msgObj  = msgs[0] || rawData;
+  // messages can be object OR array — handle both
+  const msgsRaw = rawData.messages;
+  const msgObj  = Array.isArray(msgsRaw) ? (msgsRaw[0] || {})
+                : (msgsRaw && typeof msgsRaw === 'object') ? msgsRaw
+                : rawData;
   const keyObj  = msgObj.key || {};
 
-  // Sender phone
-  const cleanedPn = keyObj.cleanedSenderPn || msgObj.cleanedSenderPn || '';
-  const senderPn  = keyObj.senderPn || msgObj.senderPn || '';
+  // Sender phone — from key.cleanedSenderPn or key.senderPn
+  const cleanedPn = keyObj.cleanedSenderPn || '';
+  const senderPn  = keyObj.senderPn || '';
   const from = cleanedPn
     ? cleanedPn + '@s.whatsapp.net'
     : senderPn
@@ -1846,30 +1847,26 @@ app.post('/webhook', async (req, res) => {
       : '';
 
   // Message body
-  const body = msgObj.message?.conversation
-            || msgObj.message?.extendedTextMessage?.text
-            || msgObj.message?.imageMessage?.caption
-            || msgObj.message?.documentMessage?.caption
+  const msgContent = msgObj.message || {};
+  const body = msgContent.conversation
+            || msgContent.extendedTextMessage?.text
+            || msgContent.imageMessage?.caption
+            || msgContent.documentMessage?.caption
             || msgObj.messageBody
             || msgObj.body
             || '';
-  const mediaUrl  = msgObj.message?.imageMessage?.url
-                 || msgObj.message?.documentMessage?.url
-                 || msgObj.mediaUrl || null;
-  const mediaType = msgObj.message?.imageMessage?.mimetype
-                 || msgObj.message?.documentMessage?.mimetype
-                 || msgObj.mediaType || '';
-  const filename  = msgObj.message?.documentMessage?.fileName
-                 || msgObj.filename || '';
+
+  // Media
+  const mediaUrl  = msgContent.imageMessage?.url
+                 || msgContent.documentMessage?.url || null;
+  const mediaType = msgContent.imageMessage?.mimetype
+                 || msgContent.documentMessage?.mimetype || '';
+  const filename  = msgContent.documentMessage?.fileName || '';
+
   const isImage   = mediaType.startsWith('image/') ||
                     ['image/jpeg','image/png','image/webp'].includes(mediaType);
 
-  console.log('📨 DEBUG msgs.length:', msgs.length);
-  console.log('📨 DEBUG msgObj keys:', Object.keys(msgObj).join(','));
-  console.log('📨 DEBUG keyObj:', JSON.stringify(keyObj).slice(0,200));
-  console.log('📨 DEBUG msgObj.message:', JSON.stringify(msgObj.message).slice(0,100));
-  console.log('📨 DEBUG cleanedPn:', cleanedPn, 'senderPn:', senderPn?.slice(0,30));
-  console.log('📨 DEBUG from:', from, 'body:', body);
+  console.log('📨 Parsed:', { from: from?.slice(0,25)||'EMPTY', body: body?.slice(0,50)||'EMPTY', cleanedPn: cleanedPn||'EMPTY' });
 
   // Skip messages from the bot itself
   if (from.includes(SHOP_NUMBER) || from.includes('status')) return;
