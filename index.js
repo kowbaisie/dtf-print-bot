@@ -1864,7 +1864,12 @@ app.post('/webhook', async (req, res) => {
   const isImage   = mediaType.startsWith('image/') ||
                     ['image/jpeg','image/png','image/webp'].includes(mediaType);
 
-  console.log('📨 Parsed:', { from: from?.slice(0,25), body: body?.slice(0,60), cleanedPn });
+  console.log('📨 DEBUG msgs.length:', msgs.length);
+  console.log('📨 DEBUG msgObj keys:', Object.keys(msgObj).join(','));
+  console.log('📨 DEBUG keyObj:', JSON.stringify(keyObj).slice(0,200));
+  console.log('📨 DEBUG msgObj.message:', JSON.stringify(msgObj.message).slice(0,100));
+  console.log('📨 DEBUG cleanedPn:', cleanedPn, 'senderPn:', senderPn?.slice(0,30));
+  console.log('📨 DEBUG from:', from, 'body:', body);
 
   // Skip messages from the bot itself
   if (from.includes(SHOP_NUMBER) || from.includes('status')) return;
