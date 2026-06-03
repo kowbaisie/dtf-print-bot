@@ -184,11 +184,9 @@ async function sendMsg(to, body) {
   logMsg(waId, 'out', body);
 
   // WasenderAPI correct endpoint and payload format (confirmed by support)
-  const payload = JSON.stringify({
-    to:          waId,
-    contentType: 'string',
-    content:     body,
-  });
+  // WasenderAPI send-message needs plain phone number (no @s.whatsapp.net)
+  const toPhone = waId.replace('@s.whatsapp.net', '').replace('@c.us', '');
+  const payload = JSON.stringify({ to: toPhone, text: body });
 
   return new Promise((resolve) => {
     const options = {
@@ -229,7 +227,9 @@ async function sendMsg(to, body) {
 async function alertOwner(body) {
   const waId = toWaId(OWNER_NUMBER);
   logMsg(waId, 'out', body);
-  const payload = JSON.stringify({ to: waId, contentType: 'string', content: body });
+  // WasenderAPI send-message needs plain phone number (no @s.whatsapp.net)
+  const toPhone = waId.replace('@s.whatsapp.net', '').replace('@c.us', '');
+  const payload = JSON.stringify({ to: toPhone, text: body });
   return new Promise((resolve) => {
     const opts = {
       hostname: 'www.wasenderapi.com',
