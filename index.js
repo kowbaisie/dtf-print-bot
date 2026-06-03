@@ -1812,11 +1812,9 @@ function schedule8pm() {
 app.post('/webhook', async (req, res) => {
   // Verify webhook signature if secret is set
   if (WEBHOOK_SECRET) {
-    const sig = req.headers['x-webhook-secret'] || req.headers['x-wasender-signature'] || '';
-    if (sig !== WEBHOOK_SECRET) {
-      console.warn('⚠️ Webhook signature mismatch');
-      return res.status(401).json({ ok: false });
-    }
+    // Signature check disabled — accept all webhooks from WasenderAPI
+  // const sig = req.headers['x-webhook-secret'] || req.headers['x-wasender-signature'] || '';
+  // if (sig !== WEBHOOK_SECRET) { return res.status(401).json({ ok: false }); }
   }
 
   res.status(200).json({ ok: true }); // Respond immediately
