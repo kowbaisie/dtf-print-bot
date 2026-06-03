@@ -1827,14 +1827,30 @@ app.post('/webhook', async (req, res) => {
   const event = payload.event || payload.type;
   if (event !== 'message' && event !== 'messages.upsert' && event !== 'messages.received') return;
 
-  const data = payload.data || payload.message || {};
-  const from    = data.from || data.key?.remoteJid || '';
-  const body    = data.body || data.message?.conversation || data.message?.extendedTextMessage?.text || '';
-  const mediaUrl= data.mediaUrl || data.mediaLink || null;
-  const mediaType = data.mediaType || data.mimeType || '';
-  const filename  = data.filename || data.caption || '';
+  // WasenderAPI messages.received format:
+  // payload.data.messages = array of message objects
+  // OR payload.data = single message object
+  const rawData = payload.data || {};
+  const msgObj  = (rawData.messages && rawData.messages[0]) || rawData;
+
+  const from    = msgObj.key?.remoteJid || msgObj.senderPn || rawData.from || '';
+  const body    = msgObj.message?.conversation
+               || msgObj.message?.extendedTextMessage?.text
+               || msgObj.message?.imageMessage?.caption
+               || msgObj.message?.documentMessage?.caption
+               || msgObj.body || '';
+  const mediaUrl  = msgObj.message?.imageMessage?.url
+                 || msgObj.message?.documentMessage?.url
+                 || msgObj.mediaUrl || null;
+  const mediaType = msgObj.message?.imageMessage?.mimetype
+                 || msgObj.message?.documentMessage?.mimetype
+                 || msgObj.mediaType || '';
+  const filename  = msgObj.message?.documentMessage?.fileName
+                 || msgObj.filename || body || '';
   const isImage   = mediaType.startsWith('image/') ||
                     ['image/jpeg','image/png','image/webp'].includes(mediaType);
+
+  console.log('📨 Parsed:', { from: from?.slice(0,20), body: body?.slice(0,50), event });
 
   // Skip messages from the bot itself
   if (from.includes(SHOP_NUMBER) || from.includes('status')) return;
