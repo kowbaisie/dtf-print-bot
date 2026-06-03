@@ -1821,10 +1821,11 @@ app.post('/webhook', async (req, res) => {
 
   const payload = req.body;
   if (!payload) return;
+  console.log('📨 Webhook received:', JSON.stringify(payload).slice(0, 300));
 
   // WasenderAPI message format
   const event = payload.event || payload.type;
-  if (event !== 'message' && event !== 'messages.upsert') return;
+  if (event !== 'message' && event !== 'messages.upsert' && event !== 'messages.received') return;
 
   const data = payload.data || payload.message || {};
   const from    = data.from || data.key?.remoteJid || '';
