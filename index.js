@@ -1821,7 +1821,7 @@ app.post('/webhook', async (req, res) => {
 
   const payload = req.body;
   if (!payload) return;
-  console.log('📨 Webhook received:', JSON.stringify(payload).slice(0, 300));
+  console.log('📨 Webhook RAW:', JSON.stringify(payload).slice(0, 800));
 
   // WasenderAPI message format
   const event = payload.event || payload.type;
@@ -1833,12 +1833,21 @@ app.post('/webhook', async (req, res) => {
   const rawData = payload.data || {};
   const msgObj  = (rawData.messages && rawData.messages[0]) || rawData;
 
-  const from    = msgObj.key?.remoteJid || msgObj.senderPn || rawData.from || '';
+  // Extract sender - WasenderAPI uses cleanedSenderPn
+  const cleanedPn = msgObj.key?.cleanedSenderPn || msgObj.cleanedSenderPn || '';
+  const senderPn  = msgObj.key?.senderPn || msgObj.senderPn || '';
+  const remoteJid = msgObj.key?.remoteJid || '';
+  // Build proper WhatsApp ID
+  const from = cleanedPn ? cleanedPn + '@s.whatsapp.net'
+             : senderPn  ? senderPn.replace('as.whatsapp.net','@s.whatsapp.net').replace(/^233/,'233')
+             : remoteJid.includes('@s.whatsapp.net') ? remoteJid
+             : rawData.from || '';
+
   const body    = msgObj.message?.conversation
                || msgObj.message?.extendedTextMessage?.text
                || msgObj.message?.imageMessage?.caption
                || msgObj.message?.documentMessage?.caption
-               || msgObj.body || '';
+               || msgObj.text || msgObj.body || '';
   const mediaUrl  = msgObj.message?.imageMessage?.url
                  || msgObj.message?.documentMessage?.url
                  || msgObj.mediaUrl || null;
@@ -1850,7 +1859,7 @@ app.post('/webhook', async (req, res) => {
   const isImage   = mediaType.startsWith('image/') ||
                     ['image/jpeg','image/png','image/webp'].includes(mediaType);
 
-  console.log('📨 Parsed:', { from: from?.slice(0,20), body: body?.slice(0,50), event });
+  console.log('📨 Parsed:', { from: from?.slice(0,25), body: body?.slice(0,50), cleanedPn, senderPn: senderPn?.slice(0,25) });
 
   // Skip messages from the bot itself
   if (from.includes(SHOP_NUMBER) || from.includes('status')) return;
