@@ -185,7 +185,7 @@ async function sendMsg(to, body) {
 
   // WasenderAPI correct endpoint and payload format (confirmed by support)
   const payload = JSON.stringify({
-    chatId:      waId,
+    to:          waId,
     contentType: 'string',
     content:     body,
   });
@@ -229,7 +229,7 @@ async function sendMsg(to, body) {
 async function alertOwner(body) {
   const waId = toWaId(OWNER_NUMBER);
   logMsg(waId, 'out', body);
-  const payload = JSON.stringify({ chatId: waId, contentType: 'string', content: body });
+  const payload = JSON.stringify({ to: waId, contentType: 'string', content: body });
   return new Promise((resolve) => {
     const opts = {
       hostname: 'www.wasenderapi.com',
