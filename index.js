@@ -45,7 +45,7 @@ const OWNER_NUMBER = process.env.OWNER_PHONE || '233272006161'; // 0272006161
 const SHOP_NUMBER  = '233552719245';                             // 0552719245
 
 // WasenderAPI base URL
-const WA_BASE = 'https://api.wasenderapi.com';
+const WA_BASE = 'https://www.wasenderapi.com';
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 
@@ -183,13 +183,17 @@ async function sendMsg(to, body) {
   const waId = to.includes('@') ? to : toWaId(to);
   logMsg(waId, 'out', body);
 
-  const sessionEncoded = encodeURIComponent(WASENDER_SID);
-  const payload = JSON.stringify({ to: waId, text: body });
+  // WasenderAPI correct endpoint and payload format (confirmed by support)
+  const payload = JSON.stringify({
+    chatId:      waId,
+    contentType: 'string',
+    content:     body,
+  });
 
   return new Promise((resolve) => {
     const options = {
-      hostname: 'api.wasenderapi.com',
-      path:     `/api/sessions/${sessionEncoded}/send-message`,
+      hostname: 'www.wasenderapi.com',
+      path:     '/api/send-message',
       method:   'POST',
       headers:  {
         'Content-Type':   'application/json',
@@ -225,12 +229,11 @@ async function sendMsg(to, body) {
 async function alertOwner(body) {
   const waId = toWaId(OWNER_NUMBER);
   logMsg(waId, 'out', body);
-  const sessionEncoded = encodeURIComponent(WASENDER_SID);
-  const payload = JSON.stringify({ to: waId, text: body });
+  const payload = JSON.stringify({ chatId: waId, contentType: 'string', content: body });
   return new Promise((resolve) => {
     const opts = {
-      hostname: 'api.wasenderapi.com',
-      path:     `/api/sessions/${sessionEncoded}/send-message`,
+      hostname: 'www.wasenderapi.com',
+      path:     '/api/send-message',
       method:   'POST',
       headers:  {
         'Content-Type':   'application/json',
@@ -1868,11 +1871,14 @@ app.post('/webhook', async (req, res) => {
 
   console.log('📨 Parsed:', { from: from?.slice(0,25)||'EMPTY', body: body?.slice(0,50)||'EMPTY', cleanedPn: cleanedPn||'EMPTY' });
 
+  // Skip if no sender extracted
+  if (!from) return;
   // Skip messages from the bot itself
-  if (from.includes(SHOP_NUMBER) || from.includes('status')) return;
-  if (!from || (!body && !mediaUrl)) return;
+  if (from.includes(SHOP_NUMBER) || from.includes('status@broadcast') || from.includes('@newsletter')) return;
+  // Skip if no content
+  if (!body && !mediaUrl) return;
 
-  console.log(`📩 WA: ${from} — "${body.slice(0,60)}" media=${!!mediaUrl}`);
+  console.log(`📩 WA: ${from} — "${(body||'').slice(0,60)}" media=${!!mediaUrl}`);
   logMsg(from, 'in', body || '[media]');
 
   try {
