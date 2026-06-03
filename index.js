@@ -1827,27 +1827,32 @@ app.post('/webhook', async (req, res) => {
   const event = payload.event || payload.type;
   if (event !== 'message' && event !== 'messages.upsert' && event !== 'messages.received') return;
 
-  // WasenderAPI messages.received format:
-  // payload.data.messages = array of message objects
-  // OR payload.data = single message object
+  // WasenderAPI messages.received payload structure:
+  // payload.data.messages[0].key.cleanedSenderPn = phone number
+  // payload.data.messages[0].message.conversation = text body
+  // payload.data.messages[0].messageBody = text body (alternative)
   const rawData = payload.data || {};
-  const msgObj  = (rawData.messages && rawData.messages[0]) || rawData;
+  const msgs    = rawData.messages || [];
+  const msgObj  = msgs[0] || rawData;
+  const keyObj  = msgObj.key || {};
 
-  // Extract sender - WasenderAPI uses cleanedSenderPn
-  const cleanedPn = msgObj.key?.cleanedSenderPn || msgObj.cleanedSenderPn || '';
-  const senderPn  = msgObj.key?.senderPn || msgObj.senderPn || '';
-  const remoteJid = msgObj.key?.remoteJid || '';
-  // Build proper WhatsApp ID
-  const from = cleanedPn ? cleanedPn + '@s.whatsapp.net'
-             : senderPn  ? senderPn.replace('as.whatsapp.net','@s.whatsapp.net').replace(/^233/,'233')
-             : remoteJid.includes('@s.whatsapp.net') ? remoteJid
-             : rawData.from || '';
+  // Sender phone
+  const cleanedPn = keyObj.cleanedSenderPn || msgObj.cleanedSenderPn || '';
+  const senderPn  = keyObj.senderPn || msgObj.senderPn || '';
+  const from = cleanedPn
+    ? cleanedPn + '@s.whatsapp.net'
+    : senderPn
+      ? senderPn.replace('as.whatsapp.net', '@s.whatsapp.net')
+      : '';
 
-  const body    = msgObj.message?.conversation
-               || msgObj.message?.extendedTextMessage?.text
-               || msgObj.message?.imageMessage?.caption
-               || msgObj.message?.documentMessage?.caption
-               || msgObj.text || msgObj.body || '';
+  // Message body
+  const body = msgObj.message?.conversation
+            || msgObj.message?.extendedTextMessage?.text
+            || msgObj.message?.imageMessage?.caption
+            || msgObj.message?.documentMessage?.caption
+            || msgObj.messageBody
+            || msgObj.body
+            || '';
   const mediaUrl  = msgObj.message?.imageMessage?.url
                  || msgObj.message?.documentMessage?.url
                  || msgObj.mediaUrl || null;
@@ -1855,11 +1860,11 @@ app.post('/webhook', async (req, res) => {
                  || msgObj.message?.documentMessage?.mimetype
                  || msgObj.mediaType || '';
   const filename  = msgObj.message?.documentMessage?.fileName
-                 || msgObj.filename || body || '';
+                 || msgObj.filename || '';
   const isImage   = mediaType.startsWith('image/') ||
                     ['image/jpeg','image/png','image/webp'].includes(mediaType);
 
-  console.log('📨 Parsed:', { from: from?.slice(0,25), body: body?.slice(0,50), cleanedPn, senderPn: senderPn?.slice(0,25) });
+  console.log('📨 Parsed:', { from: from?.slice(0,25), body: body?.slice(0,60), cleanedPn });
 
   // Skip messages from the bot itself
   if (from.includes(SHOP_NUMBER) || from.includes('status')) return;
