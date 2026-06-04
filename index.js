@@ -86,7 +86,7 @@ function shopStatus() {
   const d   = new Date(now);
   const hr  = d.getHours();
   const day = d.getDay(); // 0=Sun
-  const open = hr >= 7 && hr < 22; // 7am–10pm
+  const open = hr >= 7 && hr < 22; // 7am–12pm
   return { open, isSunday: day === 0, hour: hr };
 }
 
