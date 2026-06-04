@@ -1,5 +1,30 @@
 // ============================================================
-// MIGO DTF PRINT SHOP — WhatsApp Bot (v19b)
+// MIGO DTF PRINT SHOP — WhatsApp Bot (v20)
+// Changes from v19b:
+//   • Upgraded to claude-opus-4-8 (most powerful)
+//   • Welcome message + name capture for new customers
+//   • Shop hours 7am–10pm Mon–Sun (Sunday bulk 200+ only)
+//   • Duplicate file protection
+//   • 3-day session auto-close on no payment
+//   • Re-send bill on request
+//   • Forwarded messages stripped
+//   • File receipt ack for unknown files only (known = silent)
+//   • Rating follow-up after 2 hours if ignored
+//   • Pressing only asked if customer mentions it
+//   • Natural ready-check detection
+//   • FAQ quick-match (location, prices, hours etc.)
+//   • Pressing revenue in daily summary
+//   • Queue position in payment confirmation
+//   • Dashboard pressing + queue position columns
+//   • Health endpoint with version + uptime
+//   • Pickup code only sent when job is ready (not on payment)
+//   • Bill reminder: send receipt to COMPLETE order
+//   • extractImageInstructions A4 default bug fixed
+//   • Cash payment from dashboard (admin + worker)
+//   • Dashboard bottom nav — 5 tabs professional layout
+//   • File handling: known filenames collected silently
+//   • Test mode (admin test on/off) — pending
+// ============================================================
 // ============================================================
 // Changes from v18:
 //   • WasenderAPI only — Twilio completely removed
@@ -50,7 +75,7 @@ const WA_API_SEND = 'https://www.wasenderapi.com/api/send-message';
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 
 // ── Model — most powerful available ──────────────────────────
-const MODEL = 'claude-opus-4-6';
+const MODEL = 'claude-opus-4-8';
 
 const BOT_VERSION = 'v20';
 const BOT_START   = Date.now();
@@ -122,6 +147,7 @@ const sessions     = new Map();
 const timers       = new Map();
 let   botActive    = true;
 let   botCrashed   = false;
+let   testMode     = false; // when true, only OWNER_PHONE receives replies
 
 const paymentLedger = [];
 const ratingsLog    = [];
@@ -694,15 +720,12 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
         overpaid > 0.01 ? `\n⚠️ GHS ${overpaid.toFixed(2)} overpaid — collect change at pickup.` : ``,
         queueLine,
         ``,
-        `🔑 *PICKUP CODE*`,
-        ``,
-        `   *${jobId}*`,
-        ``,
         `⏱ *ESTIMATED READY TIME*`,
         ``,
         `   *${readyAt}*`,
         ``,
-        `We will notify you as soon as it is ready. 🙏`,
+        `We will notify you as soon as it is ready.`,
+        `Your *Pickup Code* will be sent to you when your order is ready. 🙏`,
       ].filter(l => l !== null && l !== undefined).join('\n'));
 
       scheduleWorkerReminders(matchedKey, matched, jobId);
@@ -1142,6 +1165,12 @@ async function sendBill(phone, session) {
 
   setTimeout(async () => {
     await sendMsg(phone, buildBill(session));
+    // Reminder to send receipt
+    await sendMsg(phone, [
+      `📌 Please send your payment receipt or MoMo confirmation screenshot to *__COMPLETE__* your order.`,
+      ``,
+      `No payment = No printing. 🙏`,
+    ].join('\n'));
     setTimer(phone, 'pay1', 600000, () => {
       if (session.state === 'awaiting_payment')
         sendMsg(phone, `⏰ Reminder: Pay *GHS ${session.totalBill?.toFixed(2)}* to MoMo *0552719245*. 🙏`);
@@ -1206,20 +1235,12 @@ async function handleImage(from, session, mediaUrl, caption) {
       : /with.?background|keep.?background|with.?bg/i.test(caption) ? 'keep background' : '';
     valid.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, caption || 'image', bgNote));
     startReceiveTimer(from, session);
-    return `📥 Got it! Send more files or wait for the summary.`;
+    return null; // ✅ silent — info was in caption/filename
   }
-  // Check if customer already told us the size via text
-  if (session.pendingTextOrder?.length > 0) {
-    session.pendingTextOrder.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, caption || 'image', ''));
-    session.pendingTextOrder = null;
-    startReceiveTimer(from, session);
-    return `📥 Got it!`;
-  }
+  // Unknown — ask for details
   session.pendingImages.push({ url: mediaUrl, caption, index: session.pendingImages.length + 1 });
   startReceiveTimer(from, session);
-  return !caption
-    ? `📥 Received! Size? (A4 / A3 / A2) · Qty? · Background? (keep/remove)`
-    : `📥 Received! Size? (A4 / A3 / A2) · Qty? · Background? (keep/remove)`;
+  return `📥 Received! Size? (A4 / A3 / A2) · Qty? · Background? (keep/remove)`;
 }
 
 async function handleDoc(from, session, mediaUrl, caption, filename) {
@@ -1234,15 +1255,9 @@ async function handleDoc(from, session, mediaUrl, caption, filename) {
   if (valid.length > 0) {
     valid.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, caption || filename, ''));
     startReceiveTimer(from, session);
-    return `📥 Got it!`;
+    return null; // ✅ silent — info was in caption/filename
   }
-  // Check if customer already told us the size via text
-  if (session.pendingTextOrder?.length > 0) {
-    session.pendingTextOrder.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, filename || 'your file', ''));
-    session.pendingTextOrder = null;
-    startReceiveTimer(from, session);
-    return `📥 Got it!`;
-  }
+  // Unknown — ask for size and qty
   session.unknownFiles.push({ name: filename || 'your file', url: mediaUrl });
   startReceiveTimer(from, session);
   return `📥 File received! What size is *"${filename || 'your file'}"*? (A4 / A3 / A2) and how many copies?`;
@@ -1369,12 +1384,12 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       return handleDoc(from, session, mediaUrl, msg, filename);
     }
     if (msg) {
-      session.state = 'receiving';
       const orders = await extractOrder(msg, null, session);
       const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
       if (valid.length > 0) {
-        // Text-only order — store as pending, ask for files
-        session.pendingTextOrder = valid;
+        // Add sizes directly — customer will send files next (v16 behaviour)
+        session.state = 'receiving';
+        valid.forEach(o => addFile(session, o, msg, ''));
         startReceiveTimer(from, session);
         return `Got it! Please send your file(s) and we'll sort it out. 📎`;
       }
@@ -1408,10 +1423,10 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
           await proceedToSummary(from, session);
           return null;
         }
-        // Normal: store as pending text order
-        session.pendingTextOrder = valid;
+        // Normal: add sizes to session directly, keep receiving files
+        valid.forEach(o => addFile(session, o, msg, ''));
         startReceiveTimer(from, session);
-        return `Got it! Send your file(s) and we'll calculate. 📎`;
+        return null;
       }
       return replyWithClaude(msg, session);
     }
@@ -1951,6 +1966,23 @@ async function handleAdmin(from, msg) {
     return `✅ All ${count} sessions cleared.`;
   }
 
+  if (cmd === 'test') {
+    const sub = (args[0] || '').toLowerCase();
+    if (sub === 'on') {
+      testMode = true;
+      audit('TEST_MODE_ON', from, `Enabled by ${workerName}`);
+      await alertOwner(`🧪 *TEST MODE ON*\nBot only responding to your private number (0272006161). All other customers silently ignored.`);
+      return `🧪 *Test mode ON.*\nBot will only respond to the owner number.\nUse: admin reset 0272006161 — to reset your test session between tests.\nUse: admin test off — when done.`;
+    }
+    if (sub === 'off') {
+      testMode = false;
+      audit('TEST_MODE_OFF', from, `Disabled by ${workerName}`);
+      await alertOwner(`✅ *TEST MODE OFF*\nBot back to normal — responding to all customers.`);
+      return `✅ *Test mode OFF.* Bot is back to normal for all customers.`;
+    }
+    return `❌ Usage: admin test on  OR  admin test off\nCurrent: ${testMode ? '🧪 ON' : '✅ OFF'}`;
+  }
+
   if (cmd === 'daily') { await sendDailySummary(); return `✅ Daily summary sent.`; }
 
   if (cmd === 'archive') {
@@ -1962,7 +1994,7 @@ async function handleAdmin(from, msg) {
 
   if (cmd === 'help' || cmd === '?') {
     return [
-      `🤖 *MIGO BOT v19 — COMMANDS*`, ``,
+      `🤖 *MIGO BOT ${BOT_VERSION} — COMMANDS*`, ``,
       `*PAYMENTS:*`,
       `admin W01 cash <last4> <amount> <PIN>`,
       `admin W01 bill <last4> <amount>`,``,
@@ -1988,6 +2020,7 @@ async function handleAdmin(from, msg) {
       `admin knowledge`,``,
       `*BOT:*`,
       `admin h|j|restart|daily`,
+      `admin test on|off  — test mode (${testMode?'🧪 ON':'✅ OFF'})`,
     ].join('\n');
   }
 
@@ -2177,6 +2210,19 @@ app.post('/webhook', async (req, res) => {
 
   console.log(`📩 WA: ${from} — "${(body||'').slice(0,60)}" media=${!!mediaUrl}`);
   logMsg(from, 'in', body || '[media]');
+
+  // ── Test mode filter ─────────────────────────────────────────
+  // When test mode is ON, only owner's private number gets replies
+  // Admin commands from the shop number always pass through
+  if (testMode) {
+    const isOwner = from.includes(OWNER_NUMBER.replace(/\D/g,'').slice(-9));
+    const isAdminCmd = (cleanBody||'').toLowerCase().startsWith('admin');
+    const isShop = from.includes(SHOP_NUMBER.replace(/\D/g,'').slice(-9));
+    if (!isOwner && !(isShop && isAdminCmd)) {
+      console.log(`🧪 TEST MODE — silent ignore: ${from.slice(0,20)}`);
+      return; // silently ignore
+    }
+  }
 
   // Strip WhatsApp forwarded prefix
   const cleanBody = stripForwarded(body);
@@ -2398,6 +2444,7 @@ app.get('/', (req, res) => res.json({
   status:   botCrashed ? 'CRASHED' : botActive ? 'running' : 'stopped',
   version:  BOT_VERSION,
   model:    MODEL,
+  testMode,
   sessions: sessions.size,
   uptime:   `${Math.floor(process.uptime()/3600)}h ${Math.floor(process.uptime()%3600/60)}m`,
   started:  new Date(BOT_START).toLocaleString('en-GH', { timeZone: 'Africa/Accra' }),
@@ -2505,10 +2552,11 @@ function adminHTML() {
     '</div></div></div>',
     /* Stats bar */
     '<div class="stats">',
-    '<div class="stat"><div class="stat-n" id="sn">—</div><div class="stat-l">Active Jobs</div></div>',
-    '<div class="stat"><div class="stat-n gr" id="sm">—</div><div class="stat-l">MoMo Today</div></div>',
-    '<div class="stat"><div class="stat-n am" id="sc">—</div><div class="stat-l">Cash Today</div></div>',
+    `'<div class="stat"><div class="stat-n" id="sn">—</div><div class="stat-l">Active Jobs</div></div>',`,
+    `'<div class="stat"><div class="stat-n gr" id="sm">—</div><div class="stat-l">MoMo Today</div></div>',`,
+    `'<div class="stat"><div class="stat-n am" id="sc">—</div><div class="stat-l">Cash Today</div></div>',`,
     '</div>',
+    testMode ? '<div style="background:#f59e0b;color:#000;text-align:center;padding:10px;font-weight:700;font-size:13px">🧪 TEST MODE ON — Bot only responding to owner number. Type: admin test off to disable.</div>' : '',
     /* Panels */
     '<div class="panel on" id="b0">',
     '  <div class="section-hd"><h2>🖨️ Live Job Queue</h2><button class="btn btn-ghost" onclick="lq()" style="font-size:10px">↻ Refresh</button></div>',
