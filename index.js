@@ -44,16 +44,78 @@ const DESKTOP_KEY    = process.env.DESKTOP_AGENT_KEY || 'migo-agent-2025';
 const OWNER_NUMBER = process.env.OWNER_PHONE || '233272006161'; // 0272006161
 const SHOP_NUMBER  = '233552719245';                             // 0552719245
 
-// WasenderAPI base URL
-const WA_BASE = 'https://www.wasenderapi.com';
+// WasenderAPI base URL (used in all API calls below)
+const WA_API_SEND = 'https://www.wasenderapi.com/api/send-message';
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 
 // ── Model — most powerful available ──────────────────────────
 const MODEL = 'claude-opus-4-6';
 
-const PRICES = { A4: 3.20, A3: 6.40, A2: 16.00 };
-const A4_EQ  = { A4: 1, A3: 2, A2: 4 };
+const BOT_VERSION = 'v20';
+const BOT_START   = Date.now();
+
+// ── Shop hours ────────────────────────────────────────────────
+function shopStatus() {
+  const now = new Date().toLocaleString('en-US', { timeZone: 'Africa/Accra' });
+  const d   = new Date(now);
+  const hr  = d.getHours();
+  const day = d.getDay(); // 0=Sun
+  const open = hr >= 7 && hr < 22; // 7am–10pm
+  return { open, isSunday: day === 0, hour: hr };
+}
+
+// ── FAQ quick-match ───────────────────────────────────────────
+const FAQ = [
+  { p: /where.*(you|shop|locate|find|address|located)/i,
+    a: `📍 We're at Circle branch, near Benz Gate, closer to Calvary Church, Accra.` },
+  { p: /how much.*(a4|a3|a2)|price.*(a4|a3|a2)|(a4|a3|a2).*(price|cost|how much)/i,
+    a: `🖨 *Printing prices:*\nA4 — GHS 3.20\nA3 — GHS 6.40\nA2 — GHS 16.00` },
+  { p: /how much.*press|press.*price|press.*cost|cost.*press/i,
+    a: `👕 *Pressing prices:*\n1–2 shirts — GHS 10 flat\n3–5 shirts — 1.5× rate\n6+ shirts — normal rate\nFront only GHS 2/shirt · Front+Back GHS 3/shirt · Side GHS 2/shirt\nLarge artwork +GHS 1/shirt` },
+  { p: /what.*time|when.*open|opening.*hour|close.*time|hours/i,
+    a: `🕐 We're open *7am – 10pm*, Monday to Sunday.\n_(Sundays: bulk orders of 200+ sheets only)_` },
+  { p: /sunday|tomorrow.*(sun)/i,
+    a: `📅 We're open Sundays for bulk orders (200+ sheets). For smaller orders, we'll process yours first thing Monday.` },
+  { p: /momo|mobile money|number.*pay|pay.*number/i,
+    a: `🟡 *MTN MoMo:* 0552719245 · Kow Habib Baisie` },
+  { p: /instagram|facebook|social|ig\b/i,
+    a: `We're on Instagram — search *Migo Print Shop Accra*. 🙏` },
+  { p: /sublim|embroid|screen.?print/i,
+    a: `We specialise in *DTF printing and pressing* only. We do not offer sublimation, embroidery or screen printing.` },
+  { p: /delivery|dispatch|rider|send.*my guy/i,
+    a: `We don't offer delivery at the moment. Orders must be collected from the shop. Your pickup code is required for collection.` },
+  { p: /thank|thanks|thank you|merci/i,
+    a: `You're welcome! 🙏 Let us know if you need anything else.` },
+];
+
+function tryFAQ(msg) {
+  for (const f of FAQ) if (f.p.test(msg)) return f.a;
+  return null;
+}
+
+// ── Natural "is my job ready?" detector ──────────────────────
+function isReadyCheck(msg) {
+  const m = (msg || '').toLowerCase();
+  // Explicit collection phrases
+  if (/\b(can i (come|collect|send|pick)|my delivery|send.*guy|my rider|come now|come collect|come pick)\b/.test(m)) return true;
+  // Job status questions
+  if (/\b(is it|is my|are you|have you|when will|how long)\b/.test(m)
+    && /\b(ready|done|finish|complet|printed|print)\b/.test(m)) return true;
+  // "My job/order ready?" style
+  if (/\b(my (order|job|file|design)|the order|the job)\b/.test(m)
+    && /\b(ready|done|complet|finish)\b/.test(m)) return true;
+  // "Have you finished?" / "Finished?" standalone
+  if (/\b(have you (finish|done|complet)|you (finish|done)|finish(ed)?\s*\?)/i.test(m)) return true;
+  return false;
+}
+
+// ── Strip WhatsApp forwarded prefix ──────────────────────────
+function stripForwarded(body) {
+  return (body || '').replace(/^(\[?forwarded\]?|_forwarded_|fwd:)\s*/i, '').trim();
+}
+
+
 
 // ── Global state ──────────────────────────────────────────────
 const sessions     = new Map();
@@ -260,9 +322,12 @@ async function askClaude(messages, system, maxTokens = 400, timeoutMs = 10000) {
 }
 
 // ── Knowledge base system prompt ─────────────────────────────
-function buildShopSystem() {
+function buildShopSystem(session) {
   const kb = knowledgeBase.length > 0
     ? `\n\nADDITIONAL SHOP INFORMATION:\n${knowledgeBase.map((f,i)=>`${i+1}. ${f}`).join('\n')}`
+    : '';
+  const nameNote = session?.customerName
+    ? `\nThe customer's name is ${session.customerName}. Use their name naturally in responses.`
     : '';
   return `You are a professional and helpful customer service representative for Migo Print Shop.
 
@@ -276,8 +341,8 @@ Services:
   • Large/oversized artwork = +GHS 1.00 per shirt
   • Price is by impressions and artwork size only — NOT shirt size, NOT number of colours
 Payment: MTN MoMo 0552719245 (Kow Habib Baisie) or cash at shop.
-Hours: Mon–Sat 8am–6pm. Closed Sundays.
-Style: Clear British English. Warm, professional. 1–4 sentences. Never reveal you are AI.
+Hours: Mon–Sun 7am–10pm. Sundays: bulk orders (200+ sheets) only.
+Style: Clear British English. Warm, professional. 1–4 sentences. Never reveal you are AI.${nameNote}
 If you genuinely cannot answer: say "Let me get someone to assist you shortly." and nothing else.
 You have full context of this customer's order in the conversation history.${kb}`;
 }
@@ -290,7 +355,7 @@ function addToHistory(s, role, content) {
 async function replyWithClaude(msg, session) {
   addToHistory(session, 'user', msg);
   try {
-    const r = await askClaude(session.chatHistory, buildShopSystem(), 400, 10000);
+    const r = await askClaude(session.chatHistory, buildShopSystem(session), 400, 10000);
     const reply = r.content.map(c => c.text || '').join('').trim();
     if (reply) addToHistory(session, 'assistant', reply);
 
@@ -304,7 +369,7 @@ async function replyWithClaude(msg, session) {
         const parsed = JSON.parse(nameR.content.map(c=>c.text||'').join('').trim().replace(/```json|```/g,''));
         if (parsed?.name && parsed.name.length > 1) {
           session.customerName = parsed.name;
-          audit('NAME_CAPTURED', from, parsed.name);
+          audit('NAME_CAPTURED', session.phone, parsed.name);
         }
       } catch(e) { /* silent fail */ }
     }
@@ -336,11 +401,15 @@ function getSession(phone) {
       totalBill: null, a4eq: 0,
       paymentReceived: 0, jobId: null,
       readyTime: null, overdueReminders: 0,
-      ratingAsked: false, lastActivity: Date.now(),
+      ratingAsked: false, ratingGiven: false, lastActivity: Date.now(),
       pendingTxId: null, pendingTxAmount: null,
       awaitingTxId: false, confirmedTxId: null,
       paused: false, servedBy: null,
       customerName: null,
+      pressing: null,
+      askedPressing: false,
+      isFirstTime: true,      // true until name captured
+      pressingMentioned: false, // true if customer mentions pressing
     });
   }
   return sessions.get(phone);
@@ -361,7 +430,7 @@ function setTimer(phone, name, ms, fn) {
 
 // ── Ready time ────────────────────────────────────────────────
 function getReadyHours(a4eq) {
-  if (a4eq <= 50)  return 3;   // estimated
+  if (a4eq <= 50)  return 3;
   if (a4eq <= 100) return 4;
   if (a4eq <= 200) return 5;
   if (a4eq <= 400) return 7;
@@ -612,34 +681,35 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
       const workerLine = (type === 'cash' && workerName)
         ? `\n👤 Served by: *${workerName}* at Migo Print Shop` : '';
 
+      // Queue position — count jobs already processing before this one
+      const jobsAhead = [...sessions.values()].filter(s => s.state === 'processing' && s.jobId && s.jobId !== jobId).length;
+      const queueLine = jobsAhead === 0
+        ? `\n📋 *You're next in queue!* 🎉`
+        : `\n📋 *Queue position: ${jobsAhead + 1}* (${jobsAhead} job${jobsAhead !== 1 ? 's' : ''} ahead of you)`;
+
       await sendMsg(matchedKey, [
         `✅ *Payment Confirmed!*${type === 'cash' ? ' _(Cash)_' : ''}`, ``,
         `GHS ${paid.toFixed(2)} received. Thank you! 🙏`,
-        workerLine, ``,
-        `━━━━━━━━━━━━━━━━━━━━━━`,
+        workerLine,
+        overpaid > 0.01 ? `\n⚠️ GHS ${overpaid.toFixed(2)} overpaid — collect change at pickup.` : ``,
+        queueLine,
+        ``,
         `🔑 *PICKUP CODE*`,
         ``,
         `   *${jobId}*`,
         ``,
-        `━━━━━━━━━━━━━━━━━━━━━━`,
         `⏱ *ESTIMATED READY TIME*`,
         ``,
         `   *${readyAt}*`,
         ``,
-        `━━━━━━━━━━━━━━━━━━━━━━`,
-        `⚠️ *IMPORTANT:*`,
-        `• Show pickup code when collecting`,
-        `• No pickup code — no job released`,
-        overpaid > 0.01 ? `• GHS ${overpaid.toFixed(2)} overpaid — collect change at pickup` : '',
-        ``,
-        `We will notify you when your order is ready. 🙏`,
-      ].filter(l => l !== '').join('\n'));
+        `We will notify you as soon as it is ready. 🙏`,
+      ].filter(l => l !== null && l !== undefined).join('\n'));
 
       scheduleWorkerReminders(matchedKey, matched, jobId);
 
       // Queue for desktop agent to move files to hot folder after payment
       confirmedPayments.push({
-        id:    require('crypto').randomBytes(8).toString('hex'),
+        id:    crypto.randomBytes(8).toString('hex'),
         phone: matchedKey,
         jobId, ts: new Date().toISOString(),
         acknowledged: false,
@@ -840,8 +910,15 @@ Images waiting: ${JSON.stringify(pendingImages.map(i => ({ index: i.index, capti
 
 Extract print instructions for EACH image.
 Return ONLY a valid JSON array with ${count} objects.
-Each: {"size":"A4|A3|A2","qty":number,"background":"keep|remove|null"}
-If size/qty unknown for an image, use null.`;
+Each: {"size":"A3|A4|A2","qty":number,"background":"keep|remove|null"}
+If size/qty unknown for an image, use null.
+
+CRITICAL RULES:
+- Only use sizes explicitly mentioned by the customer.
+- If customer says "all A3" or "all are A3" — every single object MUST be A3. No exceptions.
+- If customer says "all A4" — every object MUST be A4.
+- NEVER assign a size that was not mentioned by the customer.
+- NEVER default to A4 when the customer has specified a different size.`;
   try {
     const r = await askClaude([{ role: 'user', content: prompt }], null, 400, 8000);
     const raw = r.content.map(c => c.text || '').join('').trim();
@@ -896,36 +973,76 @@ function isMomoReceipt(msg) {
 
 function buildSummary(session) {
   const { lines, subtotal, a4eq } = calcBill(session.files);
-  session.totalBill = subtotal; session.a4eq = a4eq;
-  const items = lines.map(l => `   ${l.size}  ·  *${l.qty} sheet${l.qty !== 1 ? 's' : ''}*  ·  GHS ${l.price.toFixed(2)}`).join('\n');
+  session.a4eq = a4eq;
+  let pressingFee = 0;
+  if (session.pressing) {
+    pressingFee = calcPressing(session.pressing.shirts, session.pressing.type, session.pressing.largeArtwork);
+    session.pressing.fee = pressingFee;
+  }
+  const grandTotal = subtotal + pressingFee;
+  session.totalBill = grandTotal;
+  const items = lines.map(l => `  ${l.size} × ${l.qty} — GHS ${l.price.toFixed(2)}`).join('\n');
+  const pressingLine = pressingFee > 0 ? `\n  👕 Pressing — GHS ${pressingFee.toFixed(2)}` : '';
   const parts = [
-    `━━━━━━━━━━━━━━━━━━━━━━`, `      📋 *ORDER SUMMARY*`, `━━━━━━━━━━━━━━━━━━━━━━`, ``,
-    items || `   (no items detected)`, ``, `   💰 *Total: GHS ${subtotal.toFixed(2)}*`,
-    `━━━━━━━━━━━━━━━━━━━━━━`,
+    `📋 *Order Summary*`, ``,
+    (items + pressingLine) || `  (nothing detected)`, ``,
+    `💰 *Total: GHS ${grandTotal.toFixed(2)}*`,
   ];
   if (session.unknownFiles.length > 0) {
-    const names = session.unknownFiles.map(u => `   • ${u.name}`).join('\n');
-    parts.push(``, `❓ *Still need size/quantity for:*`, names, ``, `_Reply e.g. "logo is 5 A3, flyer is 10 A4"_`);
+    const names = session.unknownFiles.map(u => `  • ${u.name}`).join('\n');
+    parts.push(``, `❓ *Still need size for:*`, names, `_e.g. logo=5 A3, flyer=10 A4_`);
   } else {
-    parts.push(``, `Is this correct?`, `Reply *YES* to confirm ✅ or tell us what to change.`, `_Auto-confirms in 1 min._`);
+    parts.push(``, `Is this correct? Reply *YES* to confirm ✅ or tell us what to change.`, `_Auto-confirms in 1 min._`);
   }
   return parts.join('\n');
 }
 
+function calcPressing(shirts, type, largeArtwork) {
+  if (!shirts || shirts <= 0) return 0;
+  const base = (type === 'front_back') ? 3 : 2; // front+back=3, front or side=2
+  const extra = largeArtwork ? 1 : 0;
+  const rate = base + extra;
+  if (shirts <= 2) return 10; // flat rate for 1-2 shirts
+  if (shirts <= 5) return Math.ceil(shirts * rate * 1.5 * 100) / 100;
+  return shirts * rate;
+}
+
 function buildBill(session) {
   const { lines, subtotal, a4eq } = calcBill(session.files);
-  session.totalBill = subtotal; session.a4eq = a4eq;
-  const ready = readyTimeText(a4eq);
+  session.a4eq = a4eq;
+  let pressingFee = 0;
+  if (session.pressing) {
+    pressingFee = calcPressing(session.pressing.shirts, session.pressing.type, session.pressing.largeArtwork);
+    session.pressing.fee = pressingFee;
+  }
+  const grandTotal = subtotal + pressingFee;
+  session.totalBill = grandTotal;
   const items = lines.map(l => `🖨 ${l.size}  ·  ${l.qty} sheet${l.qty!==1?'s':''}  ·  *GHS ${l.price.toFixed(2)}*`).join('\n');
+  const pressingLine = pressingFee > 0
+    ? `\n👕 Pressing  ·  *GHS ${pressingFee.toFixed(2)}*`
+    : '';
   return [
     `━━━━━━━━━━━━━━━━━━━━━━`, `🧾 *MIGO PRINT SHOP*`,
     `📍 _Circle · Near Benz Gate · Accra_`, `━━━━━━━━━━━━━━━━━━━━━━`,
-    `📄 *ORDER DETAILS*`, `━━━━━━━━━━━━━━━━━━━━━━`, items,
-    `━━━━━━━━━━━━━━━━━━━━━━`, `💰 *TOTAL:  GHS ${subtotal.toFixed(2)}*`,
+    `📄 *ORDER DETAILS*`, `━━━━━━━━━━━━━━━━━━━━━━`,
+    items + pressingLine,
+    `━━━━━━━━━━━━━━━━━━━━━━`,
+    `💰 *TOTAL:  GHS ${grandTotal.toFixed(2)}*`,
     `━━━━━━━━━━━━━━━━━━━━━━`, `🟡 *MTN MOBILE MONEY*`, ``,
     `   📱 *0552719245*`, `   👤 *KOW HABIB BAISIE*`, ``,
     `🗓 ${nowStr()}`, `━━━━━━━━━━━━━━━━━━━━━━`,
     `_Thank you for choosing Migo!_ 🙏`,
+  ].join('\n');
+}
+
+function buildReadyMsg(jobId) {
+  return [
+    `✅ *Your order is ready for pickup!*`, ``,
+    `🔑 *PICKUP CODE*`, ``,
+    `   *${jobId || '—'}*`, ``,
+    `📍 *Migo Print Shop*`,
+    `Circle branch, Near Benz Gate, Accra.`, ``,
+    `No pickup code — no job released. 🙏`,
   ].join('\n');
 }
 
@@ -950,7 +1067,7 @@ function startReceiveTimer(phone, session) {
       setTimer(phone, 'imageTimeout', 300000, async () => {
         if (session.state !== 'asking_image_info') return;
         session.pendingImages = []; session.state = 'asked_done';
-        await sendMsg(phone, 'Have you finished sending?');
+        await sendMsg(phone, 'All done sending? 👍');
         setTimer(phone, 'nodone', 60000, async () => {
           if (session.state === 'asked_done') await proceedToSummary(phone, session);
         });
@@ -958,7 +1075,7 @@ function startReceiveTimer(phone, session) {
       return;
     }
     session.state = 'asked_done';
-    await sendMsg(phone, 'Have you finished sending?');
+    await sendMsg(phone, 'All done sending? 👍');
     setTimer(phone, 'nodone', 60000, async () => {
       if (session.state === 'asked_done') await proceedToSummary(phone, session);
     });
@@ -970,6 +1087,23 @@ async function proceedToSummary(phone, session) {
     await sendMsg(phone, `I could not detect any files. Please send your files and I will calculate the cost.`);
     session.state = 'receiving'; return;
   }
+  // Only ask about pressing if customer mentioned it and we haven't asked yet
+  if (session.pressingMentioned && !session.askedPressing) {
+    session.askedPressing = true;
+    session.state = 'asking_pressing';
+    await sendMsg(phone, `Pressing details — how many shirts and front only, front+back, or side? (Type *no* to skip)`);
+    setTimer(phone, 'pressing_timeout', 90000, async () => {
+      if (session.state === 'asking_pressing') {
+        session.pressing = null;
+        session.state = 'confirming';
+        await sendMsg(phone, buildSummary(session));
+        setTimer(phone, 'autoconfirm', 60000, async () => {
+          if (session.state === 'confirming') await sendBill(phone, session);
+        });
+      }
+    });
+    return;
+  }
   session.state = 'confirming';
   await sendMsg(phone, buildSummary(session));
   setTimer(phone, 'autoconfirm', 60000, async () => {
@@ -978,9 +1112,34 @@ async function proceedToSummary(phone, session) {
 }
 
 async function sendBill(phone, session) {
+  // Sunday: only bulk (200+ A4 equivalent)
+  const { isSunday } = shopStatus();
+  if (isSunday && (session.a4eq || 0) < 200) {
+    clearTimers(phone);
+    session.state = 'idle';
+    session.files = []; session.unknownFiles = []; session.pendingImages = [];
+    session.totalBill = null; session.a4eq = 0; session.askedPressing = false; session.pressingMentioned = false;
+    return sendMsg(phone, [
+      `📅 *Sunday Notice*`,
+      `On Sundays we process bulk orders only (200+ sheets).`,
+      `Your order is below our Sunday minimum.`,
+      `We'll process yours *first thing Monday*. Sorry for the inconvenience! 🙏`,
+    ].join('\n'));
+  }
+
   session.state = 'awaiting_payment';
   audit('BILL_SENT', phone, `GHS ${session.totalBill?.toFixed(2)}`);
   await sendMsg(phone, `Order received. Sending your bill now. 🙏`);
+
+  // 3-day auto-close if no payment
+  setTimer(phone, 'pay_expire', 3 * 24 * 3600000, async () => {
+    if (session.state === 'awaiting_payment') {
+      const waId = phone.includes('@') ? phone : toWaId(phone);
+      await sendMsg(waId, `Hi${session.customerName ? ' ' + session.customerName.split(' ')[0] : ''}! Your order has been cancelled as we didn't receive payment. Send your files again whenever you're ready. 🙏`);
+      archiveSession(waId, session, 'expired_no_payment');
+    }
+  });
+
   setTimeout(async () => {
     await sendMsg(phone, buildBill(session));
     setTimer(phone, 'pay1', 600000, () => {
@@ -990,6 +1149,10 @@ async function sendBill(phone, session) {
     setTimer(phone, 'pay2', 1800000, () => {
       if (session.state === 'awaiting_payment')
         sendMsg(phone, `🔔 *GHS ${session.totalBill?.toFixed(2)}* still pending. Please pay to keep your slot.`);
+    });
+    setTimer(phone, 'pay3', 3600000, () => {
+      if (session.state === 'awaiting_payment')
+        sendMsg(phone, `⚠️ Last reminder: Your order will be cancelled if payment is not received. MoMo: *0552719245*.`);
     });
   }, 2000);
 }
@@ -1028,6 +1191,11 @@ function scheduleWorkerReminders(phone, session, jobId) {
 }
 
 async function handleImage(from, session, mediaUrl, caption) {
+  // Duplicate check
+  const isDuplicate = session.files.some(f => f.sourceUrl === mediaUrl)
+    || session.pendingImages.some(p => p.url === mediaUrl);
+  if (isDuplicate) return null; // silently ignore
+
   // Track for desktop agent
   trackFile(from, mediaUrl, caption || 'image.jpg', 'image/jpeg', caption, session);
   const orders = await extractOrder(caption, '', session);
@@ -1036,29 +1204,48 @@ async function handleImage(from, session, mediaUrl, caption) {
     const bgNote = /no.?background|remove.?background|no.?bg|transparent/i.test(caption)
       ? 'remove background'
       : /with.?background|keep.?background|with.?bg/i.test(caption) ? 'keep background' : '';
-    valid.forEach(o => addFile(session, o, caption || 'image', bgNote));
+    valid.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, caption || 'image', bgNote));
     startReceiveTimer(from, session);
-    return null;
+    return `📥 Got it! Send more files or wait for the summary.`;
+  }
+  // Check if customer already told us the size via text
+  if (session.pendingTextOrder?.length > 0) {
+    session.pendingTextOrder.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, caption || 'image', ''));
+    session.pendingTextOrder = null;
+    startReceiveTimer(from, session);
+    return `📥 Got it!`;
   }
   session.pendingImages.push({ url: mediaUrl, caption, index: session.pendingImages.length + 1 });
   startReceiveTimer(from, session);
   return !caption
-    ? [`Please provide:`, `  1️⃣ Size — A4, A3, or A2?`, `  2️⃣ Quantity — copies?`, `  3️⃣ Background — keep or remove?`].join('\n')
-    : [`Thank you! Please specify:`, ``, `  1️⃣  *Size* — A4, A3, or A2?`, `  2️⃣  *Quantity* — How many copies?`, `  3️⃣  *Background* — Keep or remove?`].join('\n');
+    ? `📥 Received! Size? (A4 / A3 / A2) · Qty? · Background? (keep/remove)`
+    : `📥 Received! Size? (A4 / A3 / A2) · Qty? · Background? (keep/remove)`;
 }
 
 async function handleDoc(from, session, mediaUrl, caption, filename) {
+  // Duplicate check
+  const isDuplicate = session.files.some(f => f.sourceUrl === mediaUrl)
+    || session.unknownFiles.some(u => u.url === mediaUrl);
+  if (isDuplicate) return null;
+
   trackFile(from, mediaUrl, filename || 'file.pdf', 'application/pdf', caption, session);
   const orders = await extractOrder(caption, filename, session);
   const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
   if (valid.length > 0) {
-    valid.forEach(o => addFile(session, o, caption || filename, ''));
+    valid.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, caption || filename, ''));
     startReceiveTimer(from, session);
-    return null;
+    return `📥 Got it!`;
+  }
+  // Check if customer already told us the size via text
+  if (session.pendingTextOrder?.length > 0) {
+    session.pendingTextOrder.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, filename || 'your file', ''));
+    session.pendingTextOrder = null;
+    startReceiveTimer(from, session);
+    return `📥 Got it!`;
   }
   session.unknownFiles.push({ name: filename || 'your file', url: mediaUrl });
   startReceiveTimer(from, session);
-  return `What size and quantity for "${filename || 'your file'}"? (A4 / A3 / A2)`;
+  return `📥 File received! What size is *"${filename || 'your file'}"*? (A4 / A3 / A2) and how many copies?`;
 }
 
 // ── File tracking for desktop agent ──────────────────────────
@@ -1115,16 +1302,66 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   const session = getSession(from);
   if (session.paused) return null;
 
-  // Auto-reset stale sessions (12h)
+  // Auto-reset stale sessions (12h) — guard against double-reset
   const STALE = 12 * 60 * 60 * 1000;
-  if (Date.now() - session.lastActivity > STALE
-      && ['idle','receiving','asked_done','confirming','asking_image_info','ready'].includes(session.state)) {
+  if (!body?.startsWith('__reset__') && Date.now() - session.lastActivity > STALE
+      && ['idle','receiving','asked_done','confirming','asking_image_info','asking_pressing','ready'].includes(session.state)) {
     clearTimers(from); sessions.delete(from);
     return handleMessage(from, body, mediaUrl, mediaType, filename, isImage);
   }
   session.lastActivity = Date.now();
 
-  // ── IDLE ────────────────────────────────────────────────────
+  // ── Detect pressing mention anywhere in message ───────────
+  if (/\bpress(ing|ed)?\b/i.test(msg || '')) session.pressingMentioned = true;
+
+  // ── First-time welcome + name ask ────────────────────────
+  if (session.isFirstTime && !session.customerName && session.state !== 'asking_name') {
+    session.isFirstTime = false;
+    const { isSunday } = shopStatus();
+    const sundayNote = isSunday ? `\n\n_Note: Sundays we process bulk orders (200+ sheets) only._` : ``;
+    await sendMsg(from, `👋 Welcome to *Migo Print Shop!* 🖨️\nCircle branch · Near Benz Gate · Accra${sundayNote}\n\nMay I know your name please?`);
+    session.state = 'asking_name';
+    return null;
+  }
+
+  // ── Name greeting helper ──────────────────────────────────
+  const greet = session.customerName ? `${session.customerName.split(' ')[0]}, ` : ``;
+
+  // ── ASKING NAME ───────────────────────────────────────────
+  if (session.state === 'asking_name') {
+    const name = (msg || '').trim().replace(/^(i.?m|my name is|call me|its|it.?s)\s*/i, '').trim();
+    if (name.length > 1 && name.length < 40 && !/\d{5}/.test(name)) {
+      session.customerName = name.charAt(0).toUpperCase() + name.slice(1);
+    }
+    session.state = 'idle';
+    const first = session.customerName ? session.customerName.split(' ')[0] : 'there';
+    await sendMsg(from, `Nice to meet you, *${first}*! 😊\nHow can we help you today?`);
+    return null;
+  }
+
+  // ── Job-ready check (natural language) ───────────────────
+  if (isReadyCheck(msg || '') && session.state !== 'idle') {
+    if (session.state === 'ready') {
+      return `✅ Yes${greet}your order is ready! Come in with your pickup code *${session.jobId}* and we'll sort you out. 📍 Near Benz Gate, Circle.`;
+    }
+    if (session.state === 'processing') {
+      const eta = session.readyTime
+        ? session.readyTime.toLocaleTimeString('en-GH', { timeZone: 'Africa/Accra', hour12: true, hour: '2-digit', minute: '2-digit' })
+        : 'shortly';
+      return `Not yet${greet}we're still working on it. 🖨️ Estimated ready: *${eta}*. We'll notify you as soon as it's done!`;
+    }
+    if (session.state === 'awaiting_payment') {
+      return `We haven't received your payment yet${greet}Once payment is confirmed we'll start printing and notify you. 🙏`;
+    }
+  }
+
+  // ── FAQ quick-match ───────────────────────────────────────
+  if (msg && session.state === 'idle') {
+    const faqAnswer = tryFAQ(msg);
+    if (faqAnswer) return faqAnswer;
+  }
+
+  // ── IDLE ─────────────────────────────────────────────────
   if (session.state === 'idle') {
     if (mediaUrl) {
       session.state = 'receiving';
@@ -1135,7 +1372,12 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       session.state = 'receiving';
       const orders = await extractOrder(msg, null, session);
       const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
-      if (valid.length > 0) { valid.forEach(o => addFile(session, o, msg, '')); startReceiveTimer(from, session); return null; }
+      if (valid.length > 0) {
+        // Text-only order — store as pending, ask for files
+        session.pendingTextOrder = valid;
+        startReceiveTimer(from, session);
+        return `Got it! Please send your file(s) and we'll sort it out. 📎`;
+      }
       return replyWithClaude(msg, session);
     }
     return null;
@@ -1150,7 +1392,27 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     if (msg) {
       const orders = await extractOrder(msg, null, session);
       const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
-      if (valid.length > 0) { valid.forEach(o => addFile(session, o, msg, '')); startReceiveTimer(from, session); return null; }
+      if (valid.length > 0) {
+        // Scenario 5: "all A3 1 each" — apply to all unknown files and pending images
+        const allKeywords = /\ball\b/i.test(msg);
+        const eachKeywords = /\beach\b/i.test(msg);
+        if ((allKeywords || eachKeywords) && valid.length === 1 && session.unknownFiles.length > 0) {
+          const { size, qty } = valid[0];
+          // Apply to every unknown file
+          session.unknownFiles.forEach(() => addFile(session, { size, qty, isUnknown: false, isMoreOf: null }, msg, ''));
+          session.unknownFiles = [];
+          // Apply to every pending image too
+          session.pendingImages.forEach(() => addFile(session, { size, qty, isUnknown: false, isMoreOf: null }, msg, ''));
+          session.pendingImages = [];
+          clearTimers(from);
+          await proceedToSummary(from, session);
+          return null;
+        }
+        // Normal: store as pending text order
+        session.pendingTextOrder = valid;
+        startReceiveTimer(from, session);
+        return `Got it! Send your file(s) and we'll calculate. 📎`;
+      }
       return replyWithClaude(msg, session);
     }
     return null;
@@ -1177,9 +1439,34 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       }
       session.pendingImages = unresolved;
       if (session.pendingImages.length > 0)
-        return `Thank you. I still need instructions for ${session.pendingImages.length} image(s). Please provide size, quantity, and background.`;
+        return `Still need details for ${session.pendingImages.length} image(s). Size / qty / background?`;
       clearTimers(from); await proceedToSummary(from, session); return null;
     }
+    return null;
+  }
+
+  // ── ASKING PRESSING ─────────────────────────────────────────
+  if (session.state === 'asking_pressing') {
+    clearTimers(from);
+    const lower = (msg || '').toLowerCase().trim();
+    if (lower === 'no' || lower === 'nope' || lower === 'nah' || lower === 'skip') {
+      session.pressing = null;
+    } else {
+      // Parse pressing info: "10 front", "5 front+back", "3 side", "10 front large"
+      const shirtsMatch = msg.match(/(\d+)/);
+      const shirts = shirtsMatch ? parseInt(shirtsMatch[1]) : 1;
+      const type = /front.?back|both/i.test(msg) ? 'front_back'
+                 : /side/i.test(msg)              ? 'side'
+                 :                                  'front';
+      const largeArtwork = /large|big/i.test(msg);
+      session.pressing = { shirts, type, largeArtwork };
+    }
+    session.askedPressing = true;
+    session.state = 'confirming';
+    await sendMsg(from, buildSummary(session));
+    setTimer(from, 'autoconfirm', 60000, async () => {
+      if (session.state === 'confirming') await sendBill(from, session);
+    });
     return null;
   }
 
@@ -1214,55 +1501,54 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       }
       session.unknownFiles.splice(0, resolved);
       if (session.unknownFiles.length > 0)
-        return `Got it! I still need size/quantity for:\n${session.unknownFiles.map(u=>`  • ${u.name}`).join('\n')}\n\n_e.g. "5 A3"_`;
+        return `Still need size for:\n${session.unknownFiles.map(u=>`  • ${u.name}`).join('\n')}\n_e.g. 5 A3_`;
       clearTimers(from); await proceedToSummary(from, session); return null;
     }
     clearTimers(from);
     if (isYes(msg)) { await sendBill(from, session); return null; }
     session.state = 'receiving'; session.files = []; session.unknownFiles = []; session.pendingImages = [];
-    await sendMsg(from, `No problem! Please send the correct details.`);
+    await sendMsg(from, `No problem! What's the correct size and quantity? 📝`);
     startReceiveTimer(from, session); return null;
   }
 
   // ── AWAITING PAYMENT ─────────────────────────────────────────
   if (session.state === 'awaiting_payment') {
     if (mediaUrl && isImage) {
+      // Only treat as receipt if it has an amount (GHS value) — otherwise it's a new design file
+      const ocr = await extractReceiptFromImage(mediaUrl);
+      if (ocr && ocr.amount) {
+        // Has amount = it's a MoMo receipt
+        if (ocr.txId) {
+          session.pendingTxId = ocr.txId; session.pendingTxAmount = ocr.amount;
+          audit('RECEIPT_SCANNED', from, `TxID:${ocr.txId}`);
+        }
+        return ocr.txId
+          ? `Got it! TxID *${ocr.txId}* noted — GHS ${ocr.amount.toFixed(2)}. We'll confirm shortly. 🙏`
+          : `Got it! GHS ${ocr.amount.toFixed(2)} noted. Please reply with your *Transaction ID* so we can confirm faster.`;
+      }
+      // No amount = treat as a new design file
       if (msg) {
         const orders = await extractOrder(msg, '', session);
         const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
         if (valid.length > 0) {
           valid.forEach(o => addFile(session, o, msg, ''));
-          const { subtotal, a4eq } = calcBill(session.files);
-          session.totalBill = subtotal; session.a4eq = a4eq;
-          await sendMsg(from, `I have added your new file. Here is your updated bill:`);
-          setTimeout(() => sendMsg(from, buildBill(session)), 1500);
+          const billMsg = buildBill(session); // buildBill recalcs including pressing
+          await sendMsg(from, `New file added. Updated total:`);
+          setTimeout(() => sendMsg(from, billMsg), 1000);
           return null;
         }
       }
-      // Try OCR
-      const ocr = await extractReceiptFromImage(mediaUrl);
-      if (ocr && ocr.txId) {
-        session.pendingTxId = ocr.txId; session.pendingTxAmount = ocr.amount;
-        audit('RECEIPT_SCANNED', from, `TxID:${ocr.txId}`);
-        return [`✅ Thank you for your receipt!`, ``,
-          `📋 *Receipt details:*`,
-          `   💰 GHS ${ocr.amount?.toFixed(2) || '—'}`,
-          `   🧾 TxID: ${ocr.txId}`, ``,
-          `We will confirm your payment shortly. 🙏`].join('\n');
-      }
-      return [`Thank you for your receipt! 🙏`, ``,
-        `We could not read the Transaction ID automatically.`,
-        `Please reply with your *Transaction ID* to confirm faster.`,
-        `_Example: "My TxID is 82052935078"_`].join('\n');
+      // Image with no caption and no OCR amount — ask for details
+      session.pendingImages.push({ url: mediaUrl, caption: msg, index: session.pendingImages.length + 1 });
+      return `Got the image! Size and quantity? (e.g. A4 × 5)`;
     }
     if (mediaUrl && !isImage) {
       const prev = session.files.length;
       await handleDoc(from, session, mediaUrl, msg, filename);
       if (session.files.length > prev) {
-        const { subtotal, a4eq } = calcBill(session.files);
-        session.totalBill = subtotal; session.a4eq = a4eq;
-        await sendMsg(from, `I have added your new file. Here is your updated bill:`);
-        setTimeout(() => sendMsg(from, buildBill(session)), 1500);
+        const billMsg = buildBill(session); // buildBill handles pressing too
+        await sendMsg(from, `New file added. Updated total:`);
+        setTimeout(() => sendMsg(from, billMsg), 1000);
       }
       return null;
     }
@@ -1271,12 +1557,19 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     if (txIdTyped) {
       session.pendingTxId = txIdTyped[1]; session.awaitingTxId = false;
       audit('TXID_PROVIDED', from, `TxID:${txIdTyped[1]}`);
-      return [`Thank you! We have noted your Transaction ID: *${txIdTyped[1]}*`, ``,
-        `We will match it to your payment shortly. 🙏`].join('\n');
+      return `Got it! TxID *${txIdTyped[1]}* noted. We'll confirm shortly. 🙏`;
     }
-    if (isMomoReceipt(lower)) return [`Thank you! 🙏 We have received your payment notification and will confirm shortly.`, ``, `🟡 *MTN MoMo: 0552719245*`].join('\n');
+    if (isMomoReceipt(lower)) {
+      if (!session.totalBill || session.totalBill <= 0) return null;
+      return `Got it! We'll confirm your payment shortly. 🙏`;
+    }
+    // Re-send bill request
+    if (/send.*bill|bill again|resend.*bill|can.?t see|didn.?t (get|receive)|show.*bill|send.*again/i.test(lower)) {
+      await sendMsg(from, buildBill(session));
+      return null;
+    }
     if (/how much|total|bill|balance|amount/.test(lower))
-      return `Your total is *GHS ${session.totalBill?.toFixed(2) || '—'}*.\n\n🟡 Pay to MoMo *0552719245* (Kow Habib Baisie). 🙏`;
+      return `Total: *GHS ${session.totalBill?.toFixed(2) || '—'}*\n🟡 MoMo *0552719245* (Kow Habib Baisie)`;
     return replyWithClaude(msg, session);
   }
 
@@ -1295,15 +1588,16 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     const n = parseInt(msg);
     if (!isNaN(n) && n >= 1 && n <= 5) {
       let reply, sentiment;
-      if (n === 5) { reply = `🎉 Thank you so much! We are thrilled you had a great experience!`; sentiment = 'excellent'; }
-      else if (n === 4) { reply = `😊 Thank you! We appreciate your kind feedback.`; sentiment = 'good'; }
-      else if (n === 3) { reply = `🙏 Thank you! We will work hard to do better next time.`; sentiment = 'okay'; }
-      else { reply = `😔 We are truly sorry. Please tell us what went wrong so we can improve.`; sentiment = 'poor'; }
+      if (n === 5) { reply = `🎉 Amazing — thank you! See you next time!`; sentiment = 'excellent'; }
+      else if (n === 4) { reply = `😊 Thanks! Glad you're happy with the result.`; sentiment = 'good'; }
+      else if (n === 3) { reply = `🙏 Thank you. We'll do better next time!`; sentiment = 'okay'; }
+      else { reply = `😔 So sorry to hear that. What went wrong? We want to fix it.`; sentiment = 'poor'; }
       ratingsLog.unshift({
         ts: nowStr(), date: todayStr(), phone: displayPhone(from),
         jobId: session.jobId || '—', score: n, sentiment, comment: '',
         files: [...(session.confirmedFiles || [])],
       });
+      session.ratingGiven = true;
       audit('RATING', from, `${n}/5 — ${sentiment} | Job:${session.jobId||'—'}`);
       if (n <= 2) await alertOwner(`⭐ *BAD RATING*\nCustomer ...${last4(from)} — ${n}/5 | Job: ${session.jobId||'—'}`);
       clearTimers(from); sessions.delete(from);
@@ -1405,16 +1699,7 @@ async function handleAdmin(from, msg) {
       const found2 = findByLast4(l4);
       if (found2) {
         found2.session.state = 'ready'; clearTimers(found2.key);
-        await sendMsg(found2.key, [
-          `✅ *Your order is ready for pickup!*`, ``,
-          `🔑 *PICKUP CODE*`, ``,
-          `   *${found2.session.jobId || '—'}*`, ``,
-          `━━━━━━━━━━━━━━━━━━━━━━`,
-          `⚠️ Show this code when collecting.`,
-          `*No pickup code — no job released.*`, ``,
-          `📍 *Migo Print Shop*`, `Circle branch, Near Benz Gate, Accra.`, ``,
-          `Thank you for choosing Migo! 🙏`,
-        ].join('\n'));
+        await sendMsg(found2.key, buildReadyMsg(found2.session.jobId));
       }
       return `✅ Job marked ready. Customer notified.`;
     }
@@ -1447,15 +1732,19 @@ async function handleAdmin(from, msg) {
       const flow = overdueFlow.get(found2.key);
       const [hh, mm] = (flow.newTime || '12:00').split(':').map(Number);
       const newDate = new Date();
-      newDate.setHours(hh, (mm || 0) + 30, 0, 0);
+      newDate.setHours(hh, mm || 0, 0, 0);
+      // If time already passed today, push to tomorrow
+      if (newDate <= new Date()) newDate.setDate(newDate.getDate() + 1);
       const newETA = newDate.toLocaleTimeString('en-GH', {
         timeZone: 'Africa/Accra', hour12: true, hour: '2-digit', minute: '2-digit',
       });
+      // Update session ready time
+      found2.session.readyTime = newDate;
+      // Send new ready time first, then apology
       await sendMsg(found2.key, [
-        `We sincerely apologise for the delay on your order. 🙏`, ``,
-        `⏱ *ESTIMATED READY TIME*`, ``,
+        `⏱ *UPDATED READY TIME*`, ``,
         `   *${newETA}*`, ``,
-        `We will notify you when your order is ready. 🙏`,
+        `We sincerely apologise for the delay. Thank you for your patience. 🙏`,
       ].join('\n'));
       await alertOwner([
         `🔴 *JOB OVERDUE ALERT*`, ``,
@@ -1463,11 +1752,11 @@ async function handleAdmin(from, msg) {
         `📱 Customer: ...${l4}`,
         `🕐 New ETA: *${newETA}*`,
         `❓ Reason: ${reason}`,
-        `👤 Reported by: ${workerName || 'worker'}`,
+        `👤 By: ${workerName || 'worker'}`,
       ].join('\n'));
       overdueFlow.delete(found2.key);
       audit('JOB_DELAY', found2.key, `New ETA: ${newETA} — Reason: ${reason}`, true, workerId);
-      return `✅ Customer notified. New ETA: ${newETA}. Owner alerted with reason.`;
+      return `✅ Customer notified. New ETA: ${newETA}. Owner alerted.`;
     }
   }
 
@@ -1512,36 +1801,33 @@ async function handleAdmin(from, msg) {
 
   if (cmd === 'ready') {
     const input = args[0] || '';
-    let phone, s;
+    // Support: admin W01 ready 9245 (last4) or admin W01 ready MGO-9245-A1001 (jobId)
     const byLast4 = findByLast4(input);
+    let phone, s;
     if (byLast4) { phone = byLast4.key; s = byLast4.session; }
     else {
       for (const [key, sess] of sessions.entries())
         if (sess.jobId === input.toUpperCase()) { phone = key; s = sess; break; }
     }
-    if (!s) return `❌ No session for "${input}".`;
+    if (!s) return `❌ No session for "${input}".\nUsage: admin W01 ready <last4>`;
     s.state = 'ready'; s.servedBy = workerId; clearTimers(phone);
     audit('MARKED_READY', from, `Job ${s.jobId||'—'} by ${workerName}`, false, workerId);
-    const readyMsg = [
-      `✅ *Your order is ready for pickup!*`, ``,
-      `🔑 *PICKUP CODE*`, ``,
-      `   *${s.jobId || '—'}*`, ``,
-      `━━━━━━━━━━━━━━━━━━━━━━`,
-      `⚠️ Show this code when collecting.`,
-      `*No pickup code — no job released.*`, ``,
-      `📍 *Migo Print Shop*`,
-      `Circle branch, Near Benz Gate, Accra.`, ``,
-      `Thank you for choosing Migo! 🙏`,
-    ].join('\n');
+    const readyMsg = buildReadyMsg(s.jobId);
     await sendMsg(phone, readyMsg);
     setTimer(phone, 'rating', 1800000, async () => {
       if (!s.ratingAsked) {
         s.ratingAsked = true;
         await sendMsg(phone, [`⭐ How was your experience at Migo Print Shop?`, ``,
           `5 — Excellent  |  4 — Good  |  3 — Okay  |  2 — Poor  |  1 — Very poor`].join('\n'));
+        // Follow-up if no rating after 2 hours
+        setTimer(phone, 'rating_followup', 7200000, async () => {
+          if (s.state === 'ready' && !s.ratingGiven) {
+            await sendMsg(phone, `😊 We'd love to hear how your experience was! Just reply with a number:\n5 — Excellent  |  4 — Good  |  3 — Okay  |  2 — Poor  |  1 — Very poor`);
+          }
+        });
       }
     });
-    return `✅ Ready notification sent for ...${last4(phone)}.`;
+    return `✅ Ready sent to ...${last4(phone)}.`;
   }
 
   if (cmd === 'status') {
@@ -1777,15 +2063,17 @@ async function sendDailySummary() {
   const abandoned = todayArchive.filter(a => a.reason === 'abandoned').length;
   const overdueCount = auditLog.filter(a => a.action === 'JOB_OVERDUE' && a.date === todayStr()).length;
 
+  const pressingT = todayP.reduce((s, p) => s + (p.pressingFee || 0), 0);
   await alertOwner([
     `━━━━━━━━━━━━━━━━━━━━━━`,
     `📊 *MIGO DAILY SUMMARY*`,
     `📅 ${todayStr()} 🕗 8pm`,
     `━━━━━━━━━━━━━━━━━━━━━━`, ``,
-    `🟡 MoMo:  GHS ${momoT.toFixed(2)}`,
-    `💵 Cash:  GHS ${cashT.toFixed(2)}`,
+    `🟡 MoMo:      GHS ${momoT.toFixed(2)}`,
+    `💵 Cash:      GHS ${cashT.toFixed(2)}`,
+    pressingT > 0 ? `👕 Pressing:  GHS ${pressingT.toFixed(2)}` : ``,
     `━━━━━━━━`,
-    `💰 TOTAL: GHS ${(momoT + cashT).toFixed(2)}`, ``,
+    `💰 TOTAL:     GHS ${(momoT + cashT).toFixed(2)}`, ``,
     `*Cash by worker:*`, wb, ``,
     `⭐ Avg Rating: ${avgR} (${todayR.length} reviews)`,
     `🚩 Flagged events: ${flagged}`,
@@ -1800,14 +2088,23 @@ async function sendDailySummary() {
     `❌ Abandoned: ${abandoned}`,
     `⚠️ Overdue:   ${overdueCount}`,
     `━━━━━━━━━━━━━━━━━━━━━━`,
-  ].join('\n'));
+  ].filter(l => l !== '').join('\n'));
 }
 
 function schedule8pm() {
   const now  = new Date();
   const next = new Date(); next.setHours(20, 0, 0, 0);
   if (next <= now) next.setDate(next.getDate() + 1);
-  setTimeout(async () => { await sendDailySummary(); schedule8pm(); }, next - now);
+  setTimeout(async () => {
+    // Close all open sessions before daily summary
+    for (const [key, s] of sessions.entries()) {
+      if (!['processing', 'ready'].includes(s.state)) {
+        archiveSession(key, s, 'end_of_day');
+      }
+    }
+    await sendDailySummary();
+    schedule8pm();
+  }, next - now);
   console.log(`⏰ Daily summary scheduled in ${Math.round((next-now)/60000)} mins`);
 }
 
@@ -1881,8 +2178,22 @@ app.post('/webhook', async (req, res) => {
   console.log(`📩 WA: ${from} — "${(body||'').slice(0,60)}" media=${!!mediaUrl}`);
   logMsg(from, 'in', body || '[media]');
 
+  // Strip WhatsApp forwarded prefix
+  const cleanBody = stripForwarded(body);
+
+  // ── Shop hours check ─────────────────────────────────────────
+  const { open, isSunday } = shopStatus();
+  const session = getSession(from);
+  if (!open && !cleanBody?.toLowerCase().startsWith('admin')) {
+    await sendMsg(from, `We're currently closed. We're open *7am – 10pm*, Mon–Sun.\nSend your files anytime and we'll process them first thing when we open. 🙏`);
+    return;
+  }
+
+  // Sunday: only bulk (200+ A4eq)
+  // We don't know order size yet, so we flag it after bill is calculated
+
   try {
-    const reply = await handleMessage(from, body, mediaUrl, mediaType, filename, isImage);
+    const reply = await handleMessage(from, cleanBody, mediaUrl, mediaType, filename, isImage);
     if (reply) await sendMsg(from, reply);
   } catch (err) {
     console.error('❌ Webhook error:', err.message);
@@ -1967,17 +2278,7 @@ app.get('/mark-ready/:phone', async (req, res) => {
     if (sess.jobId === raw.toUpperCase()) { s = sess; break; }
   if (!s) return res.json({ status: 'error', message: 'Not found' });
   s.state = 'ready'; clearTimers(waId);
-  const readyMsg2 = [
-    `✅ *Your order is ready for pickup!*`, ``,
-    `🔑 *PICKUP CODE*`, ``,
-    `   *${s.jobId || '—'}*`, ``,
-    `━━━━━━━━━━━━━━━━━━━━━━`,
-    `⚠️ Show this code when collecting.`,
-    `*No pickup code — no job released.*`, ``,
-    `📍 *Migo Print Shop*`,
-    `Circle branch, Near Benz Gate, Accra.`, ``,
-    `Thank you for choosing Migo! 🙏`,
-  ].join('\n');
+  const readyMsg2 = buildReadyMsg(s.jobId);
   await sendMsg(waId, readyMsg2);
   setTimer(waId, 'rating', 1800000, async () => {
     if (!s.ratingAsked) {
@@ -2095,10 +2396,16 @@ app.get('/api/stats', (req, res) => {
 // ── Health ────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
   status:   botCrashed ? 'CRASHED' : botActive ? 'running' : 'stopped',
-  version:  'v19b',
+  version:  BOT_VERSION,
   model:    MODEL,
   sessions: sessions.size,
-  uptime:   process.uptime().toFixed(0) + 's',
+  uptime:   `${Math.floor(process.uptime()/3600)}h ${Math.floor(process.uptime()%3600/60)}m`,
+  started:  new Date(BOT_START).toLocaleString('en-GH', { timeZone: 'Africa/Accra' }),
+  queue: {
+    active:          [...sessions.values()].filter(s => s.state === 'processing').length,
+    awaiting_payment:[...sessions.values()].filter(s => s.state === 'awaiting_payment').length,
+    ready:           [...sessions.values()].filter(s => s.state === 'ready').length,
+  },
 }));
 
 // ── Dashboard ─────────────────────────────────────────────────
@@ -2109,66 +2416,150 @@ function adminHTML() {
     '<!DOCTYPE html><html><head><meta charset="UTF-8">',
     '<meta name="viewport" content="width=device-width,initial-scale=1">',
     '<title>Migo Admin</title>',
-    '<style>*{margin:0;padding:0;box-sizing:border-box}',
-    'body{background:#0f172a;color:#f1f5f9;font-family:Arial,sans-serif;min-height:100vh}',
-    '.hd{background:#1e293b;border-bottom:2px solid #3b82f6;padding:12px 20px;display:flex;justify-content:space-between;align-items:center}',
-    '.hd h1{font-size:15px;font-weight:700}',
-    '.stats{display:flex;gap:10px;flex-wrap:wrap;padding:14px}',
-    '.stat{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:10px 14px;min-width:110px;text-align:center}',
-    '.stat-n{font-size:20px;font-weight:800}.stat-l{font-size:10px;color:#64748b;margin-top:2px}',
-    '.tabs{display:flex;gap:4px;padding:0 14px;flex-wrap:wrap}',
-    '.tab{padding:8px 14px;background:#1e293b;border:1px solid #334155;border-radius:8px 8px 0 0;cursor:pointer;font-size:12px;font-weight:600;color:#94a3b8;border-bottom:none}',
-    '.tab.on{background:#3b82f6;color:#fff;border-color:#3b82f6}',
-    '.box{background:#1e293b;margin:0 14px;border:1px solid #334155;border-radius:0 0 10px 10px;padding:12px;display:none}',
-    '.box.on{display:block}',
+    '<style>',
+    '*{margin:0;padding:0;box-sizing:border-box}',
+    'body{background:#0f172a;color:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;min-height:100vh;padding-bottom:70px}',
+    /* Header */
+    '.hd{background:#1e293b;border-bottom:1px solid #334155;padding:10px 16px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:100}',
+    '.hd-left{display:flex;align-items:center;gap:10px}',
+    '.hd-logo{font-size:18px}.hd-title{font-size:14px;font-weight:700;color:#f1f5f9}',
+    '.hd-sub{font-size:10px;color:#64748b;margin-top:1px}',
+    '.hd-dot{width:7px;height:7px;border-radius:50%;background:#10b981;animation:pulse 2s infinite}',
+    '@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}',
+    /* Stats bar */
+    '.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:12px 14px}',
+    '.stat{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:10px 12px;text-align:center}',
+    '.stat-n{font-size:18px;font-weight:800;line-height:1.1}',
+    '.stat-l{font-size:9px;color:#64748b;margin-top:3px;text-transform:uppercase;letter-spacing:.5px}',
+    '.gr{color:#10b981}.bl{color:#3b82f6}.am{color:#f59e0b}.rd{color:#ef4444}',
+    /* Content panels */
+    '.panel{padding:0 14px;display:none}.panel.on{display:block}',
+    /* Section headers inside panels */
+    '.section-hd{display:flex;justify-content:space-between;align-items:center;padding:10px 0 8px}',
+    '.section-hd h2{font-size:12px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.6px}',
+    /* Tables */
+    '.tbl-wrap{background:#1e293b;border:1px solid #334155;border-radius:10px;overflow:hidden}',
     'table{width:100%;border-collapse:collapse;font-size:11px}',
-    'th{background:#0f172a;padding:7px;text-align:left;color:#64748b;font-weight:600}',
-    'td{padding:7px;border-bottom:1px solid #0f172a;vertical-align:top}',
-    'tr:hover td{background:#0f172a30}',
-    '.badge{padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700}',
-    '.gr{background:#10b98120;color:#10b981}.bl{background:#3b82f620;color:#3b82f6}',
-    '.am{background:#f59e0b20;color:#f59e0b}.rd{background:#ef444420;color:#ef4444}',
-    '.btn{padding:5px 10px;border:none;border-radius:5px;cursor:pointer;font-size:11px;font-weight:700}',
-    '.btn-b{background:#3b82f6;color:#fff}.btn-g{background:#10b981;color:#fff}.btn-r{background:#ef4444;color:#fff}',
-    'input{background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:6px 9px;border-radius:6px;font-size:11px;margin:0 4px 4px 0;width:90px}',
-    '.fl{color:#ef4444}.mt{color:#64748b;text-align:center;padding:20px}</style>',
+    'th{background:#0f172a;padding:8px 10px;text-align:left;color:#64748b;font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.5px}',
+    'td{padding:9px 10px;border-bottom:1px solid #0f172a;vertical-align:middle}',
+    'tr:last-child td{border-bottom:none}',
+    'tr:hover td{background:#ffffff06}',
+    /* Badges */
+    '.badge{padding:3px 8px;border-radius:20px;font-size:10px;font-weight:700;white-space:nowrap}',
+    '.bg-gr{background:#10b98118;color:#10b981}.bg-bl{background:#3b82f618;color:#3b82f6}',
+    '.bg-am{background:#f59e0b18;color:#f59e0b}.bg-rd{background:#ef444418;color:#ef4444}',
+    /* Buttons */
+    '.btn{padding:5px 11px;border:none;border-radius:6px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap}',
+    '.btn-g{background:#10b981;color:#fff}.btn-b{background:#3b82f6;color:#fff}',
+    '.btn-r{background:#ef4444;color:#fff}.btn-ghost{background:#334155;color:#94a3b8}',
+    /* Worker form */
+    '.w-form{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px;margin-bottom:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end}',
+    '.w-form input{background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:7px 10px;border-radius:7px;font-size:11px;width:90px;flex:1;min-width:70px}',
+    /* Bottom nav */
+    '.nav{position:fixed;bottom:0;left:0;right:0;background:#1e293b;border-top:1px solid #334155;display:flex;z-index:100}',
+    '.nav-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:8px 4px;cursor:pointer;color:#64748b;font-size:9px;font-weight:600;gap:3px;text-transform:uppercase;letter-spacing:.3px;border:none;background:none;transition:color .15s}',
+    '.nav-item.on{color:#3b82f6}',
+    '.nav-icon{font-size:18px;line-height:1}',
+    '.nav-item.on .nav-icon{filter:drop-shadow(0 0 4px #3b82f6aa)}',
+    /* Empty state */
+    '.empty{text-align:center;padding:32px 16px;color:#475569}',
+    '.empty-icon{font-size:36px;margin-bottom:8px}',
+    '.empty-txt{font-size:12px}',
+    /* Misc */
+    '.fl{color:#ef4444}',
+    /* Modal */
+    '.modal{display:none;position:fixed;inset:0;background:#000a;z-index:999;align-items:center;justify-content:center}',
+    '.modal-box{background:#1e293b;border:1px solid #334155;border-radius:16px;padding:22px;width:92%;max-width:320px}',
+    '.modal-box h3{font-size:14px;font-weight:700;margin-bottom:14px}',
+    '.modal-box label{font-size:11px;color:#94a3b8;display:block;margin-bottom:4px}',
+    '.modal-box input{width:100%;margin-bottom:12px;padding:9px 11px;background:#0f172a;border:1px solid #334155;color:#f1f5f9;border-radius:8px;font-size:13px}',
+    '.modal-row{display:flex;gap:8px;margin-top:6px}',
+    '.modal-row button{flex:1;padding:10px;border:none;border-radius:8px;font-size:12px;font-weight:700;cursor:pointer}',
+    '.err{color:#ef4444;font-size:11px;min-height:16px;margin-bottom:4px}',
+    '</style>',
     '</head><body>',
-    '<div class="hd"><h1>Migo Print Shop &mdash; Admin</h1>',
-    '<button class="btn btn-r" onclick="logout()">Logout</button></div>',
-    '<div class="stats" id="stats"><div class="stat"><div class="stat-n" id="sn">0</div><div class="stat-l">Sessions</div></div>',
-    '<div class="stat"><div class="stat-n gr" id="sm">GHS 0</div><div class="stat-l">MoMo Today</div></div>',
-    '<div class="stat"><div class="stat-n am" id="sc">GHS 0</div><div class="stat-l">Cash Today</div></div></div>',
-    '<div class="tabs">',
-    '<div class="tab on" onclick="sw(this,0)">Queue</div>',
-    '<div class="tab" onclick="sw(this,1)">Payments</div>',
-    '<div class="tab" onclick="sw(this,2)">Workers</div>',
-    '<div class="tab" onclick="sw(this,3)">Ratings</div>',
-    '<div class="tab" onclick="sw(this,4)">Audit</div></div>',
-    '<div class="box on" id="b0"><table><thead><tr><th>Customer</th><th>State</th><th>Files</th><th>Bill</th><th>Job ID</th><th>Action</th></tr></thead>',
-    '<tbody id="qb"></tbody></table></div>',
-    '<div class="box" id="b1"><table><thead><tr><th>Time</th><th>Customer</th><th>Amount</th><th>Type</th><th>Worker</th><th>Job ID</th></tr></thead>',
-    '<tbody id="pb"></tbody></table></div>',
-    '<div class="box" id="b2">',
-    '<div style="padding:8px 0"><input id="wi" placeholder="ID e.g. W04"><input id="wn" placeholder="Name"><input id="wp" placeholder="PIN">',
-    '<button class="btn btn-b" onclick="addW()">Add Worker</button></div>',
-    '<table><thead><tr><th>ID</th><th>Name</th><th>Added</th><th>Action</th></tr></thead>',
-    '<tbody id="wb"></tbody></table></div>',
-    '<div class="box" id="b3"><table><thead><tr><th>Time</th><th>Score</th><th>Job ID</th></tr></thead>',
-    '<tbody id="rb"></tbody></table></div>',
-    '<div class="box" id="b4"><table><thead><tr><th>Time</th><th>Action</th><th>Customer</th><th>Detail</th></tr></thead>',
-    '<tbody id="ab"></tbody></table></div>',
+    /* Header */
+    '<div class="hd">',
+    '  <div class="hd-left">',
+    '    <span class="hd-logo">🧾</span>',
+    '    <div><div class="hd-title">Migo Print Shop</div><div class="hd-sub">Admin Dashboard</div></div>',
+    '  </div>',
+    '  <div style="display:flex;align-items:center;gap:10px">',
+    '    <span class="hd-dot" title="Bot active"></span>',
+    '    <button class="btn btn-ghost" onclick="logout()" style="font-size:10px;padding:5px 10px">Sign out</button>',
+    '  </div>',
+    '</div>',
+    /* Cash Modal */
+    '<div class="modal" id="cm"><div class="modal-box">',
+    '<h3>💵 Confirm Cash Payment</h3>',
+    '<p style="font-size:11px;color:#94a3b8;margin-bottom:6px">Customer: <b id="cm-phone" style="color:#f1f5f9"></b></p>',
+    '<p style="font-size:11px;color:#94a3b8;margin-bottom:14px">Order total: <b id="cm-amt" style="color:#10b981"></b></p>',
+    '<label>Amount received (blank = full total)</label>',
+    '<input id="cm-custom" type="number" step="0.01" placeholder="e.g. 20.00">',
+    '<label>Your PIN</label>',
+    '<input id="cm-pin" type="password" placeholder="Enter your PIN" maxlength="6">',
+    '<div class="err" id="cm-err"></div>',
+    '<div class="modal-row">',
+    '<button style="background:#334155;color:#94a3b8" onclick="closeCash()">Cancel</button>',
+    '<button id="cm-btn" style="background:#10b981;color:#fff" onclick="confirmCash()">Confirm Cash</button>',
+    '</div></div></div>',
+    /* Stats bar */
+    '<div class="stats">',
+    '<div class="stat"><div class="stat-n" id="sn">—</div><div class="stat-l">Active Jobs</div></div>',
+    '<div class="stat"><div class="stat-n gr" id="sm">—</div><div class="stat-l">MoMo Today</div></div>',
+    '<div class="stat"><div class="stat-n am" id="sc">—</div><div class="stat-l">Cash Today</div></div>',
+    '</div>',
+    /* Panels */
+    '<div class="panel on" id="b0">',
+    '  <div class="section-hd"><h2>🖨️ Live Job Queue</h2><button class="btn btn-ghost" onclick="lq()" style="font-size:10px">↻ Refresh</button></div>',
+    '  <div class="tbl-wrap"><table><thead><tr><th>#</th><th>Customer</th><th>Status</th><th>Files</th><th>Bill</th><th>Pressing</th><th>Job ID</th><th>Action</th></tr></thead>',
+    '  <tbody id="qb"></tbody></table></div>',
+    '</div>',
+    '<div class="panel" id="b1">',
+    '  <div class="section-hd"><h2>💰 Payments</h2></div>',
+    '  <div class="tbl-wrap"><table><thead><tr><th>Time</th><th>Customer</th><th>Amount</th><th>Type</th><th>Worker</th><th>Job ID</th></tr></thead>',
+    '  <tbody id="pb"></tbody></table></div>',
+    '</div>',
+    '<div class="panel" id="b2">',
+    '  <div class="section-hd"><h2>👷 Workers</h2></div>',
+    '  <div class="w-form">',
+    '    <input id="wi" placeholder="ID e.g. W04"><input id="wn" placeholder="Name"><input id="wp" placeholder="PIN">',
+    '    <button class="btn btn-b" onclick="addW()">+ Add</button>',
+    '  </div>',
+    '  <div class="tbl-wrap"><table><thead><tr><th>ID</th><th>Name</th><th>Added</th><th></th></tr></thead>',
+    '  <tbody id="wb"></tbody></table></div>',
+    '</div>',
+    '<div class="panel" id="b3">',
+    '  <div class="section-hd"><h2>⭐ Customer Ratings</h2></div>',
+    '  <div class="tbl-wrap"><table><thead><tr><th>Time</th><th>Rating</th><th>Job ID</th></tr></thead>',
+    '  <tbody id="rb"></tbody></table></div>',
+    '</div>',
+    '<div class="panel" id="b4">',
+    '  <div class="section-hd"><h2>🔍 Audit Log</h2></div>',
+    '  <div class="tbl-wrap"><table><thead><tr><th>Time</th><th>Action</th><th>Customer</th><th>Detail</th></tr></thead>',
+    '  <tbody id="ab"></tbody></table></div>',
+    '</div>',
+    /* Bottom nav */
+    '<nav class="nav">',
+    '<button class="nav-item on" id="n0" onclick="sw(0)"><span class="nav-icon">🖨️</span>Queue</button>',
+    '<button class="nav-item" id="n1" onclick="sw(1)"><span class="nav-icon">💰</span>Payments</button>',
+    '<button class="nav-item" id="n2" onclick="sw(2)"><span class="nav-icon">👷</span>Workers</button>',
+    '<button class="nav-item" id="n3" onclick="sw(3)"><span class="nav-icon">⭐</span>Ratings</button>',
+    '<button class="nav-item" id="n4" onclick="sw(4)"><span class="nav-icon">🔍</span>Audit</button>',
+    '</nav>',
     '<script>',
     'var TK=localStorage.getItem("migo_token");',
     'if(!TK)window.location="/login";',
     'var cur=0;',
-    'function sw(el,i){',
-    '  document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("on");});',
-    '  document.querySelectorAll(".box").forEach(function(x){x.classList.remove("on");});',
-    '  el.classList.add("on");document.getElementById("b"+i).classList.add("on");cur=i;',
-    '  [lq,lp,lw,lr,la][i]();',
+    'function sw(i){',
+    '  document.querySelectorAll(".panel").forEach(function(x){x.classList.remove("on");});',
+    '  document.querySelectorAll(".nav-item").forEach(function(x){x.classList.remove("on");});',
+    '  document.getElementById("b"+i).classList.add("on");',
+    '  document.getElementById("n"+i).classList.add("on");',
+    '  cur=i;[lq,lp,lw,lr,la][i]();',
     '}',
     'function api(p,m,b){return fetch(p,{method:m||"GET",headers:{"Content-Type":"application/json","X-Dashboard-Token":TK},body:b?JSON.stringify(b):null}).then(function(r){return r.json();});}',
-    'var bs={awaiting_payment:"am",processing:"bl",confirming:"am",ready:"gr",idle:"rd"};',
+    'var bs={awaiting_payment:"bg-am",processing:"bg-bl",confirming:"bg-am",ready:"bg-gr",idle:"bg-rd"};',
     'function lq(){',
     '  api("/api/stats").then(function(st){',
     '    if(!st.ok)return;',
@@ -2179,13 +2570,42 @@ function adminHTML() {
     '  api("/api/sessions").then(function(se){',
     '    if(!se.ok)return;',
     '    var r=(se.sessions||[]).map(function(s){',
-    '      var btn=s.state==="processing"?"<button class=\"btn btn-g\" onclick=\"rd(\'"+s.phone+"\')\">Ready</button>":"&mdash;";',
-    '      return "<tr><td>"+(s.customerName||s.phone)+"</td><td><span class=\"badge "+(bs[s.state]||"bl")+"\">"+ s.state+"</span></td><td>"+s.files+"</td><td>"+(s.totalBill?"GHS "+s.totalBill.toFixed(2):"&mdash;")+"</td><td style=\"font-size:10px\">"+( s.jobId||"&mdash;")+"</td><td>"+btn+"</td></tr>";',
+    '      var btn="";',
+    '      if(s.state==="processing")btn="<button class=\"btn btn-g\" onclick=\"rd(\'"+s.phone+"\')\">✅ Ready</button>";',
+    '      if(s.state==="awaiting_payment")btn="<button class=\"btn btn-b\" onclick=\"showCash(\'"+s.phone+"\',"+( s.totalBill||0).toFixed(2)+")\">💵 Cash</button>";',
+    '      var qp=s.queuePosition?"#"+s.queuePosition:"&mdash;";',
+    '      return "<tr><td>"+qp+"</td><td>"+(s.customerName||s.phone)+"</td><td><span class=\"badge "+(bs[s.state]||"bl")+"\">"+ s.state+"</span></td><td>"+s.files+"</td><td>"+(s.totalBill?"GHS "+s.totalBill.toFixed(2):"&mdash;")+"</td><td style=\"font-size:10px\">"+(s.pressing||"&mdash;")+"</td><td style=\"font-size:10px\">"+(s.jobId||"&mdash;")+"</td><td>"+btn+"</td></tr>";',
     '    }).join("");',
     '    document.getElementById("qb").innerHTML=r||"<tr><td colspan=6 class=\"mt\">No active sessions</td></tr>";',
     '  });',
     '}',
     'function rd(phone){if(!confirm("Mark ready?"))return;api("/api/mark-ready","POST",{phone:phone}).then(lq);}',
+    '/* ── Cash modal ── */',
+    'var cashPhone="",cashAmt=0;',
+    'function showCash(phone,amt){',
+    '  cashPhone=phone;cashAmt=amt;',
+    '  document.getElementById("cm-phone").textContent=phone;',
+    '  document.getElementById("cm-amt").textContent="GHS "+amt.toFixed(2);',
+    '  document.getElementById("cm-custom").value="";',
+    '  document.getElementById("cm-pin").value="";',
+    '  document.getElementById("cm-err").textContent="";',
+    '  document.getElementById("cm").style.display="flex";',
+    '  document.getElementById("cm-pin").focus();',
+    '}',
+    'function closeCash(){document.getElementById("cm").style.display="none";}',
+    'function confirmCash(){',
+    '  var customAmt=document.getElementById("cm-custom").value.trim();',
+    '  var amount=customAmt?parseFloat(customAmt):cashAmt;',
+    '  var pin=document.getElementById("cm-pin").value.trim();',
+    '  if(!pin){document.getElementById("cm-err").textContent="Enter your PIN";return;}',
+    '  if(isNaN(amount)||amount<=0){document.getElementById("cm-err").textContent="Invalid amount";return;}',
+    '  document.getElementById("cm-btn").disabled=true;',
+    '  document.getElementById("cm-btn").textContent="Processing...";',
+    '  api("/api/cash-payment","POST",{phone:cashPhone,amount:amount,pin:pin}).then(function(r){',
+    '    if(r.ok){closeCash();lq();alert("✅ Cash payment confirmed!");}',
+    '    else{document.getElementById("cm-err").textContent=r.error||"Failed";document.getElementById("cm-btn").disabled=false;document.getElementById("cm-btn").textContent="Confirm Cash";}',
+    '  }).catch(function(){document.getElementById("cm-err").textContent="Network error";document.getElementById("cm-btn").disabled=false;document.getElementById("cm-btn").textContent="Confirm Cash";});',
+    '}',
     'function lp(){',
     '  api("/api/payments").then(function(d){',
     '    if(!d.ok)return;',
@@ -2252,21 +2672,43 @@ function workerHTML() {
     '.badge{padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700}',
     '.gr{background:#10b98120;color:#10b981}.bl{background:#3b82f620;color:#3b82f6}.am{background:#f59e0b20;color:#f59e0b}',
     '.btn{padding:7px 12px;border:none;border-radius:5px;cursor:pointer;font-size:11px;font-weight:700}',
-    '.btn-g{background:#10b981;color:#fff}.btn-r{background:#ef4444;color:#fff}',
-    '.mt{text-align:center;padding:30px;color:#334155}</style>',
+    '.btn-g{background:#10b981;color:#fff}.btn-r{background:#ef4444;color:#fff}.btn-b{background:#3b82f6;color:#fff}',
+    '.mt{text-align:center;padding:30px;color:#334155}',
+    '.modal{display:none;position:fixed;inset:0;background:#0009;z-index:999;align-items:center;justify-content:center}',
+    '.modal-box{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:20px;width:90%;max-width:320px}',
+    '.modal-box h3{font-size:14px;margin-bottom:12px}.modal-box label{font-size:11px;color:#94a3b8;display:block;margin-bottom:3px}',
+    '.modal-box input{width:100%;margin:0 0 10px 0;padding:8px 10px;background:#0f172a;border:1px solid #334155;color:#f1f5f9;border-radius:7px;font-size:13px}',
+    '.row{display:flex;gap:8px;margin-top:4px}.row button{flex:1;padding:9px;border:none;border-radius:7px;font-size:12px;font-weight:700;cursor:pointer}',
+    '.err{color:#ef4444;font-size:11px;margin-top:4px;min-height:16px}</style>',
     '</head><body>',
     '<div class="hd"><h1>Migo Print Shop &mdash; Worker View</h1>',
     '<button class="btn btn-r" onclick="logout()">Logout</button></div>',
+    '<!-- Cash Modal -->',
+    '<div class="modal" id="cm"><div class="modal-box">',
+    '<h3>💵 Confirm Cash Payment</h3>',
+    '<p style="font-size:11px;color:#94a3b8;margin-bottom:10px">Customer: <b id="cm-phone"></b></p>',
+    '<p style="font-size:11px;color:#94a3b8;margin-bottom:12px">Total: <b id="cm-amt" style="color:#f1f5f9"></b></p>',
+    '<label>Amount received (blank = full total)</label>',
+    '<input id="cm-custom" type="number" step="0.01" placeholder="e.g. 20.00">',
+    '<label>Your PIN</label>',
+    '<input id="cm-pin" type="password" placeholder="4-digit PIN" maxlength="6">',
+    '<div class="err" id="cm-err"></div>',
+    '<div class="row"><button style="background:#334155;color:#f1f5f9" onclick="closeCash()">Cancel</button>',
+    '<button id="cm-btn" style="background:#10b981;color:#fff" onclick="confirmCash()">Confirm Cash</button>',
+    '</div></div></div>',
     '<div class="content"><table><thead><tr><th>Customer</th><th>State</th><th>Files</th><th>Bill</th><th>Job ID</th><th>Action</th></tr></thead>',
     '<tbody id="body"></tbody></table></div>',
     '<script>',
     'var TK=localStorage.getItem("migo_token");if(!TK)window.location="/login";',
     'var bs={awaiting_payment:"am",processing:"bl",confirming:"am",ready:"gr"};',
+    'var cashPhone="",cashAmt=0;',
     'function load(){',
     '  fetch("/api/sessions",{headers:{"X-Dashboard-Token":TK}}).then(function(r){return r.json();}).then(function(d){',
     '    if(!d.ok){window.location="/login";return;}',
     '    var r=(d.sessions||[]).map(function(s){',
-    '      var btn=s.state==="processing"?"<button class=\"btn btn-g\" onclick=\"rdy(\'"+s.phone+"\')\">Mark Ready</button>":"&mdash;";',
+    '      var btn="";',
+    '      if(s.state==="processing")btn="<button class=\"btn btn-g\" onclick=\"rdy(\'"+s.phone+"\')\">✅ Ready</button>";',
+    '      if(s.state==="awaiting_payment")btn="<button class=\"btn btn-b\" onclick=\"showCash(\'"+s.phone+"\',"+( s.totalBill||0).toFixed(2)+")\">💵 Cash</button>";',
     '      return "<tr><td>"+(s.customerName||s.phone)+"</td><td><span class=\"badge "+(bs[s.state]||"bl")+"\">"+s.state+"</span></td><td>"+s.files+"</td><td>"+(s.totalBill?"GHS "+s.totalBill.toFixed(2):"&mdash;")+"</td><td style=\"font-size:10px\">"+(s.jobId||"&mdash;")+"</td><td>"+btn+"</td></tr>";',
     '    }).join("");',
     '    document.getElementById("body").innerHTML=r||"<tr><td colspan=6 class=\"mt\">No active orders</td></tr>";',
@@ -2275,6 +2717,31 @@ function workerHTML() {
     'function rdy(phone){',
     '  if(!confirm("Mark ready?"))return;',
     '  fetch("/api/mark-ready",{method:"POST",headers:{"Content-Type":"application/json","X-Dashboard-Token":TK},body:JSON.stringify({phone:phone})}).then(load);',
+    '}',
+    'function showCash(phone,amt){',
+    '  cashPhone=phone;cashAmt=amt;',
+    '  document.getElementById("cm-phone").textContent=phone;',
+    '  document.getElementById("cm-amt").textContent="GHS "+amt.toFixed(2);',
+    '  document.getElementById("cm-custom").value="";',
+    '  document.getElementById("cm-pin").value="";',
+    '  document.getElementById("cm-err").textContent="";',
+    '  document.getElementById("cm").style.display="flex";',
+    '  document.getElementById("cm-pin").focus();',
+    '}',
+    'function closeCash(){document.getElementById("cm").style.display="none";}',
+    'function confirmCash(){',
+    '  var customAmt=document.getElementById("cm-custom").value.trim();',
+    '  var amount=customAmt?parseFloat(customAmt):cashAmt;',
+    '  var pin=document.getElementById("cm-pin").value.trim();',
+    '  if(!pin){document.getElementById("cm-err").textContent="Enter your PIN";return;}',
+    '  if(isNaN(amount)||amount<=0){document.getElementById("cm-err").textContent="Invalid amount";return;}',
+    '  document.getElementById("cm-btn").disabled=true;',
+    '  document.getElementById("cm-btn").textContent="Processing...";',
+    '  fetch("/api/cash-payment",{method:"POST",headers:{"Content-Type":"application/json","X-Dashboard-Token":TK},body:JSON.stringify({phone:cashPhone,amount:amount,pin:pin})})',
+    '  .then(function(r){return r.json();}).then(function(r){',
+    '    if(r.ok){closeCash();load();alert("✅ Cash confirmed!");}',
+    '    else{document.getElementById("cm-err").textContent=r.error||"Failed";document.getElementById("cm-btn").disabled=false;document.getElementById("cm-btn").textContent="Confirm Cash";}',
+    '  }).catch(function(){document.getElementById("cm-err").textContent="Network error";document.getElementById("cm-btn").disabled=false;document.getElementById("cm-btn").textContent="Confirm Cash";});',
     '}',
     'function logout(){localStorage.removeItem("migo_token");window.location="/login";}',
     'load();setInterval(load,15000);',
@@ -2397,13 +2864,21 @@ async function loginWorker(){
 
   // Sessions list
   app.get('/api/sessions', authMiddleware, (req, res) => {
-    const list = [...sessions.entries()].map(([key, s]) => ({
-      phone: displayPhone(key), state: s.state,
-      totalBill: s.totalBill, paymentReceived: s.paymentReceived,
-      jobId: s.jobId, a4eq: s.a4eq, paused: s.paused,
-      customerName: s.customerName,
-      files: s.files?.length || 0,
-    }));
+    const processingList = [...sessions.values()].filter(s => s.state === 'processing');
+    const list = [...sessions.entries()].map(([key, s], idx) => {
+      const qPos = s.state === 'processing'
+        ? processingList.indexOf(s) + 1
+        : null;
+      return {
+        phone: displayPhone(key), state: s.state,
+        totalBill: s.totalBill, paymentReceived: s.paymentReceived,
+        jobId: s.jobId, a4eq: s.a4eq, paused: s.paused,
+        customerName: s.customerName,
+        files: s.files?.length || 0,
+        pressing: s.pressing ? `${s.pressing.shirts} shirts (${s.pressing.type}) — GHS ${(s.pressing.fee||0).toFixed(2)}` : null,
+        queuePosition: qPos,
+      };
+    });
     res.json({ ok: true, sessions: list });
   });
 
@@ -2433,6 +2908,32 @@ async function loginWorker(){
     res.json({ ok: true, facts: knowledgeBase });
   });
 
+  // Cash payment from dashboard
+  app.post('/api/cash-payment', authMiddleware, async (req, res) => {
+    const { phone, amount, pin } = req.body || {};
+    if (!phone || !amount || !pin) return res.json({ ok: false, error: 'Missing fields' });
+    const workerId = req.role === 'worker'
+      ? (SESSION_TOKENS.get(req.headers['x-dashboard-token'] || req.query.token)?.workerId || 'dashboard')
+      : 'admin';
+    const w = req.role === 'worker' ? workers.get(workerId) : null;
+    const expectedPin = w ? w.pin : ADMIN_PIN;
+    if (pin !== expectedPin) {
+      audit('WRONG_PIN_DASHBOARD', phone, `Wrong PIN by ${workerId}`, true, workerId === 'admin' ? null : workerId);
+      await alertOwner([
+        `🚨 *WRONG PIN — DASHBOARD*`,
+        `📱 Customer: ${phone}`,
+        `👤 By: ${workerId}`,
+        `⚠️ Possible theft attempt.`,
+      ].join('\n'));
+      return res.json({ ok: false, error: 'Wrong PIN — owner has been alerted.' });
+    }
+    const result = await processPayment(toWaId(phone), amount, 'cash', workerId, workerId === 'admin' ? null : workerId);
+    if (result.status === 'confirmed' || result.status === 'partial') {
+      return res.json({ ok: true, result });
+    }
+    return res.json({ ok: false, error: result.message || 'Payment failed' });
+  });
+
   // Mark ready
   app.post('/api/mark-ready', authMiddleware, (req, res) => {
     const { phone } = req.body || {};
@@ -2441,16 +2942,7 @@ async function loginWorker(){
     const s = sessions.get(waId);
     if (!s) return res.json({ ok: false, error: 'No session' });
     s.state = 'ready'; clearTimers(waId);
-    const readyMsg = [
-      `✅ *Your order is ready for pickup!*`, ``,
-      `🔑 *PICKUP CODE*`, ``, `   *${s.jobId || '—'}*`, ``,
-      `━━━━━━━━━━━━━━━━━━━━━━`,
-      `⚠️ Show this code when collecting.`,
-      `*No pickup code — no job released.*`, ``,
-      `📍 *Migo Print Shop*`, `Circle branch, Near Benz Gate, Accra.`, ``,
-      `Thank you for choosing Migo! 🙏`,
-    ].join('\n');
-    sendMsg(waId, readyMsg).catch(()=>{});
+    sendMsg(waId, buildReadyMsg(s.jobId)).catch(()=>{});
     audit('MARKED_READY', waId, `Via dashboard`);
     res.json({ ok: true });
   });
@@ -2503,7 +2995,7 @@ process.on('unhandledRejection', async (reason) => {
 // ── Start ──────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`🚀 MIGO Print Bot v19b — port ${PORT}`);
+  console.log(`🚀 MIGO Print Bot ${BOT_VERSION} — port ${PORT}`);
   console.log(`   WasenderAPI : ${WASENDER_KEY ? '✅ set' : 'NOT SET ❌'}`);
   console.log(`   Session     : ${WASENDER_SID}`);
   console.log(`   Anthropic   : ${ANTHROPIC_KEY ? '✅ set' : 'NOT SET ❌'}`);
@@ -2516,7 +3008,7 @@ app.listen(PORT, async () => {
   setInterval(runAutoArchive, 30 * 60 * 1000);
 
   await alertOwner([
-    `✅ *Migo Bot v19b Started*`,
+    `✅ *Migo Bot ${BOT_VERSION} Started*`,
     `🕐 ${nowStr()}`,
     `🤖 Model: ${MODEL}`,
     `📱 WasenderAPI: Connected`,
