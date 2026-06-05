@@ -1,11 +1,17 @@
 // ============================================================
 // MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
-// Version : v26
+// Version : v27
 // Date    : June 2026
 // Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
 //
 // VERSION HISTORY
+//
+// v27 (Jun 2026) — Critical filename parsing fix
+//   • Fix: handleImage now receives and uses filename for parsing
+//     PNG/PDF files sent as documents with clear filenames
+//     (e.g. "A2 13COPIES.png", "a3 - 4.png") now collected silently
+//     instead of asking customer for size/qty they already provided
 //
 // v26 (Jun 2026) — Bug fixes
 //   • Fix: FAQ delivery regex now catches "deliver" and "delivery"
@@ -115,7 +121,7 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── Model — most powerful available ──────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v26';
+const BOT_VERSION = 'v27';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -1286,21 +1292,24 @@ function scheduleWorkerReminders(phone, session, jobId) {
     setTimer(phone, 'overdue', readyMs + 60000 - now, () => overdueFn(1));
 }
 
-async function handleImage(from, session, mediaUrl, caption, mediaType) {
+async function handleImage(from, session, mediaUrl, caption, mediaType, filename) {
   // Duplicate check
   const isDuplicate = session.files.some(f => f.sourceUrl === mediaUrl)
     || session.pendingImages.some(p => p.url === mediaUrl);
   if (isDuplicate) return null; // silently ignore
 
   // Track for desktop agent
-  trackFile(from, mediaUrl, caption || 'image.jpg', mediaType || 'image/jpeg', caption, session);
-  const orders = await extractOrder(caption, '', session);
+  trackFile(from, mediaUrl, filename || caption || 'image.jpg', mediaType || 'image/jpeg', caption, session);
+
+  // Parse from caption first, fall back to filename (e.g. "A2 13COPIES.png" sent as document)
+  const parseSource = caption || filename || '';
+  const orders = await extractOrder(parseSource, filename || '', session);
   const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
   if (valid.length > 0) {
     const bgNote = /no.?background|remove.?background|no.?bg|transparent/i.test(caption)
       ? 'remove background'
       : /with.?background|keep.?background|with.?bg/i.test(caption) ? 'keep background' : '';
-    valid.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, caption || 'image', bgNote));
+    valid.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, caption || filename || 'image', bgNote));
     startReceiveTimer(from, session);
     return null; // ✅ silent — info was in caption/filename
   }
@@ -1446,7 +1455,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   if (session.state === 'idle') {
     if (mediaUrl) {
       session.state = 'receiving';
-      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType);
+      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType, filename);
       return handleDoc(from, session, mediaUrl, msg, filename);
     }
     if (msg) {
@@ -1467,7 +1476,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   // ── RECEIVING ───────────────────────────────────────────────
   if (session.state === 'receiving') {
     if (mediaUrl) {
-      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType);
+      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType, filename);
       return handleDoc(from, session, mediaUrl, msg, filename);
     }
     if (msg) {
@@ -1558,7 +1567,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     if (isYes(msg)) { await proceedToSummary(from, session); return null; }
     if (mediaUrl) {
       session.state = 'receiving';
-      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType);
+      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType, filename);
       return handleDoc(from, session, mediaUrl, msg, filename);
     }
     const orders = await extractOrder(msg, null, session);
@@ -1658,7 +1667,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   if (session.state === 'processing') {
     if (mediaUrl) {
       session.state = 'receiving'; session.files = []; session.unknownFiles = []; session.pendingImages = [];
-      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType);
+      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType, filename);
       return handleDoc(from, session, mediaUrl, msg, filename);
     }
     return replyWithClaude(msg, session);
