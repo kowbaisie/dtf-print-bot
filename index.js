@@ -1,11 +1,20 @@
 // ============================================================
 // MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
-// Version : v28
+// Version : v29
 // Date    : June 2026
 // Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
 //
 // VERSION HISTORY
+//
+// v29 (Jun 2026) — Bill sending hardened
+//   • Replaced ━ box-drawing characters with plain dashes throughout
+//     WasenderAPI was likely rejecting messages with Unicode box chars
+//     causing bill to silently fail without error
+//   • buildBill called BEFORE setTimeout so crash is caught
+//     immediately and owner alerted — not lost silently
+//   • If buildBill crashes, function aborts cleanly — customer
+//     does not receive confusing partial messages
 //
 // v28 (Jun 2026) — Bill sending fixes
 //   • Fix: sendBill wrapped in try/catch — bill failures now visible
@@ -127,7 +136,7 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── Model — most powerful available ──────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v28';
+const BOT_VERSION = 'v29';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -1131,15 +1140,15 @@ function buildBill(session) {
     ? `\n👕 Pressing  ·  *GHS ${pressingFee.toFixed(2)}*`
     : '';
   return [
-    `━━━━━━━━━━━━━━━━━━━━━━`, `🧾 *MIGO PRINT SHOP*`,
-    `📍 _Circle · Near Benz Gate · Accra_`, `━━━━━━━━━━━━━━━━━━━━━━`,
-    `📄 *ORDER DETAILS*`, `━━━━━━━━━━━━━━━━━━━━━━`,
+    `--------------------`, `🧾 *MIGO PRINT SHOP*`,
+    `📍 _Circle · Near Benz Gate · Accra_`, `--------------------`,
+    `📄 *ORDER DETAILS*`, `--------------------`,
     items + pressingLine,
-    `━━━━━━━━━━━━━━━━━━━━━━`,
+    `--------------------`,
     `💰 *TOTAL:  GHS ${grandTotal.toFixed(2)}*`,
-    `━━━━━━━━━━━━━━━━━━━━━━`, `🟡 *MTN MOBILE MONEY*`, ``,
+    `--------------------`, `🟡 *MTN MOBILE MONEY*`, ``,
     `   📱 *0552719245*`, `   👤 *KOW HABIB BAISIE*`, ``,
-    `🗓 ${nowStr()}`, `━━━━━━━━━━━━━━━━━━━━━━`,
+    `🗓 ${nowStr()}`, `--------------------`,
     `_Thank you for choosing Migo!_ 🙏`,
   ].join('\n');
 }
@@ -1232,6 +1241,17 @@ async function proceedToSummary(phone, session) {
 async function sendBill(phone, session) {
   session.state = 'awaiting_payment';
   audit('BILL_SENT', phone, `GHS ${session.totalBill?.toFixed(2)}`);
+
+  // Build bill string NOW before setTimeout — so any crash is caught immediately
+  let billMsg;
+  try {
+    billMsg = buildBill(session);
+  } catch(e) {
+    console.error('❌ buildBill error:', e.message);
+    await alertOwner(`⚠️ buildBill crashed for ${displayPhone(phone)}: ${e.message}`).catch(()=>{});
+    return; // abort — do not send confusing partial messages
+  }
+
   await sendMsg(phone, `Order received. Sending your bill now. 🙏`);
 
   // 3-day auto-close if no payment
@@ -1243,9 +1263,9 @@ async function sendBill(phone, session) {
     }
   });
 
+  // Send bill after short delay (feels natural, avoids WhatsApp rate limits)
   setTimeout(async () => {
     try {
-      const billMsg = buildBill(session);
       await sendMsg(phone, billMsg);
       await sendMsg(phone, [
         `📌 Please send your payment receipt or MoMo confirmation screenshot to *COMPLETE* your order.`,
@@ -1253,7 +1273,7 @@ async function sendBill(phone, session) {
         `Printing can *ONLY* start *AFTER* payment. 🙏`,
       ].join('\n'));
     } catch(e) {
-      console.error('❌ sendBill inner error:', e.message);
+      console.error('❌ Bill send error:', e.message);
       alertOwner(`⚠️ Bill failed to send to ${displayPhone(phone)}: ${e.message}`).catch(()=>{});
     }
     setTimer(phone, 'pay1', 600000, () => {
@@ -1770,22 +1790,22 @@ async function handleAdmin(from, msg) {
       .map(f => `🖨 ${f.size}  ·  ${f.qty} sheet${f.qty!==1?'s':''}`)
       .join('\n') || '(files to be confirmed)';
     const overrideBillMsg = [
-      `━━━━━━━━━━━━━━━━━━━━━━`,
+      `--------------------`,
       `🧾 *MIGO PRINT SHOP*`,
       `📍 _Circle · Near Benz Gate · Accra_`,
-      `━━━━━━━━━━━━━━━━━━━━━━`,
+      `--------------------`,
       `📄 *ORDER DETAILS*`,
-      `━━━━━━━━━━━━━━━━━━━━━━`,
+      `--------------------`,
       billItems,
-      `━━━━━━━━━━━━━━━━━━━━━━`,
+      `--------------------`,
       `💰 *TOTAL:  GHS ${newAmount.toFixed(2)}*`,
-      `━━━━━━━━━━━━━━━━━━━━━━`,
+      `--------------------`,
       `🟡 *MTN MOBILE MONEY*`, ``,
       `   📱 *0552719245*`,
       `   👤 *KOW HABIB BAISIE*`, ``,
-      `━━━━━━━━━━━━━━━━━━━━━━`,
+      `--------------------`,
       `🗓 ${nowStr()}`,
-      `━━━━━━━━━━━━━━━━━━━━━━`,
+      `--------------------`,
       `_Thank you for choosing Migo!_ 🙏`,
     ].join('\n');
     await sendMsg(found.key, overrideBillMsg);
@@ -2277,38 +2297,38 @@ async function sendDailySummary() {
     : '  None';
 
   await alertOwner([
-    `━━━━━━━━━━━━━━━━━━━━━━`,
+    `--------------------`,
     `📊 *MIGO DAILY SUMMARY*`,
     `📅 ${todayStr()} 🕗 8pm`,
-    `━━━━━━━━━━━━━━━━━━━━━━`, ``,
+    `--------------------`, ``,
     `🟡 MoMo:      GHS ${momoT.toFixed(2)}`,
     `💵 Cash:      GHS ${cashT.toFixed(2)}`,
     pressingT > 0 ? `👕 Pressing:  GHS ${pressingT.toFixed(2)}` : ``,
-    `━━━━━━━━`,
+    `--------`,
     `💰 TOTAL:     GHS ${(momoT + cashT).toFixed(2)}`, ``,
     `*Cash by worker:*`, wb, ``,
     `⭐ Avg Rating: ${avgR} (${todayR.length} reviews)`,
     `🚩 Flagged events: ${flagged}`,
     `📋 Active sessions: ${sessions.size}`,
-    `━━━━━━━━━━━━━━━━━━━━━━`,
+    `--------------------`,
     `📊 *PRODUCTION REPORT*`,
     `🖨 A4 sheets: ${bySize.A4}`,
     `🖨 A3 sheets: ${bySize.A3}`,
     `🖨 A2 sheets: ${bySize.A2}`,
-    `━━━━━━━━`,
+    `--------`,
     `✅ Completed: ${completed}`,
     `❌ Abandoned: ${abandoned}`,
     `⚠️ Overdue:   ${overdueCount}`,
-    `━━━━━━━━━━━━━━━━━━━━━━`,
+    `--------------------`,
     `😠 *COMPLAINTS (${todayComplaints.length})*`,
     complaintsLines,
-    `━━━━━━━━`,
+    `--------`,
     `💬 *CUSTOMER COMMENTS*`,
     commentsLines,
-    `━━━━━━━━`,
+    `--------`,
     `🕐 *DELAY REASONS (${todayDelays.length})*`,
     delayLines,
-    `━━━━━━━━━━━━━━━━━━━━━━`,
+    `--------------------`,
   ].filter(l => l !== '').join('\n'));
 }
 
