@@ -1,6 +1,6 @@
 // ============================================================
 // MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
-// Version : v40
+// Version : v44
 // Date    : June 2026
 // Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
@@ -136,7 +136,7 @@ const openai = new OpenAI({ apiKey: OPENAI_KEY });
 // ── Model ─────────────────────────────────────────────────────
 const MODEL = 'gpt-5.5-2026-04-23';
 
-const BOT_VERSION = 'v40';
+const BOT_VERSION = 'v44';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -150,19 +150,18 @@ function shopStatus() {
 }
 
 // ── Greeting detector ────────────────────────────────────────
-// Any greeting → mirror it + "Please send your DTF files."
+// Greeting → mirror warmly and stop. Nothing more.
 function isGreeting(msg) {
   return /^\s*(hi+|hello+|hey+|good\s*(morning|afternoon|evening|night|day)|howdy|greetings|sup|what'?s up|yo\b|hy|helo|holla|morning|afternoon|evening|night|how are you|how r u)\b/i.test((msg||'').trim());
 }
 function greetingReply(msg) {
-  // Mirror the greeting back naturally
   const m = (msg||'').trim();
-  if (/good\s*morning/i.test(m)) return `Good morning! Please send your DTF files. 🖨️`;
-  if (/good\s*afternoon/i.test(m)) return `Good afternoon! Please send your DTF files. 🖨️`;
-  if (/good\s*evening/i.test(m)) return `Good evening! Please send your DTF files. 🖨️`;
-  if (/good\s*night/i.test(m)) return `Good night! Please send your DTF files. 🖨️`;
-  if (/good\s*day/i.test(m)) return `Good day! Please send your DTF files. 🖨️`;
-  return `Hi! Please send your DTF files. 🖨️`;
+  if (/good\s*morning/i.test(m)) return `Good morning! 😊`;
+  if (/good\s*afternoon/i.test(m)) return `Good afternoon! 😊`;
+  if (/good\s*evening/i.test(m)) return `Good evening! 😊`;
+  if (/good\s*night/i.test(m)) return `Good night! 😊`;
+  if (/good\s*day/i.test(m)) return `Good day! 😊`;
+  return `Hi! 👋`;
 }
 const FAQ = [
   { p: /where.*(you|shop|locate|find|address|located)/i,
@@ -430,35 +429,89 @@ function gptText(r) {
 // Returns structured JSON: { reply, action, files, pressing }
 
 function buildMasterSystem(session) {
+  const order = getActiveOrder(session);
   const kb = knowledgeBase.length > 0
     ? `\n\nSHOP KNOWLEDGE BASE:\n${knowledgeBase.map((f,i)=>`${i+1}. ${f}`).join('\n')}`
     : '';
 
-  const filesReceived = session.files.length > 0
-    ? `\nFILES ALREADY COLLECTED:\n${session.files.map((f,i)=>
+  const filesReceived = order.files.length > 0
+    ? `\nFILES ALREADY COLLECTED:\n${order.files.map((f,i)=>
         `  ${i+1}. ${f.name||'file'} → Size: ${f.size||'?'}, Qty: ${f.qty||'?'}`
       ).join('\n')}`
     : '';
 
-  const pendingFiles = session.pendingImages.length > 0
-    ? `\nFILES WAITING FOR SIZE/QTY:\n${session.pendingImages.map((f,i)=>
+  const pendingFiles = order.pendingImages.length > 0
+    ? `\nFILES WAITING FOR SIZE/QTY:\n${order.pendingImages.map((f,i)=>
         `  ${i+1}. ${f.caption||f.url?.split('/').pop()||'image'} (mediaType: ${f.mediaType||'image'})`
       ).join('\n')}`
     : '';
 
-  const unknownFiles = session.unknownFiles.length > 0
-    ? `\nFILES WITH UNKNOWN SIZE:\n${session.unknownFiles.map((f,i)=>
+  const unknownFiles = order.unknownFiles.length > 0
+    ? `\nFILES WITH UNKNOWN SIZE:\n${order.unknownFiles.map((f,i)=>
         `  ${i+1}. ${f.name||'file'}`
       ).join('\n')}`
     : '';
 
-  const currentBill = session.totalBill
-    ? `\nCURRENT BILL: GHS ${session.totalBill.toFixed(2)}`
+  const currentBill = order.totalBill
+    ? `\nCURRENT BILL: GHS ${order.totalBill.toFixed(2)}`
     : '';
 
   const customerName = session.customerName
     ? `\nCUSTOMER NAME: ${session.customerName}. Use their name naturally.`
     : '';
+
+  const orderRef = order.ref > 1 ? `\nCURRENT ORDER: #${order.ref} for today` : '';
+
+  return `You are the AI brain for Migo Print Shop WhatsApp bot. You have FULL CONTROL of this conversation.
+
+SHOP INFO:
+- Name: Migo Print Shop
+- Location: Circle branch, near Benz Gate, Calvary Church side, Accra, Ghana
+- Service: DTF sheet printing ONLY
+- Payment: MTN MoMo 0552719245 (Kow Habib Baisie) or cash at shop
+- Hours: Open Mon–Sun, orders accepted anytime${customerName}${orderRef}
+
+PRICING (NEVER guess or change these):
+- A4 sheet = GHS 3.20
+- A3 sheet = GHS 6.40
+- A2 sheet = GHS 16.00
+- Pressing: calculated per order — do NOT quote rates to customers${filesReceived}${pendingFiles}${unknownFiles}${currentBill}${kb}
+
+YOUR RESPONSIBILITIES:
+1. Read the ENTIRE conversation history before responding
+2. Understand what files have been sent and what sizes/quantities were given
+3. When ALL files have size and quantity → set action="send_bill" with the files array
+4. If files are waiting for size/qty → ask clearly, set action="ask_size_qty"
+5. Answer FAQs about location, prices, hours, MoMo number directly
+6. If customer mentions cash/no MoMo → say exactly: "Printing can only start after Payment Confirmation. Thank you."
+7. For greetings → mirror the greeting warmly and stop. Nothing else. No DTF prompt.
+8. If you cannot answer → say "Let me get someone to assist you shortly."
+9. AUDIT your response before returning — make sure sizes, quantities and prices are 100% correct
+10. NEVER swap sizes between files. Image 1 = first file mentioned, Image 2 = second file, etc.
+
+BILL CALCULATION RULES (when action=send_bill):
+- List every file with its size and qty in the files array
+- The code will calculate the exact price — you do NOT calculate
+- Only set send_bill when you are 100% sure all files have size AND quantity
+
+RESPONSE FORMAT — return ONLY valid JSON, no markdown, no explanation:
+{
+  "reply": "your message to the customer",
+  "action": "none | send_bill | ask_size_qty | cannot_answer",
+  "files": [{"size":"A4","qty":10},{"size":"A3","qty":5}],
+  "pressing": null,
+  "customerName": null
+}
+
+- files: array of all files with confirmed size+qty. Empty [] if not ready.
+- pressing: {"shirts":5,"type":"front","largeArtwork":false} or null
+- customerName: extracted name if customer mentioned it, or null
+- action "send_bill": only when files array has ALL files with size+qty confirmed
+- action "none": normal conversation, no bill yet
+- action "ask_size_qty": waiting for size/qty from customer
+- action "cannot_answer": escalate to human
+
+STYLE: Warm, professional, clear British English. Short and direct. Never say you are AI.`;
 
   return `You are the AI brain for Migo Print Shop WhatsApp bot. You have FULL CONTROL of this conversation.
 
@@ -482,7 +535,7 @@ YOUR RESPONSIBILITIES:
 4. If files are waiting for size/qty → ask clearly, set action="ask_size_qty"
 5. Answer FAQs about location, prices, hours, MoMo number directly
 6. If customer mentions cash/no MoMo → say exactly: "Printing can only start after Payment Confirmation. Thank you."
-7. For greetings → reply warmly + "Please send your DTF files."
+7. For greetings → mirror the greeting warmly and stop. Nothing else. No DTF prompt.
 8. If you cannot answer → say "Let me get someone to assist you shortly."
 9. AUDIT your response before returning — make sure sizes, quantities and prices are 100% correct
 10. NEVER swap sizes between files. Image 1 = first file mentioned, Image 2 = second file, etc.
@@ -559,32 +612,143 @@ async function gptDecide(msg, session, extraContext) {
     return decision;
   } catch(e) {
     console.error('GPT decide error:', e.message);
-    return { reply: `Hi! Please send your DTF files. 🖨️`, action: 'none', files: [], pressing: null, customerName: null };
+    return { reply: null, action: 'none', files: [], pressing: null, customerName: null };
   }
 }
 
 // ── Session ───────────────────────────────────────────────────
+// ── Session & Order Management ────────────────────────────────
+// Each phone has a customer record with multiple orders
+// Orders are numbered 1,2,3... per phone per day (unpaid)
+// Job ID only assigned after payment confirmed
+
+function getDayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()}`;
+}
+
+function makeOrder(ref) {
+  return {
+    ref,                    // 1, 2, 3... per phone per day
+    dayKey: getDayKey(),
+    state: 'idle',          // idle|receiving|asked_done|asking_image_info|asking_pressing|awaiting_payment|processing|ready
+    files: [],
+    unknownFiles: [],
+    pendingImages: [],
+    totalBill: null,
+    a4eq: 0,
+    paymentReceived: 0,
+    jobId: null,
+    readyTime: null,
+    pressing: null,
+    askedPressing: false,
+    pressingMentioned: false,
+    billSentAt: null,       // timestamp when bill was sent
+    confirmedFiles: [],
+    overdueReminders: 0,
+    ratingAsked: false,
+    ratingGiven: false,
+    pendingTxId: null,
+    pendingTxAmount: null,
+    awaitingTxId: false,
+    confirmedTxId: null,
+    servedBy: null,
+  };
+}
+
 function getSession(phone) {
   if (!sessions.has(phone)) {
     sessions.set(phone, {
-      phone, state: 'idle',
-      files: [], confirmedFiles: [], unknownFiles: [],
-      pendingImages: [], chatHistory: [],
-      totalBill: null, a4eq: 0,
-      paymentReceived: 0, jobId: null,
-      readyTime: null, overdueReminders: 0,
-      ratingAsked: false, ratingGiven: false, lastActivity: Date.now(),
-      pendingTxId: null, pendingTxAmount: null,
-      awaitingTxId: false, confirmedTxId: null,
-      paused: false, servedBy: null,
+      phone,
       customerName: null,
-      pressing: null,
-      askedPressing: false,
-      isFirstTime: true,      // true until name captured
-      pressingMentioned: false, // true if customer mentions pressing
+      chatHistory: [],
+      paused: false,
+      pausedAt: null,
+      isFirstTime: true,
+      lastActivity: Date.now(),
+      orders: [makeOrder(1)],   // start with order 1
+      activeRef: 1,             // current active order ref
+      dayKey: getDayKey(),      // reset order numbering each day
     });
   }
-  return sessions.get(phone);
+  const s = sessions.get(phone);
+  // Reset order numbering if new day
+  if (s.dayKey !== getDayKey()) {
+    s.dayKey = getDayKey();
+    s.activeRef = 1;
+    // Keep completed orders, start fresh active
+    s.orders = s.orders.filter(o => o.state === 'processing' || o.state === 'ready');
+    if (!s.orders.find(o => o.ref === 1 && o.dayKey === getDayKey())) {
+      s.orders.push(makeOrder(1));
+      s.activeRef = 1;
+    }
+  }
+  return s;
+}
+
+// Get the current active order for a session
+function getActiveOrder(session) {
+  return session.orders.find(o => o.ref === session.activeRef) || session.orders[session.orders.length - 1];
+}
+
+// Compatibility helpers — get order properties from session
+// Lets admin/dashboard code use s.state, s.jobId etc.
+function sessState(s) {
+  const o = getActiveOrder(s);
+  // If there's a processing/ready order, surface that state
+  const proc = s.orders.find(o => o.state === 'processing');
+  const ready = s.orders.find(o => o.state === 'ready');
+  if (ready) return 'ready';
+  if (proc) return 'processing';
+  return o?.state || 'idle';
+}
+function sessJobId(s) {
+  const proc = s.orders.find(o => o.state === 'processing' || o.state === 'ready');
+  return proc?.jobId || getActiveOrder(s)?.jobId || null;
+}
+function sessTotalBill(s) { return getActiveOrder(s)?.totalBill || null; }
+function sessFiles(s) { return getActiveOrder(s)?.files || []; }
+function sessA4eq(s) { return getActiveOrder(s)?.a4eq || 0; }
+
+// Get next order ref for this phone (for this day)
+function nextOrderRef(session) {
+  const dayOrders = session.orders.filter(o => o.dayKey === getDayKey());
+  return dayOrders.length + 1;
+}
+
+// Start a new order for this session
+function startNewOrder(session) {
+  const ref = nextOrderRef(session);
+  const order = makeOrder(ref);
+  session.orders.push(order);
+  session.activeRef = ref;
+  return order;
+}
+
+// Find an awaiting_payment order for this phone
+function getPendingOrder(session) {
+  return session.orders.find(o => o.state === 'awaiting_payment');
+}
+
+// Check if bot should be silent (human handling)
+function isBotSilenced(session) {
+  return session.paused === true;
+}
+
+// Silence bot and alert owner
+async function silenceBot(phone, session, reason) {
+  session.paused = true;
+  session.pausedAt = Date.now();
+  clearTimers(phone);
+  await alertOwner([
+    `🔕 *BOT SILENCED — HUMAN NEEDED*`,
+    `📱 Customer: ${displayPhone(phone)}`,
+    `👤 Name: ${session.customerName || 'Unknown'}`,
+    `❓ Reason: ${reason}`,
+    ``,
+    `Use: admin W01 resume ${last4(phone)} — to hand back to bot`,
+    `Or reply directly to the customer.`,
+  ].join('\n')).catch(() => {});
 }
 
 function clearTimers(phone) {
@@ -791,21 +955,24 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
     }
     if (!matched) return { status: 'no_match', message: 'No active session' };
 
+    // Find the awaiting_payment order
+    const matchedOrder = matched.orders?.find(o => o.state === 'awaiting_payment');
+    if (!matchedOrder) return { status: 'no_match', message: 'No order awaiting payment' };
+
     const workerName = workerId ? (workers.get(workerId)?.name || workerId) : null;
 
     if (type === 'cash') {
-      const expectedTotal = matched.totalBill || 0;
+      const expectedTotal = matchedOrder.totalBill || 0;
       if (paid > expectedTotal + 0.01) {
         audit('SUSPICIOUS_CASH', matchedKey,
           `Cash GHS ${paid.toFixed(2)} > order GHS ${expectedTotal.toFixed(2)} — ${workerName || confirmedBy}`,
           true, workerId);
       }
-      // Alert owner of every cash payment
       await alertOwner([
         `💵 *CASH PAYMENT RECORDED*`, ``,
         `📱 Customer: ${displayPhone(matchedKey)}`,
         `💰 Amount:   GHS ${paid.toFixed(2)}`,
-        `🔖 Job ID:   ${matched.jobId || 'pending'}`,
+        `🔖 Order:    #${matchedOrder.ref}`,
         `👤 Worker:   ${workerName || confirmedBy} (${workerId || '—'})`,
         `🕐 Time:     ${nowStr()}`,
       ].join('\n'));
@@ -814,47 +981,56 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
       audit('MOMO_PAYMENT', matchedKey, `GHS ${paid.toFixed(2)} — ${confirmedBy}`, false, workerId);
     }
 
-    matched.paymentReceived += paid;
+    matchedOrder.paymentReceived = (matchedOrder.paymentReceived || 0) + paid;
     balance = exactBalance !== null ? exactBalance
-      : Math.max(0, (matched.totalBill || 0) - matched.paymentReceived);
+      : Math.max(0, (matchedOrder.totalBill || 0) - matchedOrder.paymentReceived);
 
     const ledgerEntry = {
       ts: nowStr(), date: todayStr(),
       phone: displayPhone(matchedKey),
-      jobId: matched.jobId || '—',
+      jobId: matchedOrder.jobId || '—',
       amount: paid, type, balance,
       confirmedBy: workerId
         ? `${workers.get(workerId)?.name || workerId} (${workerId})`
         : confirmedBy,
       workerId: workerId || null,
       workerName: workerName || null,
-      txId: matched.confirmedTxId || null,
-      files: [...(matched.confirmedFiles || []), ...(matched.files || [])],
+      txId: matchedOrder.confirmedTxId || null,
+      files: [...(matchedOrder.confirmedFiles || []), ...(matchedOrder.files || [])],
     };
     paymentLedger.push(ledgerEntry);
 
-    if ((matched.totalBill || 0) - matched.paymentReceived <= 0.01) {
-      const overpaid = matched.paymentReceived - (matched.totalBill || 0);
+    if ((matchedOrder.totalBill || 0) - matchedOrder.paymentReceived <= 0.01) {
+      const overpaid = matchedOrder.paymentReceived - (matchedOrder.totalBill || 0);
 
-      matched.confirmedFiles = [...matched.confirmedFiles, ...matched.files];
-      matched.files = []; matched.paymentReceived = 0; matched.totalBill = null;
-      matched.state = 'processing';
+      matchedOrder.confirmedFiles = [...(matchedOrder.confirmedFiles||[]), ...matchedOrder.files];
+      matchedOrder.files = []; matchedOrder.paymentReceived = 0; matchedOrder.totalBill = null;
+      matchedOrder.state = 'processing';
       const jobId = generateJobId(matchedKey);
-      matched.jobId = jobId;
-      matched.readyTime = new Date(Date.now() + (getReadyHours(matched.a4eq || 0) || 24) * 3600000);
-      matched.overdueReminders = 0;
+      matchedOrder.jobId = jobId;
+      matchedOrder.readyTime = new Date(Date.now() + (getReadyHours(matchedOrder.a4eq || 0) || 24) * 3600000);
+      matchedOrder.overdueReminders = 0;
+
+      // Start next order for this customer (ready for new files)
+      if (!matched.orders.find(o => o.state === 'idle' || o.state === 'receiving')) {
+        startNewOrder(matched);
+      }
+
       clearTimers(matchedKey);
       ledgerEntry.jobId = jobId;
-      const readyAt = readyTimeText(matched.a4eq || 0);
+      const readyAt = readyTimeText(matchedOrder.a4eq || 0);
 
       addToHistory(matched, 'assistant',
         `Payment confirmed via ${type}. Job ID: ${jobId}. Ready by ${readyAt}.${overpaid > 0.01 ? ` GHS ${overpaid.toFixed(2)} overpaid.` : ''}`);
 
+      // Unpause bot if it was silenced (human finished, new order can start)
+      matched.paused = false;
+      matched.pausedAt = null;
       const workerLine = (type === 'cash' && workerName)
         ? `\n👤 Served by: *${workerName}* at Migo Print Shop` : '';
 
       // Queue position — count jobs already processing before this one
-      const jobsAhead = [...sessions.values()].filter(s => s.state === 'processing' && s.jobId && s.jobId !== jobId).length;
+      const jobsAhead = [...sessions.values()].filter(s => s.orders?.some(o=>o.state==='processing') && s.orders?.some(o=>o.jobId&&o.jobId!==jobId)).length;
       const queueLine = jobsAhead === 0
         ? `\n📋 *You're next in queue!* 🎉`
         : `\n📋 *Queue position: ${jobsAhead + 1}* (${jobsAhead} job${jobsAhead !== 1 ? 's' : ''} ahead of you)`;
@@ -874,18 +1050,18 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
         `Your *Pickup Code* will be sent to you when your order is ready. 🙏`,
       ].filter(l => l !== null && l !== undefined).join('\n'));
 
-      scheduleWorkerReminders(matchedKey, matched, jobId);
+      scheduleWorkerReminders(matchedKey, matchedOrder, jobId);
 
       // S16: Sunday small order — alert owner to decide, no message to customer
       const { isSunday } = shopStatus();
-      if (isSunday && (matched.a4eq || 0) < 200) {
+      if (isSunday && (matchedOrder.a4eq || 0) < 200) {
         alertOwner([
           `📅 *SUNDAY SMALL ORDER — PAYMENT RECEIVED*`,
           ``,
           `📱 Customer: ${displayPhone(matchedKey)}`,
           `🔖 Job ID:   ${jobId}`,
           `💰 Amount:   GHS ${paid.toFixed(2)}`,
-          `🖨 Size:     ${matched.a4eq} A4-equivalent sheets`,
+          `🖨 Size:     ${matchedOrder.a4eq} A4-equivalent sheets`,
           ``,
           `This is below the 200-sheet Sunday minimum.`,
           `Please decide: process now or defer to Monday.`,
@@ -903,7 +1079,7 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
 
       return { status: 'confirmed', jobId, readyBy: readyAt, ledgerEntry };
     } else {
-      const remaining = (matched.totalBill || 0) - matched.paymentReceived;
+      const remaining = (matchedOrder.totalBill || 0) - matchedOrder.paymentReceived;
       await sendMsg(matchedKey, [
         `✅ GHS ${paid.toFixed(2)} received${type === 'cash' ? ' _(cash)_' : ''}. Thank you!`, ``,
         `⚠️ *Balance remaining: GHS ${remaining.toFixed(2)}*`, ``,
@@ -946,28 +1122,31 @@ function parseMomoSMS(text) {
 
 // ── Smart payment matcher ─────────────────────────────────────
 function smartMatchPayment(amount, txId, reference) {
+  // TxID match — check pending orders
   if (txId) {
-    for (const [key, s] of sessions.entries())
-      if (s.pendingTxId === txId) return { match: 'txid', key, session: s };
+    for (const [key, s] of sessions.entries()) {
+      const order = s.orders?.find(o => o.pendingTxId === txId);
+      if (order) return { match: 'txid', key, session: s, order };
+    }
   }
   const candidates = [];
   for (const [key, s] of sessions.entries()) {
-    if (s.state !== 'awaiting_payment') continue;
-    const balance = Math.max(0, (s.totalBill || 0) - s.paymentReceived);
-    // Match full payments, overpayments (up to 1.5x), AND partial payments
+    const order = s.orders?.find(o => o.state === 'awaiting_payment');
+    if (!order) continue;
+    const balance = Math.max(0, (order.totalBill || 0) - (order.paymentReceived || 0));
     if (amount > 0 && amount <= balance * 1.5 + 0.01)
-      candidates.push({ key, session: s, balance });
+      candidates.push({ key, session: s, order, balance });
   }
   if (candidates.length === 0) return { match: 'none' };
   if (candidates.length === 1) return { match: 'amount', ...candidates[0] };
   const ref = (reference || '').replace(/[\s\-]/g, '').toUpperCase();
   if (ref && ref !== '0') {
-    for (const { key, session: s, balance } of candidates) {
+    for (const { key, session: s, order, balance } of candidates) {
       const p4 = key.replace(/\D/g, '').slice(-4);
       const p9 = key.replace(/\D/g, '').slice(-9);
-      const jc = (s.jobId || '').replace(/[\s\-]/g, '').toUpperCase();
+      const jc = (order.jobId || '').replace(/[\s\-]/g, '').toUpperCase();
       if (ref.includes(p4)||ref.includes(p9)||ref===jc||jc.includes(ref)||(ref.length>=4&&jc.includes(ref)))
-        return { match: 'reference', key, session: s, balance };
+        return { match: 'reference', key, session: s, order, balance };
     }
   }
   return { match: 'ambiguous', candidates };
@@ -996,7 +1175,7 @@ async function handleMomoEvent(parsed, source) {
 
   if (result.match === 'ambiguous') {
     const list = result.candidates.map((c, i) =>
-      `${i+1}. ...${last4(c.key)} | Job:${c.session.jobId||'—'} | GHS ${c.session.totalBill?.toFixed(2)||'—'}`
+      `${i+1}. ...${last4(c.key)} | Job:${sessJobId(c.session)||'—'} | GHS ${sessTotalBill(c.session)?.toFixed(2)||'—'}`
     ).join('\n');
     await alertOwner([
       `⚠️ *AMBIGUOUS MOMO*`, ``,
@@ -1149,16 +1328,16 @@ STRICT RULES:
   }
 }
 
-function addFile(session, info, source, notes) {
+function addFile(order, info, source, notes) {
   const { size, qty, isMoreOf } = info;
   if (!size || !qty) return;
   if (isMoreOf) {
-    const ex = session.files.find(f => f.size === isMoreOf);
+    const ex = order.files.find(f => f.size === isMoreOf);
     if (ex) { ex.qty += qty; return; }
   }
-  const ex = session.files.find(f => f.size === size);
+  const ex = order.files.find(f => f.size === size);
   if (ex) ex.qty += qty;
-  else session.files.push({ size, qty, source: source || 'file', notes: notes || '' });
+  else order.files.push({ size, qty, source: source || 'file', notes: notes || '' });
 }
 
 function calcBill(files) {
@@ -1190,16 +1369,16 @@ function isMomoReceipt(msg) {
   return /paid|i paid|i have paid|done paying|payment done|settled|money sent|momo sent|transferred|receipt|sent the money/i.test(msg);
 }
 
-function buildSummary(session) {
-  const { lines, subtotal, a4eq } = calcBill(session.files);
-  session.a4eq = a4eq;
+function buildSummary(order) {
+  const { lines, subtotal, a4eq } = calcBill(order.files);
+  order.a4eq = a4eq;
   let pressingFee = 0;
-  if (session.pressing) {
-    pressingFee = calcPressing(session.pressing.shirts, session.pressing.type, session.pressing.largeArtwork);
-    session.pressing.fee = pressingFee;
+  if (order.pressing) {
+    pressingFee = calcPressing(order.pressing.shirts, order.pressing.type, order.pressing.largeArtwork);
+    order.pressing.fee = pressingFee;
   }
   const grandTotal = subtotal + pressingFee;
-  session.totalBill = grandTotal;
+  order.totalBill = grandTotal;
   const items = lines.map(l => `  ${l.size} × ${l.qty} — GHS ${l.price.toFixed(2)}`).join('\n');
   const pressingLine = pressingFee > 0 ? `\n  👕 Pressing — GHS ${pressingFee.toFixed(2)}` : '';
   const parts = [
@@ -1226,16 +1405,16 @@ function calcPressing(shirts, type, largeArtwork) {
   return shirts * rate;
 }
 
-function buildBill(session) {
-  const { lines, subtotal, a4eq } = calcBill(session.files);
-  session.a4eq = a4eq;
+function buildBill(order) {
+  const { lines, subtotal, a4eq } = calcBill(order.files);
+  order.a4eq = a4eq;
   let pressingFee = 0;
-  if (session.pressing) {
-    pressingFee = calcPressing(session.pressing.shirts, session.pressing.type, session.pressing.largeArtwork);
-    session.pressing.fee = pressingFee;
+  if (order.pressing) {
+    pressingFee = calcPressing(order.pressing.shirts, order.pressing.type, order.pressing.largeArtwork);
+    order.pressing.fee = pressingFee;
   }
   const grandTotal = subtotal + pressingFee;
-  session.totalBill = grandTotal;
+  order.totalBill = grandTotal;
   const items = lines.map(l => `🖨 ${l.size}  ·  ${l.qty} sheet${l.qty!==1?'s':''}  ·  *GHS ${l.price.toFixed(2)}*`).join('\n');
   const pressingLine = pressingFee > 0
     ? `\n👕 Pressing  ·  *GHS ${pressingFee.toFixed(2)}*`
@@ -1277,7 +1456,7 @@ function buildImageQuestion(session) {
 }
 
 function startReceiveTimer(phone, session) {
-  const fileCount = session.files.length + session.pendingImages.length + session.unknownFiles.length;
+  const fileCount = order.files.length + session.pendingImages.length + session.unknownFiles.length;
 
   if (fileCount >= 2) {
     // Bulk: set a short 5s timer after the LAST file arrives.
@@ -1325,38 +1504,57 @@ function startReceiveTimer(phone, session) {
   });
 }
 
-async function proceedToSummary(phone, session) {
-  if (!session.files.length && !session.unknownFiles.length && !session.pendingImages.length) {
+async function proceedToSummary(phone, session, order) {
+  if (!order) order = getActiveOrder(session);
+
+  // No files at all
+  if (!order.files.length && !order.unknownFiles.length && !order.pendingImages.length) {
     await sendMsg(phone, `I could not detect any files. Please send your files and I will calculate the cost.`);
-    session.state = 'receiving'; return;
+    order.state = 'receiving'; return;
   }
-  // Only ask about pressing if customer mentioned it and we haven't asked yet
-  if (session.pressingMentioned && !session.askedPressing) {
-    session.askedPressing = true;
-    session.state = 'asking_pressing';
-    await sendMsg(phone, `Pressing details — how many shirts and front only, front+back, or side? (Type *no* to skip)`);
+
+  // Files with no size/qty — ask GPT to handle
+  if (order.pendingImages.length > 0 || order.unknownFiles.length > 0) {
+    order.state = 'asking_image_info';
+    const d = await gptDecide(null, session, `[Customer said they are done sending. There are still ${order.pendingImages.length + order.unknownFiles.length} file(s) with no size or quantity. Ask for size and quantity.]`);
+    if (d.action === 'send_bill' && order.files.length > 0) {
+      if (d.files?.length > 0) _applyGPTFiles(d.files, order);
+      if (d.pressing) order.pressing = d.pressing;
+      await sendBill(phone, session, order);
+    } else {
+      await sendMsg(phone, d.reply || `Please give size and quantity of each file.`);
+    }
+    return;
+  }
+
+  // All files have size/qty — pressing check then bill
+  if (order.pressingMentioned && !order.askedPressing) {
+    order.askedPressing = true;
+    order.state = 'asking_pressing';
+    await sendMsg(phone, `How many shirts, and front only, front+back, or side? (Type *no* to skip)`);
     setTimer(phone, 'pressing_timeout', 60000, async () => {
-      if (session.state === 'asking_pressing') {
-        session.pressing = null;
-        // Calculate bill totals before sending
-        calcBill(session.files); // sets session.a4eq via buildBill
-        await sendBill(phone, session);
+      if (order.state === 'asking_pressing') {
+        order.pressing = null;
+        await sendBill(phone, session, order);
       }
     });
     return;
   }
-  // No summary — go straight to bill
-  await sendBill(phone, session);
+
+  // All good — send bill
+  await sendBill(phone, session, order);
 }
 
-async function sendBill(phone, session) {
-  session.state = 'awaiting_payment';
-  audit('BILL_SENT', phone, `GHS ${session.totalBill?.toFixed(2)}`);
+async function sendBill(phone, session, order) {
+  if (!order) order = getActiveOrder(session);
+  order.state = 'awaiting_payment';
+  order.billSentAt = Date.now();
+  audit('BILL_SENT', phone, `Order #${order.ref} — GHS ${order.totalBill?.toFixed(2)}`);
 
-  // Build bill string NOW before setTimeout — so any crash is caught immediately
+  // Build bill string NOW before setTimeout
   let billMsg;
   try {
-    billMsg = buildBill(session);
+    billMsg = buildBill(order);
   } catch(e) {
     console.error('❌ buildBill error:', e.message);
     await alertOwner(`⚠️ buildBill crashed for ${displayPhone(phone)}: ${e.message}`).catch(()=>{});
@@ -1391,13 +1589,13 @@ async function sendBill(phone, session) {
   }, 2000);
 }
 
-function scheduleWorkerReminders(phone, session, jobId) {
-  if (!session.readyTime) return;
-  const now = Date.now(), readyMs = session.readyTime.getTime();
+function scheduleWorkerReminders(phone, order, jobId) {
+  if (!order.readyTime) return;
+  const now = Date.now(), readyMs = order.readyTime.getTime();
   const remind = (name, ms, label) => {
     if (ms <= now) return;
     setTimer(phone, name, ms - now, async () => {
-      if (session.jobId !== jobId) return;
+      if (order.jobId !== jobId) return;
       await sendMsg(toWaId(SHOP_NUMBER),
         [label, ``, `🔖 Job: *${jobId}*`, `📱 ...${last4(phone)}`].join('\n'));
     });
@@ -1406,7 +1604,7 @@ function scheduleWorkerReminders(phone, session, jobId) {
   remind('work15', readyMs - 15*60000, `⚠️ *15-Min Warning* — Job ${jobId}`);
   remind('work2',  readyMs -  2*60000, `🚨 *2-Min Warning*  — Job ${jobId} due NOW`);
   const overdueFn = async (attempt) => {
-    if (session.jobId !== jobId) return;
+    if (order.jobId !== jobId) return;
     overdueFlow.set(phone, { step: 'asked_ready', jobId, attempt });
     await sendMsg(toWaId(SHOP_NUMBER), [
       `⏰ *JOB OVERDUE — Attempt ${attempt}*`, ``,
@@ -1417,7 +1615,6 @@ function scheduleWorkerReminders(phone, session, jobId) {
       `*NO ${last4(phone)}*  — if not ready`,
     ].join('\n'));
     audit('JOB_OVERDUE', phone, `Attempt ${attempt} — Job ${jobId}`, true);
-    // If no response in 10 minutes, ask again
     setTimer(phone, 'overdue', 600000, () => overdueFn(attempt + 1));
   };
   if (readyMs + 60000 > now)
@@ -1509,22 +1706,22 @@ function trackFile(phone, url, filename, mediaType, caption, session) {
 
 // ── Main message handler ──────────────────────────────────────
 // ── Apply GPT's confirmed file list to session ────────────────
-function _applyGPTFiles(gptFiles, session) {
+function _applyGPTFiles(gptFiles, order) {
   // Merge GPT's confirmed sizes/qtys with pending/unknown files by position
-  const pending = [...session.pendingImages, ...session.unknownFiles];
+  const pending = [...order.pendingImages, ...order.unknownFiles];
   gptFiles.forEach((f, i) => {
     if (!f.size || !f.qty) return;
     const src = pending[i];
     if (src) {
-      addFile(session, { size: f.size, qty: f.qty, sourceUrl: src.url, isUnknown: false, isMoreOf: null },
+      addFile(order, { size: f.size, qty: f.qty, sourceUrl: src.url, isUnknown: false, isMoreOf: null },
         src.caption || src.name || `file ${i+1}`, '');
-    } else if (session.files.length === 0 || !session.files.find(sf => sf.size === f.size && sf.qty === f.qty)) {
+    } else if (order.files.length === 0 || !order.files.find(sf => sf.size === f.size && sf.qty === f.qty)) {
       // Text-only order or new file
-      addFile(session, { size: f.size, qty: f.qty, isUnknown: false, isMoreOf: null }, 'order', '');
+      addFile(order, { size: f.size, qty: f.qty, isUnknown: false, isMoreOf: null }, 'order', '');
     }
   });
-  session.pendingImages = [];
-  session.unknownFiles = [];
+  order.pendingImages = [];
+  order.unknownFiles = [];
 }
 
 async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage) {
@@ -1562,57 +1759,92 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   if (!botActive) return null;
 
   const session = getSession(from);
-  if (session.paused) return null;
 
-  // Auto-reset stale sessions (12h) — guard against double-reset
-  const STALE = 12 * 60 * 60 * 1000;
-  if (!body?.startsWith('__reset__') && Date.now() - session.lastActivity > STALE
-      && ['idle','receiving','asked_done','confirming','asking_image_info','asking_pressing','ready'].includes(session.state)) {
-    clearTimers(from); sessions.delete(from);
-    return handleMessage(from, body, mediaUrl, mediaType, filename, isImage);
-  }
+  // ── Bot silenced — human is handling ─────────────────────
+  if (isBotSilenced(session)) return null;
+
   session.lastActivity = Date.now();
 
-  // ── Detect pressing mention ───────────────────────────────
-  if (/\bpress(ing|ed)?\b/i.test(msg || '')) session.pressingMentioned = true;
+  // Get active order
+  let order = getActiveOrder(session);
 
-  // ── PAYMENT / PROCESSING / READY — code handles these ────
-  if (session.state === 'awaiting_payment') {
+  // ── Greeting → always start fresh if no active pending order ─
+  if (msg && isGreeting(msg)) {
+    const pendingOrder = getPendingOrder(session);
+    if (!pendingOrder && ['idle','receiving','asked_done','asking_image_info','asking_pressing'].includes(order.state)) {
+      // Clear timers and reset active order
+      clearTimers(from);
+      if (order.state !== 'idle' || order.files.length > 0) {
+        // Start new order
+        order = startNewOrder(session);
+      }
+    }
+    return greetingReply(msg);
+  }
+
+  // ── New message while awaiting payment ───────────────────
+  const pendingOrder = getPendingOrder(session);
+  if (pendingOrder && order.ref !== pendingOrder.ref) {
+    // Customer has an unpaid order AND is starting something new
+    const timeSinceBill = Date.now() - (pendingOrder.billSentAt || Date.now());
+    const THIRTY_MIN = 30 * 60 * 1000;
+
+    if (timeSinceBill <= THIRTY_MIN && mediaUrl) {
+      // Within 30 min with new files → merge into pending order
+      order = pendingOrder;
+      session.activeRef = pendingOrder.ref;
+    } else if (timeSinceBill > THIRTY_MIN) {
+      // After 30 min → silence bot, alert owner
+      await silenceBot(from, session, `Customer returned after ${Math.round(timeSinceBill/60000)} min. Unpaid order ref #${pendingOrder.ref} (GHS ${pendingOrder.totalBill?.toFixed(2) || '?'})`);
+      return null;
+    }
+    // else within 30 min with text message — let GPT handle
+  }
+
+  // ── Pressing mention ──────────────────────────────────────
+  if (/\bpress(ing|ed)?\b/i.test(msg || '')) order.pressingMentioned = true;
+
+  // ── READY state ───────────────────────────────────────────
+  const readyOrder = session.orders.find(o => o.state === 'ready');
+  if (readyOrder && isReadyCheck(msg || '')) {
+    return `✅ Your order is ready!\n🔑 Pickup code: *${readyOrder.jobId}*\n📍 Near Benz Gate, Circle. No pickup code — no release.`;
+  }
+
+  // ── PROCESSING state ──────────────────────────────────────
+  const processingOrder = session.orders.find(o => o.state === 'processing');
+  if (processingOrder && isReadyCheck(msg || '')) {
+    const eta = processingOrder.readyTime
+      ? processingOrder.readyTime.toLocaleTimeString('en-GH', { timeZone:'Africa/Accra', hour12:true, hour:'2-digit', minute:'2-digit' })
+      : 'shortly';
+    return `Still printing. 🖨️ Ready by *${eta}*. We'll notify you!`;
+  }
+
+  // ── AWAITING PAYMENT ──────────────────────────────────────
+  if (order.state === 'awaiting_payment') {
     const lower = (msg || '').toLowerCase();
     if (/\b(cash|bring cash|pay cash|no momo|don.?t have momo|no mobile money|pay when i come|pay on arrival|pay at shop|i.?ll pay|coming to pay|bring the money|i have cash|physical(ly)?|in person)\b/i.test(msg))
       return `Printing can only start after Payment Confirmation. Thank you.`;
     if (isReadyCheck(msg || ''))
       return `We haven't received your payment yet. Once payment is confirmed we'll start printing. 🙏`;
     if (/send.*bill|bill again|resend|can.?t see|didn.?t (get|receive)|show.*bill/i.test(lower)) {
-      await sendMsg(from, buildBill(session)); return null;
+      await sendMsg(from, buildBill(order)); return null;
     }
     if (/how much|total|amount|balance/.test(lower))
-      return `Total: *GHS ${session.totalBill?.toFixed(2) || '—'}*\nMoMo: *0552719245*`;
+      return `Total: *GHS ${order.totalBill?.toFixed(2) || '—'}*\nMoMo: *0552719245*`;
     const txIdTyped = (msg || '').match(/\b(\d{8,})\b/);
     if (txIdTyped) {
-      session.pendingTxId = txIdTyped[1];
+      order.pendingTxId = txIdTyped[1];
       audit('TXID_PROVIDED', from, `TxID:${txIdTyped[1]}`);
       return `Got it! TxID *${txIdTyped[1]}* noted. We'll confirm shortly. 🙏`;
     }
     if (mediaUrl && isImage) {
       const ocr = await extractReceiptFromImage(mediaUrl);
       if (ocr?.amount) {
-        if (ocr.txId) { session.pendingTxId = ocr.txId; session.pendingTxAmount = ocr.amount; }
+        if (ocr.txId) { order.pendingTxId = ocr.txId; order.pendingTxAmount = ocr.amount; }
         return ocr.txId
           ? `Got it! TxID *${ocr.txId}* — GHS ${ocr.amount.toFixed(2)}. Confirming now. 🙏`
           : `Got it! GHS ${ocr.amount.toFixed(2)} noted. Please reply with your Transaction ID to confirm faster.`;
       }
-    }
-    const d0 = await gptDecide(msg, session);
-    return d0.reply || null;
-  }
-
-  if (session.state === 'processing') {
-    if (isReadyCheck(msg || '')) {
-      const eta = session.readyTime
-        ? session.readyTime.toLocaleTimeString('en-GH', { timeZone:'Africa/Accra', hour12:true, hour:'2-digit', minute:'2-digit' })
-        : 'shortly';
-      return `Still printing. 🖨️ Ready by *${eta}*. We'll notify you!`;
     }
     const d0 = await gptDecide(msg, session);
     return d0.reply || null;
@@ -1625,7 +1857,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     const fileDesc = `[FILE RECEIVED: "${fileLabel}", type: ${mediaType||'unknown'}${captionNote}]`;
 
     if (isImage) {
-      const isDup = session.files.some(f=>f.sourceUrl===mediaUrl) || session.pendingImages.some(p=>p.url===mediaUrl);
+      const isDup = order.files.some(f=>f.sourceUrl===mediaUrl) || order.pendingImages.some(p=>p.url===mediaUrl);
       if (isDup) return null;
       trackFile(from, mediaUrl, filename||msg||'image.jpg', mediaType||'image/jpeg', msg, session);
 
@@ -1633,39 +1865,39 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       const orders = await extractOrder(parseSource, filename||'', session);
       const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
       if (valid.length > 0) {
-        valid.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, msg||filename||'image', ''));
+        valid.forEach(o => addFile(order, { ...o, sourceUrl: mediaUrl }, msg||filename||'image', ''));
         addToHistory(session, 'user', `${fileDesc} → auto-parsed: ${valid.map(v=>`${v.size}×${v.qty}`).join(', ')}`);
       } else {
-        session.pendingImages.push({ url: mediaUrl, caption: msg, index: session.pendingImages.length+1, mediaType: mediaType||'' });
+        order.pendingImages.push({ url: mediaUrl, caption: msg, index: order.pendingImages.length+1, mediaType: mediaType||'' });
         addToHistory(session, 'user', fileDesc);
       }
     } else {
-      const isDup = session.files.some(f=>f.sourceUrl===mediaUrl) || session.unknownFiles.some(u=>u.url===mediaUrl);
+      const isDup = order.files.some(f=>f.sourceUrl===mediaUrl) || order.unknownFiles.some(u=>u.url===mediaUrl);
       if (isDup) return null;
       trackFile(from, mediaUrl, filename||'file.pdf', 'application/pdf', msg, session);
       const orders = await extractOrder(msg, filename, session);
       const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
       if (valid.length > 0) {
-        valid.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, msg||filename, ''));
+        valid.forEach(o => addFile(order, { ...o, sourceUrl: mediaUrl }, msg||filename, ''));
         addToHistory(session, 'user', `${fileDesc} → auto-parsed: ${valid.map(v=>`${v.size}×${v.qty}`).join(', ')}`);
       } else {
-        session.unknownFiles.push({ name: filename||'file', url: mediaUrl });
+        order.unknownFiles.push({ name: filename||'file', url: mediaUrl });
         addToHistory(session, 'user', fileDesc);
       }
     }
 
-    session.state = 'receiving';
+    order.state = 'receiving';
 
     // 30s timer — fires after customer stops sending files
     // Resets every time a new file arrives
     setTimer(from, 'checkin', 30000, async () => {
-      if (session.state !== 'receiving') return;
-      session.state = 'asked_done';
+      if (order.state !== 'receiving') return;
+      order.state = 'asked_done';
       await sendMsg(from, `Are you done sending? 👍`);
       // If no reply in 60s, assume yes and proceed
       setTimer(from, 'nodone', 60000, async () => {
-        if (session.state === 'asked_done') {
-          await proceedToSummary(from, session);
+        if (order.state === 'asked_done') {
+          await proceedToSummary(from, session, order);
         }
       });
     });
@@ -1676,23 +1908,23 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   // ── TEXT MESSAGE ─────────────────────────────────────────
 
   // Handle "Are you done sending?" reply
-  if (session.state === 'asked_done') {
+  if (order.state === 'asked_done') {
     clearTimers(from);
     if (isNo(msg)) {
       // Customer still sending — go back to receiving
-      session.state = 'receiving';
+      order.state = 'receiving';
       setTimer(from, 'checkin', 30000, async () => {
-        if (session.state !== 'receiving') return;
-        session.state = 'asked_done';
+        if (order.state !== 'receiving') return;
+        order.state = 'asked_done';
         await sendMsg(from, `Are you done sending? 👍`);
         setTimer(from, 'nodone', 60000, async () => {
-          if (session.state === 'asked_done') await proceedToSummary(from, session);
+          if (order.state === 'asked_done') await proceedToSummary(from, session, order);
         });
       });
       return null;
     }
     // Yes or any text → proceed
-    await proceedToSummary(from, session);
+    await proceedToSummary(from, session, order);
     return null;
   }
 
@@ -1701,17 +1933,17 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
 
   if (d.action === 'send_bill') {
     clearTimers(from);
-    if (d.files?.length > 0) _applyGPTFiles(d.files, session);
-    if (d.pressing) session.pressing = d.pressing;
-    if (session.files.length > 0) {
-      await sendBill(from, session);
+    if (d.files?.length > 0) _applyGPTFiles(d.files, order);
+    if (d.pressing) order.pressing = d.pressing;
+    if (order.files.length > 0) {
+      await sendBill(from, session, order);
       return null;
     }
   }
 
-  if (d.action === 'ask_size_qty') session.state = 'asking_image_info';
+  if (d.action === 'ask_size_qty') order.state = 'asking_image_info';
 
-  return d.reply || (session.state === 'idle' ? `Hi! Please send your DTF files. 🖨️` : null);
+  return d.reply || (session.state === 'idle' && isGreeting(msg||'') ? `Hi! Please send your DTF files. 🖨️` : d.reply || null);
 
 
   // ── READY ────────────────────────────────────────────────────
@@ -1725,12 +1957,12 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       else { reply = `😔 So sorry to hear that. What went wrong? We want to fix it.`; sentiment = 'poor'; }
       ratingsLog.unshift({
         ts: nowStr(), date: todayStr(), phone: displayPhone(from),
-        jobId: session.jobId || '—', score: n, sentiment, comment: '',
-        files: [...(session.confirmedFiles || [])],
+        jobId: sessJobId(session) || '—', score: n, sentiment, comment: '',
+        files: [...(readyOrder?.confirmedFiles || [])],
       });
       session.ratingGiven = true;
-      audit('RATING', from, `${n}/5 — ${sentiment} | Job:${session.jobId||'—'}`);
-      if (n <= 2) await alertOwner(`⭐ *BAD RATING*\nCustomer ...${last4(from)} — ${n}/5 | Job: ${session.jobId||'—'}`);
+      audit('RATING', from, `${n}/5 — ${sentiment} | Job:${sessJobId(session)||'—'}`);
+      if (n <= 2) await alertOwner(`⭐ *BAD RATING*\nCustomer ...${last4(from)} — ${n}/5 | Job: ${sessJobId(session)||'—'}`);
       clearTimers(from); sessions.delete(from);
       return reply;
     }
@@ -1739,7 +1971,8 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       lastRating.comment = msg;
       return `Thank you for letting us know. We take all feedback seriously. 🙏`;
     }
-    return replyWithGPT(msg, session);
+    const d0 = await gptDecide(msg, session);
+    return d0.reply || null;
   }
   return null;
 }
@@ -1829,8 +2062,8 @@ async function handleAdmin(from, msg) {
       overdueFlow.delete(flow[0]);
       const found2 = findByLast4(l4);
       if (found2) {
-        found2.session.state = 'ready'; clearTimers(found2.key);
-        await sendMsg(found2.key, buildReadyMsg(found2.session.jobId));
+        const fo=found2.session.orders?.find(o=>o.state==='processing'); if(fo){ fo.state='ready'; } clearTimers(found2.key);
+        await sendMsg(found2.key, buildReadyMsg(sessJobId(found2.session)));
       }
       return `✅ Job marked ready. Customer notified.`;
     }
@@ -1870,7 +2103,7 @@ async function handleAdmin(from, msg) {
         timeZone: 'Africa/Accra', hour12: true, hour: '2-digit', minute: '2-digit',
       });
       // Update session ready time
-      found2.session.readyTime = newDate;
+      const fo2=found2.session.orders?.find(o=>o.state==='processing'); if(fo2) fo2.readyTime = newDate;
       // Send new ready time first, then apology
       await sendMsg(found2.key, [
         `⏱ *UPDATED READY TIME*`, ``,
@@ -1879,7 +2112,7 @@ async function handleAdmin(from, msg) {
       ].join('\n'));
       await alertOwner([
         `🔴 *JOB OVERDUE ALERT*`, ``,
-        `🔖 Job: *${found2.session.jobId || l4}*`,
+        `🔖 Job: *${sessJobId(found2.session) || l4}*`,
         `📱 Customer: ...${l4}`,
         `🕐 New ETA: *${newETA}*`,
         `❓ Reason: ${reason}`,
@@ -1932,29 +2165,29 @@ async function handleAdmin(from, msg) {
 
   if (cmd === 'ready') {
     const input = args[0] || '';
-    // Support: admin W01 ready 9245 (last4) or admin W01 ready MGO-9245-A1001 (jobId)
     const byLast4 = findByLast4(input);
-    let phone, s;
-    if (byLast4) { phone = byLast4.key; s = byLast4.session; }
-    else {
-      for (const [key, sess] of sessions.entries())
-        if (sess.jobId === input.toUpperCase()) { phone = key; s = sess; break; }
+    let phone, s, targetOrder;
+    if (byLast4) {
+      phone = byLast4.key; s = byLast4.session;
+      targetOrder = s.orders.find(o => o.state === 'processing') || getActiveOrder(s);
+    } else {
+      for (const [key, sess] of sessions.entries()) {
+        const o = sess.orders?.find(o => sessJobId(sess) === input.toUpperCase());
+        if (o) { phone = key; s = sess; targetOrder = o; break; }
+      }
     }
-    if (!s) return `❌ No session for "${input}".\nUsage: admin W01 ready <last4>`;
-    s.state = 'ready'; s.servedBy = workerId; clearTimers(phone);
-    audit('MARKED_READY', from, `Job ${s.jobId||'—'} by ${workerName}`, false, workerId);
-    const readyMsg = buildReadyMsg(s.jobId);
+    if (!s || !targetOrder) return `❌ No session for "${input}".\nUsage: admin W01 ready <last4>`;
+    targetOrder.state = 'ready'; targetOrder.servedBy = workerId; clearTimers(phone);
+    audit('MARKED_READY', from, `Job ${targetOrder.jobId||'—'} by ${workerName}`, false, workerId);
+    const readyMsg = buildReadyMsg(targetOrder.jobId);
     await sendMsg(phone, readyMsg);
     setTimer(phone, 'rating', 1800000, async () => {
       if (!s.ratingAsked) {
         s.ratingAsked = true;
-        await sendMsg(phone, [`⭐ How was your experience at Migo Print Shop?`, ``,
-          `5 — Excellent  |  4 — Good  |  3 — Okay  |  2 — Poor  |  1 — Very poor`].join('\n'));
-        // Follow-up if no rating after 2 hours
+        await sendMsg(phone, `⭐ How was your experience?\n5 Excellent  4 Good  3 Okay  2 Poor  1 Very poor`);
         setTimer(phone, 'rating_followup', 7200000, async () => {
-          if (s.state === 'ready' && !s.ratingGiven) {
-            await sendMsg(phone, `😊 We'd love to hear how your experience was! Just reply with a number:\n5 — Excellent  |  4 — Good  |  3 — Okay  |  2 — Poor  |  1 — Very poor`);
-          }
+          if (targetOrder.state === 'ready' && !s.ratingGiven)
+            await sendMsg(phone, `⭐ How was your experience?\n5 Excellent  4 Good  3 Okay  2 Poor  1 Very poor`);
         });
       }
     });
@@ -1965,13 +2198,13 @@ async function handleAdmin(from, msg) {
     const found = findByLast4(args[0]);
     if (!found) return `❌ No session for "${args[0]}".`;
     const s = found.session;
+    const orderLines = s.orders.map((o,i) =>
+      `  Order ${o.ref}: ${o.state} | Files: ${o.files.length} | Bill: GHS ${o.totalBill?.toFixed(2)||'—'} | Job: ${o.jobId||'pending'}`
+    ).join('\n');
     return [`📊 *...${last4(found.key)}*`,
-      `State: ${s.state}`, `Job ID: ${s.jobId||'—'}`,
-      `Files: ${JSON.stringify(s.files)}`,
-      `Total: GHS ${s.totalBill?.toFixed(2)||'—'}`,
-      `Paid: GHS ${s.paymentReceived.toFixed(2)}`,
-      `Pending TxID: ${s.pendingTxId||'—'}`,
+      `Name: ${s.customerName||'—'}`,
       `Paused: ${s.paused ? 'YES' : 'no'}`,
+      `Orders today:`, orderLines,
     ].join('\n');
   }
 
@@ -2125,14 +2358,22 @@ async function handleAdmin(from, msg) {
     if (!found) return `❌ No session for ...${args[0]}`;
     const qty = parseInt(args[1]), size = (args[2] || '').toUpperCase();
     if (!PRICES[size] || isNaN(qty)) return `❌ Usage: admin W01 info <last4> 20 A4`;
-    addFile(found.session, { size, qty, isUnknown: false, isMoreOf: null }, 'admin', '');
+    const activeOrd = getActiveOrder(found.session);
+    addFile(activeOrd, { size, qty, isUnknown: false, isMoreOf: null }, 'admin', '');
     return `✅ Added ${qty} ${size} for ...${args[0]}.`;
   }
 
   if (cmd === 'jobs') {
     const out = [`📋 *ACTIVE SESSIONS*`, ``];
-    for (const [key, s] of sessions.entries())
-      out.push(`...${last4(key)} → ${s.state} | GHS ${s.totalBill?.toFixed(2)||'—'}${s.jobId?' | '+s.jobId:''}`);
+    let i = 1;
+    for (const [key, s] of sessions.entries()) {
+      const state = sessState(s);
+      const bill = sessTotalBill(s);
+      const jid = sessJobId(s);
+      const orderCount = s.orders?.filter(o => o.state !== 'idle').length || 0;
+      out.push(`${i}. ...${last4(key)} (${s.customerName||'—'}) → ${state} | ${bill ? 'GHS '+bill.toFixed(2) : '—'}${jid?' | '+jid:''} | Orders: ${orderCount}`);
+      i++;
+    }
     return out.length > 2 ? out.join('\n') : '📭 No active sessions.';
   }
 
@@ -2249,8 +2490,8 @@ function runAutoArchive() {
   for (const [key, s] of sessions.entries()) {
     const hrs = (now - (s.lastActivity || now)) / 3600000;
     if (s.state === 'ready' && hrs > 6)                    { archiveSession(key, s, 'completed'); count++; }
-    else if (s.state === 'awaiting_payment' && hrs > 24)   { archiveSession(key, s, 'abandoned'); count++; }
-    else if (s.state === 'processing' && hrs > 12)         { archiveSession(key, s, 'overdue');   count++; }
+    else if (sessState(s) === 'awaiting_payment' && hrs > 24)   { archiveSession(key, s, 'abandoned'); count++; }
+    else if (sessState(s) === 'processing' && hrs > 12)         { archiveSession(key, s, 'overdue');   count++; }
     else if (['idle','receiving','asked_done','confirming'].includes(s.state) && hrs > 24)
                                                            { archiveSession(key, s, 'abandoned'); count++; }
   }
@@ -2659,7 +2900,7 @@ app.get('/api/stats', (req, res) => {
   res.json({
     ok: true,
     active:          sessions.size,
-    awaitingPayment: [...sessions.values()].filter(s=>s.state==='awaiting_payment').length,
+    awaitingPayment: [...sessions.values()].filter(s=>s.orders?.some(o=>o.state==='awaiting_payment')).length,
     printing:        [...sessions.values()].filter(s=>s.state==='processing').length,
     momoTotal:       todayP.filter(p=>p.type==='momo').reduce((s,p)=>s+p.amount,0),
     cashTotal:       todayP.filter(p=>p.type==='cash').reduce((s,p)=>s+p.amount,0),
@@ -2677,8 +2918,8 @@ app.get('/', (req, res) => res.json({
   uptime:   `${Math.floor(process.uptime()/3600)}h ${Math.floor(process.uptime()%3600/60)}m`,
   started:  new Date(BOT_START).toLocaleString('en-GH', { timeZone: 'Africa/Accra' }),
   queue: {
-    active:          [...sessions.values()].filter(s => s.state === 'processing').length,
-    awaiting_payment:[...sessions.values()].filter(s => s.state === 'awaiting_payment').length,
+    active:          [...sessions.values()].filter(s => sessState(s) === 'processing').length,
+    awaiting_payment:[...sessions.values()].filter(s => sessState(s) === 'awaiting_payment').length,
     ready:           [...sessions.values()].filter(s => s.state === 'ready').length,
   },
 }));
@@ -2687,413 +2928,668 @@ app.get('/', (req, res) => res.json({
 
 // ── Admin & Worker Dashboard HTML ────────────────────────────
 function adminHTML() {
-  return [
-    '<!DOCTYPE html><html><head><meta charset="UTF-8">',
-    '<meta name="viewport" content="width=device-width,initial-scale=1">',
-    '<title>Migo Admin</title>',
-    '<style>',
-    '*{margin:0;padding:0;box-sizing:border-box}',
-    'body{background:#0f172a;color:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;min-height:100vh;padding-bottom:70px}',
-    /* Header */
-    '.hd{background:#1e293b;border-bottom:1px solid #334155;padding:10px 16px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:100}',
-    '.hd-left{display:flex;align-items:center;gap:10px}',
-    '.hd-logo{font-size:18px}.hd-title{font-size:14px;font-weight:700;color:#f1f5f9}',
-    '.hd-sub{font-size:10px;color:#64748b;margin-top:1px}',
-    '.hd-dot{width:7px;height:7px;border-radius:50%;background:#10b981;animation:pulse 2s infinite}',
-    '@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}',
-    /* Stats bar */
-    '.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:12px 14px}',
-    '.stat{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:10px 12px;text-align:center}',
-    '.stat-n{font-size:18px;font-weight:800;line-height:1.1}',
-    '.stat-l{font-size:9px;color:#64748b;margin-top:3px;text-transform:uppercase;letter-spacing:.5px}',
-    '.gr{color:#10b981}.bl{color:#3b82f6}.am{color:#f59e0b}.rd{color:#ef4444}',
-    /* Content panels */
-    '.panel{padding:0 14px;display:none}.panel.on{display:block}',
-    /* Section headers inside panels */
-    '.section-hd{display:flex;justify-content:space-between;align-items:center;padding:10px 0 8px}',
-    '.section-hd h2{font-size:12px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.6px}',
-    /* Tables */
-    '.tbl-wrap{background:#1e293b;border:1px solid #334155;border-radius:10px;overflow:hidden}',
-    'table{width:100%;border-collapse:collapse;font-size:11px}',
-    'th{background:#0f172a;padding:8px 10px;text-align:left;color:#64748b;font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.5px}',
-    'td{padding:9px 10px;border-bottom:1px solid #0f172a;vertical-align:middle}',
-    'tr:last-child td{border-bottom:none}',
-    'tr:hover td{background:#ffffff06}',
-    /* Badges */
-    '.badge{padding:3px 8px;border-radius:20px;font-size:10px;font-weight:700;white-space:nowrap}',
-    '.bg-gr{background:#10b98118;color:#10b981}.bg-bl{background:#3b82f618;color:#3b82f6}',
-    '.bg-am{background:#f59e0b18;color:#f59e0b}.bg-rd{background:#ef444418;color:#ef4444}',
-    /* Buttons */
-    '.btn{padding:5px 11px;border:none;border-radius:6px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap}',
-    '.btn-g{background:#10b981;color:#fff}.btn-b{background:#3b82f6;color:#fff}',
-    '.btn-r{background:#ef4444;color:#fff}.btn-ghost{background:#334155;color:#94a3b8}',
-    /* Worker form */
-    '.w-form{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px;margin-bottom:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end}',
-    '.w-form input{background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:7px 10px;border-radius:7px;font-size:11px;width:90px;flex:1;min-width:70px}',
-    /* Bottom nav */
-    '.nav{position:fixed;bottom:0;left:0;right:0;background:#1e293b;border-top:1px solid #334155;display:flex;z-index:100}',
-    '.nav-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:8px 4px;cursor:pointer;color:#64748b;font-size:9px;font-weight:600;gap:3px;text-transform:uppercase;letter-spacing:.3px;border:none;background:none;transition:color .15s}',
-    '.nav-item.on{color:#3b82f6}',
-    '.nav-icon{font-size:18px;line-height:1}',
-    '.nav-item.on .nav-icon{filter:drop-shadow(0 0 4px #3b82f6aa)}',
-    /* Empty state */
-    '.empty{text-align:center;padding:32px 16px;color:#475569}',
-    '.empty-icon{font-size:36px;margin-bottom:8px}',
-    '.empty-txt{font-size:12px}',
-    /* Misc */
-    '.fl{color:#ef4444}',
-    /* Modal */
-    '.modal{display:none;position:fixed;inset:0;background:#000a;z-index:999;align-items:center;justify-content:center}',
-    '.modal-box{background:#1e293b;border:1px solid #334155;border-radius:16px;padding:22px;width:92%;max-width:320px}',
-    '.modal-box h3{font-size:14px;font-weight:700;margin-bottom:14px}',
-    '.modal-box label{font-size:11px;color:#94a3b8;display:block;margin-bottom:4px}',
-    '.modal-box input{width:100%;margin-bottom:12px;padding:9px 11px;background:#0f172a;border:1px solid #334155;color:#f1f5f9;border-radius:8px;font-size:13px}',
-    '.modal-row{display:flex;gap:8px;margin-top:6px}',
-    '.modal-row button{flex:1;padding:10px;border:none;border-radius:8px;font-size:12px;font-weight:700;cursor:pointer}',
-    '.err{color:#ef4444;font-size:11px;min-height:16px;margin-bottom:4px}',
-    '</style>',
-    '</head><body>',
-    /* Header */
-    '<div class="hd">',
-    '  <div class="hd-left">',
-    '    <span class="hd-logo">🧾</span>',
-    '    <div><div class="hd-title">Migo Print Shop</div><div class="hd-sub">Admin Dashboard</div></div>',
-    '  </div>',
-    '  <div style="display:flex;align-items:center;gap:10px">',
-    '    <span class="hd-dot" title="Bot active"></span>',
-    '    <button class="btn btn-ghost" onclick="logout()" style="font-size:10px;padding:5px 10px">Sign out</button>',
-    '  </div>',
-    '</div>',
-    /* Cash Modal */
-    '<div class="modal" id="cm"><div class="modal-box">',
-    '<h3>💵 Confirm Cash Payment</h3>',
-    '<p style="font-size:11px;color:#94a3b8;margin-bottom:6px">Customer: <b id="cm-phone" style="color:#f1f5f9"></b></p>',
-    '<p style="font-size:11px;color:#94a3b8;margin-bottom:14px">Order total: <b id="cm-amt" style="color:#10b981"></b></p>',
-    '<label>Amount received (blank = full total)</label>',
-    '<input id="cm-custom" type="number" step="0.01" placeholder="e.g. 20.00">',
-    '<label>Your PIN</label>',
-    '<input id="cm-pin" type="password" placeholder="Enter your PIN" maxlength="6">',
-    '<div class="err" id="cm-err"></div>',
-    '<div class="modal-row">',
-    '<button style="background:#334155;color:#94a3b8" onclick="closeCash()">Cancel</button>',
-    '<button id="cm-btn" style="background:#10b981;color:#fff" onclick="confirmCash()">Confirm Cash</button>',
-    '</div></div></div>',
-    /* Stats bar */
-    '<div class="stats">',
-    `'<div class="stat"><div class="stat-n" id="sn">—</div><div class="stat-l">Active Jobs</div></div>',`,
-    `'<div class="stat"><div class="stat-n gr" id="sm">—</div><div class="stat-l">MoMo Today</div></div>',`,
-    `'<div class="stat"><div class="stat-n am" id="sc">—</div><div class="stat-l">Cash Today</div></div>',`,
-    '</div>',
-    testMode ? '<div style="background:#f59e0b;color:#000;text-align:center;padding:10px;font-weight:700;font-size:13px">🧪 TEST MODE ON — Bot only responding to owner number. Type: admin test off to disable.</div>' : '',
-    /* Panels */
-    '<div class="panel on" id="b0">',
-    '  <div class="section-hd"><h2>🖨️ Live Job Queue</h2><button class="btn btn-ghost" onclick="lq()" style="font-size:10px">↻ Refresh</button></div>',
-    '  <div class="tbl-wrap"><table><thead><tr><th>#</th><th>Customer</th><th>Status</th><th>Files</th><th>Bill</th><th>Pressing</th><th>Job ID</th><th>Action</th></tr></thead>',
-    '  <tbody id="qb"></tbody></table></div>',
-    '</div>',
-    '<div class="panel" id="b1">',
-    '  <div class="section-hd"><h2>💰 Payments</h2></div>',
-    '  <div class="tbl-wrap"><table><thead><tr><th>Time</th><th>Customer</th><th>Amount</th><th>Type</th><th>Worker</th><th>Job ID</th></tr></thead>',
-    '  <tbody id="pb"></tbody></table></div>',
-    '</div>',
-    '<div class="panel" id="b2">',
-    '  <div class="section-hd"><h2>👷 Workers</h2></div>',
-    '  <div class="w-form">',
-    '    <input id="wi" placeholder="ID e.g. W04"><input id="wn" placeholder="Name"><input id="wp" placeholder="PIN">',
-    '    <button class="btn btn-b" onclick="addW()">+ Add</button>',
-    '  </div>',
-    '  <div class="tbl-wrap"><table><thead><tr><th>ID</th><th>Name</th><th>Added</th><th></th></tr></thead>',
-    '  <tbody id="wb"></tbody></table></div>',
-    '</div>',
-    '<div class="panel" id="b3">',
-    '  <div class="section-hd"><h2>⭐ Customer Ratings</h2></div>',
-    '  <div class="tbl-wrap"><table><thead><tr><th>Time</th><th>Rating</th><th>Job ID</th></tr></thead>',
-    '  <tbody id="rb"></tbody></table></div>',
-    '</div>',
-    '<div class="panel" id="b4">',
-    '  <div class="section-hd"><h2>🔍 Audit Log</h2></div>',
-    '  <div class="tbl-wrap"><table><thead><tr><th>Time</th><th>Action</th><th>Customer</th><th>Detail</th></tr></thead>',
-    '  <tbody id="ab"></tbody></table></div>',
-    '</div>',
-    /* Bottom nav */
-    '<nav class="nav">',
-    '<button class="nav-item on" id="n0" onclick="sw(0)"><span class="nav-icon">🖨️</span>Queue</button>',
-    '<button class="nav-item" id="n1" onclick="sw(1)"><span class="nav-icon">💰</span>Payments</button>',
-    '<button class="nav-item" id="n2" onclick="sw(2)"><span class="nav-icon">👷</span>Workers</button>',
-    '<button class="nav-item" id="n3" onclick="sw(3)"><span class="nav-icon">⭐</span>Ratings</button>',
-    '<button class="nav-item" id="n4" onclick="sw(4)"><span class="nav-icon">🔍</span>Audit</button>',
-    '</nav>',
-    '<script>',
-    'var TK=localStorage.getItem("migo_token");',
-    'if(!TK)window.location="/login";',
-    'var cur=0;',
-    'function sw(i){',
-    '  document.querySelectorAll(".panel").forEach(function(x){x.classList.remove("on");});',
-    '  document.querySelectorAll(".nav-item").forEach(function(x){x.classList.remove("on");});',
-    '  document.getElementById("b"+i).classList.add("on");',
-    '  document.getElementById("n"+i).classList.add("on");',
-    '  cur=i;[lq,lp,lw,lr,la][i]();',
-    '}',
-    'function api(p,m,b){return fetch(p,{method:m||"GET",headers:{"Content-Type":"application/json","X-Dashboard-Token":TK},body:b?JSON.stringify(b):null}).then(function(r){return r.json();});}',
-    'var bs={awaiting_payment:"bg-am",processing:"bg-bl",confirming:"bg-am",ready:"bg-gr",idle:"bg-rd"};',
-    'function lq(){',
-    '  api("/api/stats").then(function(st){',
-    '    if(!st.ok)return;',
-    '    document.getElementById("sn").textContent=st.sessions||0;',
-    '    document.getElementById("sm").textContent="GHS "+st.todayMomo.toFixed(2);',
-    '    document.getElementById("sc").textContent="GHS "+st.todayCash.toFixed(2);',
-    '  });',
-    '  api("/api/sessions").then(function(se){',
-    '    if(!se.ok)return;',
-    '    var r=(se.sessions||[]).map(function(s){',
-    '      var btn="";',
-    '      if(s.state==="processing")btn="<button class=\"btn btn-g\" onclick=\"rd(\'"+s.phone+"\')\">✅ Ready</button>";',
-    '      if(s.state==="awaiting_payment")btn="<button class=\"btn btn-b\" onclick=\"showCash(\'"+s.phone+"\',"+( s.totalBill||0).toFixed(2)+")\">💵 Cash</button>";',
-    '      var qp=s.queuePosition?"#"+s.queuePosition:"&mdash;";',
-    '      return "<tr><td>"+qp+"</td><td>"+(s.customerName||s.phone)+"</td><td><span class=\"badge "+(bs[s.state]||"bl")+"\">"+ s.state+"</span></td><td>"+s.files+"</td><td>"+(s.totalBill?"GHS "+s.totalBill.toFixed(2):"&mdash;")+"</td><td style=\"font-size:10px\">"+(s.pressing||"&mdash;")+"</td><td style=\"font-size:10px\">"+(s.jobId||"&mdash;")+"</td><td>"+btn+"</td></tr>";',
-    '    }).join("");',
-    '    document.getElementById("qb").innerHTML=r||"<tr><td colspan=6 class=\"mt\">No active sessions</td></tr>";',
-    '  });',
-    '}',
-    'function rd(phone){if(!confirm("Mark ready?"))return;api("/api/mark-ready","POST",{phone:phone}).then(lq);}',
-    '/* ── Cash modal ── */',
-    'var cashPhone="",cashAmt=0;',
-    'function showCash(phone,amt){',
-    '  cashPhone=phone;cashAmt=amt;',
-    '  document.getElementById("cm-phone").textContent=phone;',
-    '  document.getElementById("cm-amt").textContent="GHS "+amt.toFixed(2);',
-    '  document.getElementById("cm-custom").value="";',
-    '  document.getElementById("cm-pin").value="";',
-    '  document.getElementById("cm-err").textContent="";',
-    '  document.getElementById("cm").style.display="flex";',
-    '  document.getElementById("cm-pin").focus();',
-    '}',
-    'function closeCash(){document.getElementById("cm").style.display="none";}',
-    'function confirmCash(){',
-    '  var customAmt=document.getElementById("cm-custom").value.trim();',
-    '  var amount=customAmt?parseFloat(customAmt):cashAmt;',
-    '  var pin=document.getElementById("cm-pin").value.trim();',
-    '  if(!pin){document.getElementById("cm-err").textContent="Enter your PIN";return;}',
-    '  if(isNaN(amount)||amount<=0){document.getElementById("cm-err").textContent="Invalid amount";return;}',
-    '  document.getElementById("cm-btn").disabled=true;',
-    '  document.getElementById("cm-btn").textContent="Processing...";',
-    '  api("/api/cash-payment","POST",{phone:cashPhone,amount:amount,pin:pin}).then(function(r){',
-    '    if(r.ok){closeCash();lq();alert("✅ Cash payment confirmed!");}',
-    '    else{document.getElementById("cm-err").textContent=r.error||"Failed";document.getElementById("cm-btn").disabled=false;document.getElementById("cm-btn").textContent="Confirm Cash";}',
-    '  }).catch(function(){document.getElementById("cm-err").textContent="Network error";document.getElementById("cm-btn").disabled=false;document.getElementById("cm-btn").textContent="Confirm Cash";});',
-    '}',
-    'function lp(){',
-    '  api("/api/payments").then(function(d){',
-    '    if(!d.ok)return;',
-    '    var r=(d.payments||[]).slice().reverse().map(function(p){',
-    '      return "<tr><td>"+(p.ts||p.date||"")+"</td><td>"+(p.phone||"")+"</td><td>GHS "+parseFloat(p.amount||0).toFixed(2)+"</td><td>"+(p.type||"")+"</td><td>"+(p.workerName||"auto")+"</td><td style=\"font-size:10px\">"+( p.jobId||"")+"</td></tr>";',
-    '    }).join("");',
-    '    document.getElementById("pb").innerHTML=r||"<tr><td colspan=6 class=\"mt\">No payments</td></tr>";',
-    '  });',
-    '}',
-    'function lw(){',
-    '  api("/api/workers").then(function(d){',
-    '    if(!d.ok)return;',
-    '    var r=(d.workers||[]).map(function(w){',
-    '      return "<tr><td><b>"+w.id+"</b></td><td>"+w.name+"</td><td>"+(w.addedAt||"")+"</td><td><button class=\"btn btn-r\" onclick=\"rmW(\'"+w.id+"\')\">Remove</button></td></tr>";',
-    '    }).join("");',
-    '    document.getElementById("wb").innerHTML=r||"<tr><td colspan=4 class=\"mt\">No workers</td></tr>";',
-    '  });',
-    '}',
-    'function addW(){',
-    '  var id=document.getElementById("wi").value.toUpperCase().trim();',
-    '  var name=document.getElementById("wn").value.trim();',
-    '  var pin=document.getElementById("wp").value.trim();',
-    '  if(!id||!name||!pin){alert("Fill all fields");return;}',
-    '  api("/api/workers/add","POST",{id:id,name:name,pin:pin}).then(function(r){if(r.ok)lw();else alert(r.error||"Failed");});',
-    '}',
-    'function rmW(id){if(!confirm("Remove "+id+"?"))return;api("/api/workers/remove","POST",{id:id}).then(lw);}',
-    'function lr(){',
-    '  api("/api/ratings").then(function(d){',
-    '    if(!d.ok)return;',
-    '    var r=(d.ratings||[]).slice().reverse().map(function(rt){',
-    '      var stars="";for(var i=0;i<rt.score;i++)stars+="★";',
-    '      var col=rt.score<=2?"#ef4444":rt.score>=5?"#10b981":"#f59e0b";',
-    '      return "<tr><td>"+(rt.ts||"")+"</td><td style=\"color:"+col+"\">"+stars+"</td><td style=\"font-size:10px\">"+(rt.jobId||"")+"</td></tr>";',
-    '    }).join("");',
-    '    document.getElementById("rb").innerHTML=r||"<tr><td colspan=3 class=\"mt\">No ratings</td></tr>";',
-    '  });',
-    '}',
-    'function la(){',
-    '  api("/api/audit").then(function(d){',
-    '    if(!d.ok)return;',
-    '    var r=(d.audit||[]).map(function(a){',
-    '      return "<tr class=\""+(a.flag?"fl":"")+"\"><td>"+a.ts+"</td><td>"+(a.flag?"🚩 ":"")+a.action+"</td><td>"+(a.phone||"&mdash;")+"</td><td style=\"font-size:10px\">"+(a.detail||"")+"</td></tr>";',
-    '    }).join("");',
-    '    document.getElementById("ab").innerHTML=r||"<tr><td colspan=4 class=\"mt\">No entries</td></tr>";',
-    '  });',
-    '}',
-    'function logout(){localStorage.removeItem("migo_token");window.location="/login";}',
-    'lq();setInterval(lq,15000);',
-    '<\/script></body></html>'
-  ].join("");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Migo Print Shop — Admin</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0a0a0f;
+  --surface:#111118;
+  --card:#18181f;
+  --border:#2a2a35;
+  --text:#f0f0f5;
+  --muted:#6b6b80;
+  --green:#00d68f;
+  --amber:#ffb020;
+  --blue:#4d9fff;
+  --red:#ff4d6a;
+  --nav-h:64px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif;min-height:100vh;padding-bottom:calc(var(--nav-h) + 12px)}
+
+/* ── HEADER ── */
+.hd{background:var(--surface);border-bottom:2px solid var(--border);padding:0 16px;height:56px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:100}
+.hd-brand{display:flex;align-items:center;gap:12px}
+.hd-logo{width:36px;height:36px;background:var(--amber);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px}
+.hd-name{font-size:16px;font-weight:800;color:var(--text);letter-spacing:-.3px}
+.hd-role{font-size:10px;font-weight:700;color:var(--amber);text-transform:uppercase;letter-spacing:1px}
+.live-dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.6;transform:scale(.85)}}
+.btn-sm{padding:6px 14px;border:1.5px solid var(--border);border-radius:8px;background:transparent;color:var(--muted);font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;transition:all .15s}
+.btn-sm:hover{border-color:var(--red);color:var(--red)}
+
+/* ── STATS BAR ── */
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;padding:14px 14px 0}
+.stat{background:var(--card);border:1.5px solid var(--border);border-radius:12px;padding:14px 12px;text-align:center;cursor:default}
+.stat-val{font-size:22px;font-weight:800;font-family:'JetBrains Mono',monospace;line-height:1}
+.stat-lbl{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-top:5px}
+.c-green{color:var(--green)}.c-amber{color:var(--amber)}.c-blue{color:var(--blue)}.c-red{color:var(--red)}
+
+/* ── TEST MODE BANNER ── */
+.test-banner{margin:12px 14px 0;background:#1a1500;border:2px solid var(--amber);border-radius:10px;padding:10px 14px;font-size:13px;font-weight:700;color:var(--amber);display:flex;align-items:center;gap:8px}
+
+/* ── PANEL ── */
+.panel{padding:14px;display:none}.panel.on{display:block}
+.ph{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.ph h2{font-size:13px;font-weight:800;text-transform:uppercase;letter-spacing:.8px;color:var(--text)}
+.refresh-btn{padding:6px 12px;background:var(--card);border:1.5px solid var(--border);border-radius:8px;color:var(--muted);font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;transition:all .15s}
+.refresh-btn:hover{border-color:var(--blue);color:var(--blue)}
+
+/* ── TABLE ── */
+.tbl-wrap{background:var(--card);border:1.5px solid var(--border);border-radius:12px;overflow:hidden}
+table{width:100%;border-collapse:collapse}
+th{background:var(--surface);padding:10px 12px;text-align:left;color:var(--muted);font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:.8px;border-bottom:1.5px solid var(--border)}
+td{padding:12px 12px;border-bottom:1px solid var(--border);vertical-align:middle;font-size:13px;font-weight:600}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#ffffff04}
+
+/* ── BADGES ── */
+.badge{padding:4px 10px;border-radius:20px;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;white-space:nowrap}
+.b-green{background:#00d68f18;color:var(--green);border:1px solid #00d68f30}
+.b-amber{background:#ffb02018;color:var(--amber);border:1px solid #ffb02030}
+.b-blue{background:#4d9fff18;color:var(--blue);border:1px solid #4d9fff30}
+.b-red{background:#ff4d6a18;color:var(--red);border:1px solid #ff4d6a30}
+
+/* ── ACTION BUTTONS ── */
+.btn-action{padding:7px 14px;border:none;border-radius:8px;cursor:pointer;font-size:12px;font-weight:800;font-family:inherit;transition:all .15s;white-space:nowrap;text-transform:uppercase;letter-spacing:.3px}
+.btn-green{background:var(--green);color:#000}.btn-green:hover{background:#00f0a0}
+.btn-blue{background:var(--blue);color:#fff}.btn-blue:hover{background:#6aafff}
+.btn-red{background:var(--red);color:#fff}.btn-red:hover{background:#ff6680}
+.btn-muted{background:var(--border);color:var(--muted)}.btn-muted:hover{background:#333340}
+
+/* ── WORKER FORM ── */
+.w-form{background:var(--card);border:1.5px solid var(--border);border-radius:12px;padding:14px;margin-bottom:12px;display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end}
+.w-form input{background:var(--bg);border:1.5px solid var(--border);color:var(--text);padding:9px 12px;border-radius:8px;font-size:13px;font-family:inherit;font-weight:600;flex:1;min-width:80px;transition:border-color .15s}
+.w-form input:focus{outline:none;border-color:var(--blue)}
+.w-form input::placeholder{color:var(--muted)}
+
+/* ── MODAL ── */
+.modal{display:none;position:fixed;inset:0;background:#00000099;z-index:999;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+.modal.open{display:flex}
+.modal-box{background:var(--card);border:1.5px solid var(--border);border-radius:16px;padding:24px;width:92%;max-width:340px;box-shadow:0 24px 64px #00000080}
+.modal-box h3{font-size:16px;font-weight:800;margin-bottom:6px;color:var(--text)}
+.modal-box p{font-size:12px;color:var(--muted);margin-bottom:16px;font-weight:600}
+.modal-lbl{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;display:block;margin-bottom:5px}
+.modal-input{width:100%;margin-bottom:14px;padding:11px 13px;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:10px;font-size:14px;font-family:inherit;font-weight:600;transition:border-color .15s}
+.modal-input:focus{outline:none;border-color:var(--blue)}
+.modal-err{color:var(--red);font-size:12px;font-weight:700;min-height:18px;margin-bottom:8px}
+.modal-btns{display:flex;gap:10px}
+.modal-btns button{flex:1;padding:12px;border:none;border-radius:10px;font-size:13px;font-weight:800;cursor:pointer;font-family:inherit;transition:all .15s}
+
+/* ── EMPTY STATE ── */
+.empty{text-align:center;padding:40px 20px;color:var(--muted)}
+.empty-icon{font-size:40px;margin-bottom:10px;opacity:.5}
+.empty-txt{font-size:13px;font-weight:600}
+
+/* ── NAV ── */
+nav{position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:2px solid var(--border);display:grid;grid-template-columns:repeat(5,1fr);height:var(--nav-h);z-index:100}
+.nav-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;cursor:pointer;color:var(--muted);font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;border:none;background:none;font-family:inherit;transition:color .15s;padding:0;border-top:3px solid transparent;transition:all .15s}
+.nav-btn:hover{color:var(--text)}
+.nav-btn.on{color:var(--amber);border-top-color:var(--amber)}
+.nav-icon{font-size:20px;line-height:1}
+
+/* ── MONO ── */
+.mono{font-family:'JetBrains Mono',monospace;font-size:12px}
+.flag-row td{background:#ff4d6a08!important}
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="hd">
+  <div class="hd-brand">
+    <div class="hd-logo">🖨️</div>
+    <div>
+      <div class="hd-name">Migo Print Shop</div>
+      <div class="hd-role">Admin Dashboard</div>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px">
+    <div class="live-dot" title="Bot live"></div>
+    <button class="btn-sm" onclick="logout()">Sign Out</button>
+  </div>
+</div>
+
+${`<!-- TEST BANNER -->`}
+<div id="testBanner" style="display:none" class="test-banner">🧪 TEST MODE ON — Bot only responding to owner number</div>
+
+<!-- STATS -->
+<div class="stats">
+  <div class="stat"><div class="stat-val c-blue" id="sn">—</div><div class="stat-lbl">Active Jobs</div></div>
+  <div class="stat"><div class="stat-val c-green" id="sm">—</div><div class="stat-lbl">MoMo Today</div></div>
+  <div class="stat"><div class="stat-val c-amber" id="sc">—</div><div class="stat-lbl">Cash Today</div></div>
+</div>
+
+<!-- PANELS -->
+<div class="panel on" id="b0">
+  <div class="ph"><h2>🖨️ Live Queue</h2><button class="refresh-btn" onclick="lq()">↻ Refresh</button></div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Customer</th><th>Status</th><th>Files</th><th>Bill</th><th>Job ID</th><th>Action</th></tr></thead>
+      <tbody id="qb"><tr><td colspan="7" style="text-align:center;padding:24px;color:var(--muted);font-weight:700">Loading...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="panel" id="b1">
+  <div class="ph"><h2>💰 Payments</h2><button class="refresh-btn" onclick="lp()">↻ Refresh</button></div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Time</th><th>Customer</th><th>Amount</th><th>Type</th><th>Worker</th><th>Job ID</th></tr></thead>
+      <tbody id="pb"><tr><td colspan="6" style="text-align:center;padding:24px;color:var(--muted);font-weight:700">Loading...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="panel" id="b2">
+  <div class="ph"><h2>👷 Workers</h2></div>
+  <div class="w-form">
+    <input id="wi" placeholder="ID e.g. W04">
+    <input id="wn" placeholder="Name">
+    <input id="wp" placeholder="PIN" type="password">
+    <button class="btn-action btn-blue" onclick="addW()">+ Add</button>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>Name</th><th>Added</th><th>Action</th></tr></thead>
+      <tbody id="wb"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="panel" id="b3">
+  <div class="ph"><h2>⭐ Ratings</h2><button class="refresh-btn" onclick="lr()">↻ Refresh</button></div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Time</th><th>Score</th><th>Customer</th><th>Comment</th><th>Job ID</th></tr></thead>
+      <tbody id="rb"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="panel" id="b4">
+  <div class="ph"><h2>🔍 Audit Log</h2><button class="refresh-btn" onclick="la()">↻ Refresh</button></div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Time</th><th>Action</th><th>Customer</th><th>Detail</th></tr></thead>
+      <tbody id="ab"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- CASH MODAL -->
+<div class="modal" id="cm">
+  <div class="modal-box">
+    <h3>💵 Confirm Cash Payment</h3>
+    <p>Customer: <b id="cm-phone" style="color:var(--text)"></b> &nbsp;·&nbsp; Total: <b id="cm-amt" style="color:var(--green)"></b></p>
+    <label class="modal-lbl">Amount received (blank = full total)</label>
+    <input class="modal-input" id="cm-custom" type="number" step="0.01" placeholder="Leave blank for full amount">
+    <label class="modal-lbl">Your PIN</label>
+    <input class="modal-input" id="cm-pin" type="password" placeholder="Enter PIN" maxlength="6">
+    <div class="modal-err" id="cm-err"></div>
+    <div class="modal-btns">
+      <button style="background:var(--border);color:var(--muted)" onclick="closeCash()">Cancel</button>
+      <button id="cm-btn" style="background:var(--green);color:#000" onclick="confirmCash()">Confirm Cash</button>
+    </div>
+  </div>
+</div>
+
+<!-- NAV -->
+<nav>
+  <button class="nav-btn on" id="n0" onclick="sw(0)"><span class="nav-icon">🖨️</span>Queue</button>
+  <button class="nav-btn" id="n1" onclick="sw(1)"><span class="nav-icon">💰</span>Payments</button>
+  <button class="nav-btn" id="n2" onclick="sw(2)"><span class="nav-icon">👷</span>Workers</button>
+  <button class="nav-btn" id="n3" onclick="sw(3)"><span class="nav-icon">⭐</span>Ratings</button>
+  <button class="nav-btn" id="n4" onclick="sw(4)"><span class="nav-icon">🔍</span>Audit</button>
+</nav>
+
+<script>
+var TK=localStorage.getItem('migo_token');
+if(!TK)window.location='/login';
+
+function api(p,m,b){return fetch(p,{method:m||'GET',headers:{'Content-Type':'application/json','X-Dashboard-Token':TK},body:b?JSON.stringify(b):null}).then(function(r){return r.json();});}
+
+function sw(i){
+  document.querySelectorAll('.panel').forEach(function(x){x.classList.remove('on');});
+  document.querySelectorAll('.nav-btn').forEach(function(x){x.classList.remove('on');});
+  document.getElementById('b'+i).classList.add('on');
+  document.getElementById('n'+i).classList.add('on');
+  [lq,lp,lw,lr,la][i]();
+}
+
+var stateBadge={awaiting_payment:'b-amber',processing:'b-blue',confirming:'b-amber',ready:'b-green',idle:'b-red',receiving:'b-blue'};
+var stateLabel={awaiting_payment:'Awaiting Payment',processing:'Printing',confirming:'Confirming',ready:'Ready',idle:'Idle',receiving:'Receiving'};
+
+function lq(){
+  api('/api/stats').then(function(st){
+    if(!st.ok)return;
+    document.getElementById('sn').textContent=st.sessions||0;
+    document.getElementById('sm').textContent='GHS '+(st.todayMomo||0).toFixed(2);
+    document.getElementById('sc').textContent='GHS '+(st.todayCash||0).toFixed(2);
+  });
+  api('/api/sessions').then(function(se){
+    if(!se.ok)return;
+    var rows=(se.sessions||[]).map(function(s,i){
+      var btn='';
+      if(s.state==='processing') btn='<button class="btn-action btn-green" onclick="rd(\''+s.phone+'\')">✅ Ready</button>';
+      if(s.state==='awaiting_payment') btn='<button class="btn-action btn-blue" onclick="showCash(\''+s.phone+'\','+(s.totalBill||0).toFixed(2)+')">💵 Cash</button>';
+      var qp=s.queuePosition?'#'+s.queuePosition:'—';
+      var bill=s.totalBill?'<span style="color:var(--green);font-weight:800">GHS '+s.totalBill.toFixed(2)+'</span>':'—';
+      var jid=s.jobId?'<span class="mono" style="color:var(--muted)">'+s.jobId+'</span>':'—';
+      var badge='<span class="badge '+(stateBadge[s.state]||'b-blue')+'">'+(stateLabel[s.state]||s.state)+'</span>';
+      return '<tr><td style="font-weight:800;color:var(--muted)">'+qp+'</td><td style="font-weight:700">'+(s.customerName||s.phone)+'</td><td>'+badge+'</td><td style="font-weight:700">'+s.files+'</td><td>'+bill+'</td><td>'+jid+'</td><td>'+btn+'</td></tr>';
+    }).join('');
+    document.getElementById('qb').innerHTML=rows||'<tr><td colspan="7"><div class="empty"><div class="empty-icon">🖨️</div><div class="empty-txt">No active jobs</div></div></td></tr>';
+  });
+}
+
+function rd(phone){
+  if(!confirm('Mark job as ready and send pickup code?'))return;
+  api('/api/mark-ready','POST',{phone:phone}).then(function(r){
+    if(r.ok)lq(); else alert(r.error||'Failed');
+  });
+}
+
+var cashPhone='',cashAmt=0;
+function showCash(phone,amt){
+  cashPhone=phone;cashAmt=amt;
+  document.getElementById('cm-phone').textContent=phone.replace('@s.whatsapp.net','');
+  document.getElementById('cm-amt').textContent='GHS '+amt.toFixed(2);
+  document.getElementById('cm-custom').value='';
+  document.getElementById('cm-pin').value='';
+  document.getElementById('cm-err').textContent='';
+  document.getElementById('cm-btn').disabled=false;
+  document.getElementById('cm-btn').textContent='Confirm Cash';
+  document.getElementById('cm').classList.add('open');
+  setTimeout(function(){document.getElementById('cm-pin').focus();},100);
+}
+function closeCash(){document.getElementById('cm').classList.remove('open');}
+function confirmCash(){
+  var customAmt=document.getElementById('cm-custom').value.trim();
+  var amount=customAmt?parseFloat(customAmt):cashAmt;
+  var pin=document.getElementById('cm-pin').value.trim();
+  if(!pin){document.getElementById('cm-err').textContent='Enter your PIN';return;}
+  if(isNaN(amount)||amount<=0){document.getElementById('cm-err').textContent='Invalid amount';return;}
+  document.getElementById('cm-btn').disabled=true;
+  document.getElementById('cm-btn').textContent='Processing...';
+  api('/api/cash-payment','POST',{phone:cashPhone,amount:amount,pin:pin}).then(function(r){
+    if(r.ok){closeCash();lq();alert('✅ Cash confirmed!');}
+    else{document.getElementById('cm-err').textContent=r.error||'Failed';document.getElementById('cm-btn').disabled=false;document.getElementById('cm-btn').textContent='Confirm Cash';}
+  }).catch(function(){document.getElementById('cm-err').textContent='Network error';document.getElementById('cm-btn').disabled=false;document.getElementById('cm-btn').textContent='Confirm Cash';});
+}
+
+function lp(){
+  api('/api/payments').then(function(d){
+    if(!d.ok)return;
+    var rows=(d.payments||[]).slice().reverse().map(function(p){
+      var typeColor=p.type==='momo'?'var(--green)':'var(--amber)';
+      return '<tr><td class="mono" style="color:var(--muted)">'+(p.ts||'')+'</td><td style="font-weight:700">'+(p.phone||'')+'</td><td style="font-weight:800;color:'+typeColor+'">GHS '+parseFloat(p.amount||0).toFixed(2)+'</td><td><span class="badge '+(p.type==='momo'?'b-green':'b-amber')+'">'+(p.type||'').toUpperCase()+'</span></td><td style="font-weight:700">'+(p.workerName||'Auto')+'</td><td class="mono" style="font-size:11px;color:var(--muted)">'+(p.jobId||'')+'</td></tr>';
+    }).join('');
+    document.getElementById('pb').innerHTML=rows||'<tr><td colspan="6"><div class="empty"><div class="empty-icon">💰</div><div class="empty-txt">No payments today</div></div></td></tr>';
+  });
+}
+
+function lw(){
+  api('/api/workers').then(function(d){
+    if(!d.ok)return;
+    var rows=(d.workers||[]).map(function(w){
+      return '<tr><td><span class="badge b-blue">'+w.id+'</span></td><td style="font-weight:700">'+w.name+'</td><td class="mono" style="color:var(--muted)">'+(w.addedAt||'')+'</td><td><button class="btn-action btn-red" onclick="rmW(\''+w.id+'\')">Remove</button></td></tr>';
+    }).join('');
+    document.getElementById('wb').innerHTML=rows||'<tr><td colspan="4"><div class="empty"><div class="empty-icon">👷</div><div class="empty-txt">No workers added</div></div></td></tr>';
+  });
+}
+function addW(){
+  var id=document.getElementById('wi').value.toUpperCase().trim();
+  var name=document.getElementById('wn').value.trim();
+  var pin=document.getElementById('wp').value.trim();
+  if(!id||!name||!pin){alert('Fill all fields');return;}
+  api('/api/workers/add','POST',{id:id,name:name,pin:pin}).then(function(r){
+    if(r.ok){document.getElementById('wi').value='';document.getElementById('wn').value='';document.getElementById('wp').value='';lw();}
+    else alert(r.error||'Failed');
+  });
+}
+function rmW(id){if(!confirm('Remove worker '+id+'?'))return;api('/api/workers/remove','POST',{id:id}).then(lw);}
+
+function lr(){
+  api('/api/ratings').then(function(d){
+    if(!d.ok)return;
+    var rows=(d.ratings||[]).slice().reverse().map(function(rt){
+      var stars='';for(var i=0;i<5;i++)stars+='<span style="color:'+(i<rt.score?'var(--amber)':'var(--border)')+'">★</span>';
+      var scoreColor=rt.score<=2?'var(--red)':rt.score>=5?'var(--green)':'var(--amber)';
+      return '<tr><td class="mono" style="color:var(--muted)">'+(rt.ts||rt.date||'')+'</td><td style="font-size:16px">'+stars+'</td><td style="font-weight:700">'+(rt.phone||'')+'</td><td style="color:var(--muted)">'+(rt.comment||'—')+'</td><td class="mono" style="font-size:11px;color:var(--muted)">'+(rt.jobId||'')+'</td></tr>';
+    }).join('');
+    document.getElementById('rb').innerHTML=rows||'<tr><td colspan="5"><div class="empty"><div class="empty-icon">⭐</div><div class="empty-txt">No ratings yet</div></div></td></tr>';
+  });
+}
+
+function la(){
+  api('/api/audit').then(function(d){
+    if(!d.ok)return;
+    var rows=(d.audit||[]).map(function(a){
+      return '<tr class="'+(a.flag?'flag-row':'')+'"><td class="mono" style="color:var(--muted)">'+a.ts+'</td><td style="font-weight:700">'+(a.flag?'🚩 ':'')+a.action+'</td><td style="font-weight:600">'+(a.phone||'—')+'</td><td style="color:var(--muted);font-size:12px">'+(a.detail||'')+'</td></tr>';
+    }).join('');
+    document.getElementById('ab').innerHTML=rows||'<tr><td colspan="4"><div class="empty"><div class="empty-icon">🔍</div><div class="empty-txt">No audit entries</div></div></td></tr>';
+  });
+}
+
+function logout(){localStorage.removeItem('migo_token');localStorage.removeItem('migo_role');window.location='/login';}
+
+// Close modal on backdrop click
+document.getElementById('cm').addEventListener('click',function(e){if(e.target===this)closeCash();});
+
+// Initial load
+lq();
+setInterval(lq,15000);
+</script>
+</body></html>`;
 }
 
 function workerHTML() {
-  return [
-    '<!DOCTYPE html><html><head><meta charset="UTF-8">',
-    '<meta name="viewport" content="width=device-width,initial-scale=1">',
-    '<title>Migo Worker</title>',
-    '<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0f172a;color:#f1f5f9;font-family:Arial,sans-serif}',
-    '.hd{background:#1e293b;border-bottom:2px solid #10b981;padding:12px 20px;display:flex;justify-content:space-between;align-items:center}',
-    '.hd h1{font-size:15px;font-weight:700}.content{padding:14px}',
-    'table{width:100%;border-collapse:collapse;font-size:11px}',
-    'th{background:#1e293b;padding:7px;text-align:left;color:#64748b;font-weight:600}',
-    'td{padding:9px 7px;border-bottom:1px solid #1e293b}',
-    '.badge{padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700}',
-    '.gr{background:#10b98120;color:#10b981}.bl{background:#3b82f620;color:#3b82f6}.am{background:#f59e0b20;color:#f59e0b}',
-    '.btn{padding:7px 12px;border:none;border-radius:5px;cursor:pointer;font-size:11px;font-weight:700}',
-    '.btn-g{background:#10b981;color:#fff}.btn-r{background:#ef4444;color:#fff}.btn-b{background:#3b82f6;color:#fff}',
-    '.mt{text-align:center;padding:30px;color:#334155}',
-    '.modal{display:none;position:fixed;inset:0;background:#0009;z-index:999;align-items:center;justify-content:center}',
-    '.modal-box{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:20px;width:90%;max-width:320px}',
-    '.modal-box h3{font-size:14px;margin-bottom:12px}.modal-box label{font-size:11px;color:#94a3b8;display:block;margin-bottom:3px}',
-    '.modal-box input{width:100%;margin:0 0 10px 0;padding:8px 10px;background:#0f172a;border:1px solid #334155;color:#f1f5f9;border-radius:7px;font-size:13px}',
-    '.row{display:flex;gap:8px;margin-top:4px}.row button{flex:1;padding:9px;border:none;border-radius:7px;font-size:12px;font-weight:700;cursor:pointer}',
-    '.err{color:#ef4444;font-size:11px;margin-top:4px;min-height:16px}</style>',
-    '</head><body>',
-    '<div class="hd"><h1>Migo Print Shop &mdash; Worker View</h1>',
-    '<button class="btn btn-r" onclick="logout()">Logout</button></div>',
-    '<!-- Cash Modal -->',
-    '<div class="modal" id="cm"><div class="modal-box">',
-    '<h3>💵 Confirm Cash Payment</h3>',
-    '<p style="font-size:11px;color:#94a3b8;margin-bottom:10px">Customer: <b id="cm-phone"></b></p>',
-    '<p style="font-size:11px;color:#94a3b8;margin-bottom:12px">Total: <b id="cm-amt" style="color:#f1f5f9"></b></p>',
-    '<label>Amount received (blank = full total)</label>',
-    '<input id="cm-custom" type="number" step="0.01" placeholder="e.g. 20.00">',
-    '<label>Your PIN</label>',
-    '<input id="cm-pin" type="password" placeholder="4-digit PIN" maxlength="6">',
-    '<div class="err" id="cm-err"></div>',
-    '<div class="row"><button style="background:#334155;color:#f1f5f9" onclick="closeCash()">Cancel</button>',
-    '<button id="cm-btn" style="background:#10b981;color:#fff" onclick="confirmCash()">Confirm Cash</button>',
-    '</div></div></div>',
-    '<div class="content"><table><thead><tr><th>Customer</th><th>State</th><th>Files</th><th>Bill</th><th>Job ID</th><th>Action</th></tr></thead>',
-    '<tbody id="body"></tbody></table></div>',
-    '<script>',
-    'var TK=localStorage.getItem("migo_token");if(!TK)window.location="/login";',
-    'var bs={awaiting_payment:"am",processing:"bl",confirming:"am",ready:"gr"};',
-    'var cashPhone="",cashAmt=0;',
-    'function load(){',
-    '  fetch("/api/sessions",{headers:{"X-Dashboard-Token":TK}}).then(function(r){return r.json();}).then(function(d){',
-    '    if(!d.ok){window.location="/login";return;}',
-    '    var r=(d.sessions||[]).map(function(s){',
-    '      var btn="";',
-    '      if(s.state==="processing")btn="<button class=\"btn btn-g\" onclick=\"rdy(\'"+s.phone+"\')\">✅ Ready</button>";',
-    '      if(s.state==="awaiting_payment")btn="<button class=\"btn btn-b\" onclick=\"showCash(\'"+s.phone+"\',"+( s.totalBill||0).toFixed(2)+")\">💵 Cash</button>";',
-    '      return "<tr><td>"+(s.customerName||s.phone)+"</td><td><span class=\"badge "+(bs[s.state]||"bl")+"\">"+s.state+"</span></td><td>"+s.files+"</td><td>"+(s.totalBill?"GHS "+s.totalBill.toFixed(2):"&mdash;")+"</td><td style=\"font-size:10px\">"+(s.jobId||"&mdash;")+"</td><td>"+btn+"</td></tr>";',
-    '    }).join("");',
-    '    document.getElementById("body").innerHTML=r||"<tr><td colspan=6 class=\"mt\">No active orders</td></tr>";',
-    '  });',
-    '}',
-    'function rdy(phone){',
-    '  if(!confirm("Mark ready?"))return;',
-    '  fetch("/api/mark-ready",{method:"POST",headers:{"Content-Type":"application/json","X-Dashboard-Token":TK},body:JSON.stringify({phone:phone})}).then(load);',
-    '}',
-    'function showCash(phone,amt){',
-    '  cashPhone=phone;cashAmt=amt;',
-    '  document.getElementById("cm-phone").textContent=phone;',
-    '  document.getElementById("cm-amt").textContent="GHS "+amt.toFixed(2);',
-    '  document.getElementById("cm-custom").value="";',
-    '  document.getElementById("cm-pin").value="";',
-    '  document.getElementById("cm-err").textContent="";',
-    '  document.getElementById("cm").style.display="flex";',
-    '  document.getElementById("cm-pin").focus();',
-    '}',
-    'function closeCash(){document.getElementById("cm").style.display="none";}',
-    'function confirmCash(){',
-    '  var customAmt=document.getElementById("cm-custom").value.trim();',
-    '  var amount=customAmt?parseFloat(customAmt):cashAmt;',
-    '  var pin=document.getElementById("cm-pin").value.trim();',
-    '  if(!pin){document.getElementById("cm-err").textContent="Enter your PIN";return;}',
-    '  if(isNaN(amount)||amount<=0){document.getElementById("cm-err").textContent="Invalid amount";return;}',
-    '  document.getElementById("cm-btn").disabled=true;',
-    '  document.getElementById("cm-btn").textContent="Processing...";',
-    '  fetch("/api/cash-payment",{method:"POST",headers:{"Content-Type":"application/json","X-Dashboard-Token":TK},body:JSON.stringify({phone:cashPhone,amount:amount,pin:pin})})',
-    '  .then(function(r){return r.json();}).then(function(r){',
-    '    if(r.ok){closeCash();load();alert("✅ Cash confirmed!");}',
-    '    else{document.getElementById("cm-err").textContent=r.error||"Failed";document.getElementById("cm-btn").disabled=false;document.getElementById("cm-btn").textContent="Confirm Cash";}',
-    '  }).catch(function(){document.getElementById("cm-err").textContent="Network error";document.getElementById("cm-btn").disabled=false;document.getElementById("cm-btn").textContent="Confirm Cash";});',
-    '}',
-    'function logout(){localStorage.removeItem("migo_token");window.location="/login";}',
-    'load();setInterval(load,15000);',
-    '<\/script></body></html>'
-  ].join("");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Migo — Worker View</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a0a0f;--surface:#111118;--card:#18181f;--border:#2a2a35;--text:#f0f0f5;--muted:#6b6b80;--green:#00d68f;--amber:#ffb020;--blue:#4d9fff;--red:#ff4d6a;--nav-h:64px;}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif;min-height:100vh;padding-bottom:calc(var(--nav-h)+12px)}
+.hd{background:var(--surface);border-bottom:2px solid var(--border);padding:0 16px;height:56px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:100}
+.hd-brand{display:flex;align-items:center;gap:12px}
+.hd-logo{width:36px;height:36px;background:var(--blue);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px}
+.hd-name{font-size:16px;font-weight:800}
+.hd-role{font-size:10px;font-weight:700;color:var(--blue);text-transform:uppercase;letter-spacing:1px}
+.live-dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.6;transform:scale(.85)}}
+.btn-sm{padding:6px 14px;border:1.5px solid var(--border);border-radius:8px;background:transparent;color:var(--muted);font-size:12px;font-weight:700;cursor:pointer;font-family:inherit}
+.btn-sm:hover{border-color:var(--red);color:var(--red)}
+.panel{padding:14px;display:none}.panel.on{display:block}
+.ph{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.ph h2{font-size:13px;font-weight:800;text-transform:uppercase;letter-spacing:.8px}
+.refresh-btn{padding:6px 12px;background:var(--card);border:1.5px solid var(--border);border-radius:8px;color:var(--muted);font-size:12px;font-weight:700;cursor:pointer;font-family:inherit}
+.refresh-btn:hover{border-color:var(--blue);color:var(--blue)}
+.tbl-wrap{background:var(--card);border:1.5px solid var(--border);border-radius:12px;overflow:hidden}
+table{width:100%;border-collapse:collapse}
+th{background:var(--surface);padding:10px 12px;text-align:left;color:var(--muted);font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:.8px;border-bottom:1.5px solid var(--border)}
+td{padding:12px 12px;border-bottom:1px solid var(--border);vertical-align:middle;font-size:13px;font-weight:600}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#ffffff04}
+.badge{padding:4px 10px;border-radius:20px;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.5px}
+.b-green{background:#00d68f18;color:var(--green);border:1px solid #00d68f30}
+.b-amber{background:#ffb02018;color:var(--amber);border:1px solid #ffb02030}
+.b-blue{background:#4d9fff18;color:var(--blue);border:1px solid #4d9fff30}
+.btn-action{padding:8px 16px;border:none;border-radius:8px;cursor:pointer;font-size:12px;font-weight:800;font-family:inherit;transition:all .15s;white-space:nowrap;text-transform:uppercase;letter-spacing:.3px}
+.btn-green{background:var(--green);color:#000}.btn-green:hover{background:#00f0a0}
+.btn-blue{background:var(--blue);color:#fff}.btn-blue:hover{background:#6aafff}
+.modal{display:none;position:fixed;inset:0;background:#00000099;z-index:999;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+.modal.open{display:flex}
+.modal-box{background:var(--card);border:1.5px solid var(--border);border-radius:16px;padding:24px;width:92%;max-width:340px;box-shadow:0 24px 64px #00000080}
+.modal-box h3{font-size:16px;font-weight:800;margin-bottom:6px}
+.modal-box p{font-size:12px;color:var(--muted);margin-bottom:16px;font-weight:600}
+.modal-lbl{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;display:block;margin-bottom:5px}
+.modal-input{width:100%;margin-bottom:14px;padding:11px 13px;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:10px;font-size:14px;font-family:inherit;font-weight:600}
+.modal-input:focus{outline:none;border-color:var(--blue)}
+.modal-err{color:var(--red);font-size:12px;font-weight:700;min-height:18px;margin-bottom:8px}
+.modal-btns{display:flex;gap:10px}
+.modal-btns button{flex:1;padding:12px;border:none;border-radius:10px;font-size:13px;font-weight:800;cursor:pointer;font-family:inherit}
+.empty{text-align:center;padding:40px 20px;color:var(--muted)}
+.empty-icon{font-size:40px;margin-bottom:10px;opacity:.5}
+.empty-txt{font-size:13px;font-weight:600}
+nav{position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:2px solid var(--border);display:grid;grid-template-columns:repeat(2,1fr);height:var(--nav-h);z-index:100}
+.nav-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;cursor:pointer;color:var(--muted);font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;border:none;background:none;font-family:inherit;transition:all .15s;border-top:3px solid transparent}
+.nav-btn:hover{color:var(--text)}
+.nav-btn.on{color:var(--blue);border-top-color:var(--blue)}
+.nav-icon{font-size:22px;line-height:1}
+.mono{font-family:'JetBrains Mono',monospace;font-size:12px}
+</style>
+</head>
+<body>
+
+<div class="hd">
+  <div class="hd-brand">
+    <div class="hd-logo">👷</div>
+    <div>
+      <div class="hd-name" id="workerName">Worker</div>
+      <div class="hd-role">Worker Dashboard</div>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px">
+    <div class="live-dot"></div>
+    <button class="btn-sm" onclick="logout()">Sign Out</button>
+  </div>
+</div>
+
+<div class="panel on" id="b0">
+  <div class="ph"><h2>🖨️ Job Queue</h2><button class="refresh-btn" onclick="load()">↻ Refresh</button></div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Customer</th><th>Status</th><th>Files</th><th>Bill</th><th>Job ID</th><th>Action</th></tr></thead>
+      <tbody id="qb"><tr><td colspan="7" style="text-align:center;padding:24px;color:var(--muted);font-weight:700">Loading...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="panel" id="b1">
+  <div class="ph"><h2>💰 My Payments</h2><button class="refresh-btn" onclick="lp()">↻ Refresh</button></div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Time</th><th>Customer</th><th>Amount</th><th>Job ID</th></tr></thead>
+      <tbody id="pb"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- CASH MODAL -->
+<div class="modal" id="cm">
+  <div class="modal-box">
+    <h3>💵 Confirm Cash Payment</h3>
+    <p>Customer: <b id="cm-phone" style="color:var(--text)"></b> &nbsp;·&nbsp; Total: <b id="cm-amt" style="color:var(--green)"></b></p>
+    <label class="modal-lbl">Amount received (blank = full total)</label>
+    <input class="modal-input" id="cm-custom" type="number" step="0.01" placeholder="Leave blank for full amount">
+    <label class="modal-lbl">Your PIN</label>
+    <input class="modal-input" id="cm-pin" type="password" placeholder="Enter PIN" maxlength="6">
+    <div class="modal-err" id="cm-err"></div>
+    <div class="modal-btns">
+      <button style="background:var(--border);color:var(--muted)" onclick="closeCash()">Cancel</button>
+      <button id="cm-btn" style="background:var(--green);color:#000" onclick="confirmCash()">Confirm Cash</button>
+    </div>
+  </div>
+</div>
+
+<nav>
+  <button class="nav-btn on" id="n0" onclick="sw(0)"><span class="nav-icon">🖨️</span>Queue</button>
+  <button class="nav-btn" id="n1" onclick="sw(1)"><span class="nav-icon">💰</span>Payments</button>
+</nav>
+
+<script>
+var TK=localStorage.getItem('migo_token');
+if(!TK)window.location='/login';
+
+function api(p,m,b){return fetch(p,{method:m||'GET',headers:{'Content-Type':'application/json','X-Dashboard-Token':TK},body:b?JSON.stringify(b):null}).then(function(r){return r.json();});}
+
+function sw(i){
+  document.querySelectorAll('.panel').forEach(function(x){x.classList.remove('on');});
+  document.querySelectorAll('.nav-btn').forEach(function(x){x.classList.remove('on');});
+  document.getElementById('b'+i).classList.add('on');
+  document.getElementById('n'+i).classList.add('on');
+  if(i===0)load();else lp();
+}
+
+var stateBadge={awaiting_payment:'b-amber',processing:'b-blue',ready:'b-green',idle:'b-amber',receiving:'b-blue'};
+var stateLabel={awaiting_payment:'Awaiting Payment',processing:'Printing',ready:'Ready',idle:'Idle',receiving:'Receiving'};
+
+function load(){
+  api('/api/sessions').then(function(se){
+    if(!se.ok)return;
+    var rows=(se.sessions||[]).map(function(s){
+      var btn='';
+      if(s.state==='processing') btn='<button class="btn-action btn-green" onclick="rd(\''+s.phone+'\')">✅ Ready</button>';
+      if(s.state==='awaiting_payment') btn='<button class="btn-action btn-blue" onclick="showCash(\''+s.phone+'\','+(s.totalBill||0).toFixed(2)+')">💵 Cash</button>';
+      var bill=s.totalBill?'<b style="color:var(--green)">GHS '+s.totalBill.toFixed(2)+'</b>':'—';
+      var badge='<span class="badge '+(stateBadge[s.state]||'b-blue')+'">'+(stateLabel[s.state]||s.state)+'</span>';
+      var qp=s.queuePosition?'#'+s.queuePosition:'—';
+      return '<tr><td style="font-weight:800;color:var(--muted)">'+qp+'</td><td style="font-weight:700">'+(s.customerName||s.phone)+'</td><td>'+badge+'</td><td style="font-weight:700">'+s.files+'</td><td>'+bill+'</td><td class="mono" style="color:var(--muted);font-size:11px">'+(s.jobId||'—')+'</td><td>'+btn+'</td></tr>';
+    }).join('');
+    document.getElementById('qb').innerHTML=rows||'<tr><td colspan="7"><div class="empty"><div class="empty-icon">🖨️</div><div class="empty-txt">No active jobs</div></div></td></tr>';
+  });
+}
+
+function rd(phone){if(!confirm('Mark ready and send pickup code?'))return;api('/api/mark-ready','POST',{phone:phone}).then(function(r){if(r.ok)load();else alert(r.error||'Failed');});}
+
+var cashPhone='',cashAmt=0;
+function showCash(phone,amt){
+  cashPhone=phone;cashAmt=amt;
+  document.getElementById('cm-phone').textContent=phone.replace('@s.whatsapp.net','');
+  document.getElementById('cm-amt').textContent='GHS '+amt.toFixed(2);
+  document.getElementById('cm-custom').value='';
+  document.getElementById('cm-pin').value='';
+  document.getElementById('cm-err').textContent='';
+  document.getElementById('cm-btn').disabled=false;
+  document.getElementById('cm-btn').textContent='Confirm Cash';
+  document.getElementById('cm').classList.add('open');
+  setTimeout(function(){document.getElementById('cm-pin').focus();},100);
+}
+function closeCash(){document.getElementById('cm').classList.remove('open');}
+function confirmCash(){
+  var customAmt=document.getElementById('cm-custom').value.trim();
+  var amount=customAmt?parseFloat(customAmt):cashAmt;
+  var pin=document.getElementById('cm-pin').value.trim();
+  if(!pin){document.getElementById('cm-err').textContent='Enter your PIN';return;}
+  if(isNaN(amount)||amount<=0){document.getElementById('cm-err').textContent='Invalid amount';return;}
+  document.getElementById('cm-btn').disabled=true;
+  document.getElementById('cm-btn').textContent='Processing...';
+  api('/api/cash-payment','POST',{phone:cashPhone,amount:amount,pin:pin}).then(function(r){
+    if(r.ok){closeCash();load();alert('✅ Cash confirmed!');}
+    else{document.getElementById('cm-err').textContent=r.error||'Failed';document.getElementById('cm-btn').disabled=false;document.getElementById('cm-btn').textContent='Confirm Cash';}
+  }).catch(function(){document.getElementById('cm-err').textContent='Network error';document.getElementById('cm-btn').disabled=false;document.getElementById('cm-btn').textContent='Confirm Cash';});
+}
+
+function lp(){
+  api('/api/payments').then(function(d){
+    if(!d.ok)return;
+    var wid=localStorage.getItem('migo_role')||'';
+    var rows=(d.payments||[]).filter(function(p){return !wid||wid==='admin'||p.workerId===wid;}).slice().reverse().map(function(p){
+      return '<tr><td class="mono" style="color:var(--muted)">'+(p.ts||'')+'</td><td style="font-weight:700">'+(p.phone||'')+'</td><td style="font-weight:800;color:var(--green)">GHS '+parseFloat(p.amount||0).toFixed(2)+'</td><td class="mono" style="font-size:11px;color:var(--muted)">'+(p.jobId||'')+'</td></tr>';
+    }).join('');
+    document.getElementById('pb').innerHTML=rows||'<tr><td colspan="4"><div class="empty"><div class="empty-icon">💰</div><div class="empty-txt">No payments yet</div></div></td></tr>';
+  });
+}
+
+document.getElementById('cm').addEventListener('click',function(e){if(e.target===this)closeCash();});
+function logout(){localStorage.removeItem('migo_token');localStorage.removeItem('migo_role');window.location='/login';}
+
+load();
+setInterval(load,15000);
+</script>
+</body></html>`;
 }
 
 // ── Login HTML ───────────────────────────────────────────────
 function dashboardHTML() {
   return `<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Migo Print Shop — Dashboard</title>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Migo Print Shop — Login</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
+:root{--bg:#0a0a0f;--surface:#111118;--card:#18181f;--border:#2a2a35;--text:#f0f0f5;--muted:#6b6b80;--green:#00d68f;--amber:#ffb020;--blue:#4d9fff;--red:#ff4d6a;}
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#0f172a;color:#f1f5f9;font-family:Arial,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center}
-.card{background:#1e293b;border:1px solid #334155;border-radius:16px;padding:40px;width:360px;max-width:95vw}
-h1{font-size:22px;font-weight:800;margin-bottom:4px}
-.sub{color:#64748b;font-size:13px;margin-bottom:28px}
-.tabs{display:flex;gap:8px;margin-bottom:20px}
-.tab{flex:1;padding:8px;border:1px solid #334155;border-radius:8px;background:transparent;color:#94a3b8;cursor:pointer;font-size:13px;font-weight:600}
-.tab.active{background:#3b82f6;color:#fff;border-color:#3b82f6}
-label{display:block;font-size:12px;color:#94a3b8;margin-bottom:6px;font-weight:600}
-input{width:100%;padding:10px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#f1f5f9;font-size:14px;margin-bottom:14px}
-input:focus{outline:none;border-color:#3b82f6}
-button{width:100%;padding:12px;background:#3b82f6;color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer}
-button:hover{background:#2563eb}
-.err{color:#ef4444;font-size:13px;margin-top:10px;text-align:center}
-</style></head><body>
-<div class="card">
-  <div style="text-align:center;margin-bottom:24px">
-    <div style="font-size:40px">🧾</div>
-    <h1>Migo Print Shop</h1>
-    <div class="sub">Dashboard Login</div>
+body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.wrap{width:100%;max-width:380px}
+.logo-wrap{text-align:center;margin-bottom:32px}
+.logo{width:64px;height:64px;background:var(--amber);border-radius:16px;display:inline-flex;align-items:center;justify-content:center;font-size:32px;margin-bottom:14px;box-shadow:0 8px 32px #ffb02040}
+.brand{font-size:24px;font-weight:800;color:var(--text);letter-spacing:-.5px}
+.tagline{font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px;margin-top:4px}
+.card{background:var(--card);border:1.5px solid var(--border);border-radius:20px;padding:28px;box-shadow:0 24px 64px #00000060}
+.tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:24px;background:var(--surface);border-radius:12px;padding:4px}
+.tab{padding:10px;border:none;border-radius:9px;background:transparent;color:var(--muted);cursor:pointer;font-size:14px;font-weight:800;font-family:inherit;transition:all .2s;text-transform:uppercase;letter-spacing:.5px}
+.tab.active{background:var(--card);color:var(--text);box-shadow:0 2px 8px #00000040}
+.field{margin-bottom:18px}
+.field label{display:block;font-size:11px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:7px}
+.field input{width:100%;padding:13px 15px;background:var(--surface);border:1.5px solid var(--border);border-radius:10px;color:var(--text);font-size:15px;font-weight:600;font-family:inherit;transition:border-color .15s}
+.field input:focus{outline:none;border-color:var(--blue)}
+.field input::placeholder{color:var(--border)}
+.login-btn{width:100%;padding:14px;border:none;border-radius:12px;font-size:15px;font-weight:800;cursor:pointer;font-family:inherit;transition:all .2s;letter-spacing:.3px;text-transform:uppercase}
+.login-btn.admin{background:var(--amber);color:#000}
+.login-btn.admin:hover{background:#ffc040;transform:translateY(-1px);box-shadow:0 8px 24px #ffb02040}
+.login-btn.worker{background:var(--blue);color:#fff}
+.login-btn.worker:hover{background:#6aafff;transform:translateY(-1px);box-shadow:0 8px 24px #4d9fff40}
+.err{color:var(--red);font-size:13px;font-weight:700;text-align:center;margin-top:14px;min-height:18px}
+.ver{text-align:center;margin-top:20px;font-size:11px;color:var(--border);font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="logo-wrap">
+    <div class="logo">🖨️</div>
+    <div class="brand">Migo Print Shop</div>
+    <div class="tagline">Dashboard</div>
   </div>
-  <div class="tabs">
-    <button class="tab active" onclick="setTab('admin')">Admin</button>
-    <button class="tab" onclick="setTab('worker')">Worker</button>
+  <div class="card">
+    <div class="tabs">
+      <button class="tab active" id="tab-admin" onclick="setTab('admin')">Admin</button>
+      <button class="tab" id="tab-worker" onclick="setTab('worker')">Worker</button>
+    </div>
+    <div id="adminForm">
+      <div class="field">
+        <label>Admin Password</label>
+        <input type="password" id="adminPw" placeholder="••••••••" onkeydown="if(event.key==='Enter')loginAdmin()">
+      </div>
+      <button class="login-btn admin" onclick="loginAdmin()">Sign In as Admin</button>
+    </div>
+    <div id="workerForm" style="display:none">
+      <div class="field">
+        <label>Worker ID</label>
+        <input type="text" id="wId" placeholder="e.g. W01" onkeydown="if(event.key==='Enter')loginWorker()">
+      </div>
+      <div class="field">
+        <label>Worker PIN</label>
+        <input type="password" id="wPin" placeholder="••••" maxlength="6" onkeydown="if(event.key==='Enter')loginWorker()">
+      </div>
+      <button class="login-btn worker" onclick="loginWorker()">Sign In as Worker</button>
+    </div>
+    <div class="err" id="err"></div>
   </div>
-  <div id="adminForm">
-    <label>Admin Password</label>
-    <input type="password" id="adminPw" placeholder="Enter password">
-    <button onclick="loginAdmin()">Login as Admin</button>
-  </div>
-  <div id="workerForm" style="display:none">
-    <label>Worker ID</label>
-    <input type="text" id="wId" placeholder="e.g. W01">
-    <label>Worker PIN</label>
-    <input type="password" id="wPin" placeholder="4-digit PIN">
-    <button onclick="loginWorker()">Login as Worker</button>
-  </div>
-  <div class="err" id="err"></div>
+  <div class="ver">Migo Bot v40 · Circle, Accra</div>
 </div>
 <script>
 function setTab(t){
   document.getElementById('adminForm').style.display=t==='admin'?'block':'none';
   document.getElementById('workerForm').style.display=t==='worker'?'block':'none';
-  document.querySelectorAll('.tab').forEach((b,i)=>b.classList.toggle('active',(i===0&&t==='admin')||(i===1&&t==='worker')));
+  document.getElementById('tab-admin').classList.toggle('active',t==='admin');
+  document.getElementById('tab-worker').classList.toggle('active',t==='worker');
+  document.getElementById('err').textContent='';
 }
 async function loginAdmin(){
   const pw=document.getElementById('adminPw').value;
+  if(!pw){document.getElementById('err').textContent='Enter your password';return;}
   const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
   const d=await r.json();
   if(d.ok){localStorage.setItem('migo_token',d.token);localStorage.setItem('migo_role',d.role);window.location='/admin';}
-  else document.getElementById('err').textContent='Wrong password';
+  else document.getElementById('err').textContent='Wrong password. Try again.';
 }
 async function loginWorker(){
-  const wId=document.getElementById('wId').value.toUpperCase();
-  const pin=document.getElementById('wPin').value;
+  const wId=document.getElementById('wId').value.toUpperCase().trim();
+  const pin=document.getElementById('wPin').value.trim();
+  if(!wId||!pin){document.getElementById('err').textContent='Enter Worker ID and PIN';return;}
   const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workerId:wId,pin})});
   const d=await r.json();
   if(d.ok){localStorage.setItem('migo_token',d.token);localStorage.setItem('migo_role',d.role);window.location='/worker';}
-  else document.getElementById('err').textContent='Wrong Worker ID or PIN';
+  else document.getElementById('err').textContent='Wrong Worker ID or PIN.';
 }
 </script>
 </body></html>`;
 }
+
 
 // ── Train page HTML ───────────────────────────────────────────
 function trainHTML() {
@@ -3276,19 +3772,21 @@ loadFacts();
 
   // Sessions list
   app.get('/api/sessions', authMiddleware, (req, res) => {
-    const processingList = [...sessions.values()].filter(s => s.state === 'processing');
-    const list = [...sessions.entries()].map(([key, s], idx) => {
-      const qPos = s.state === 'processing'
-        ? processingList.indexOf(s) + 1
-        : null;
+    const processingList = [...sessions.values()].filter(s => sessState(s) === 'processing');
+    const list = [...sessions.entries()].map(([key, s]) => {
+      const order = getActiveOrder(s);
+      const state = sessState(s);
+      const qPos = state === 'processing' ? processingList.indexOf(s) + 1 : null;
       return {
-        phone: displayPhone(key), state: s.state,
-        totalBill: s.totalBill, paymentReceived: s.paymentReceived,
-        jobId: s.jobId, a4eq: s.a4eq, paused: s.paused,
+        phone: displayPhone(key), state,
+        totalBill: sessTotalBill(s), paymentReceived: order?.paymentReceived,
+        jobId: sessJobId(s), a4eq: sessA4eq(s), paused: s.paused,
         customerName: s.customerName,
-        files: s.files?.length || 0,
-        pressing: s.pressing ? `${s.pressing.shirts} shirts (${s.pressing.type}) — GHS ${(s.pressing.fee||0).toFixed(2)}` : null,
+        files: sessFiles(s)?.length || 0,
+        pressing: order?.pressing ? `${order.pressing.shirts} shirts (${order.pressing.type})` : null,
         queuePosition: qPos,
+        orderRef: order?.ref,
+        orders: s.orders?.length || 1,
       };
     });
     res.json({ ok: true, sessions: list });
