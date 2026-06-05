@@ -1,57 +1,82 @@
 // ============================================================
-// MIGO DTF PRINT SHOP — WhatsApp Bot (v21)
-// Changes from v20:
-//   • Fix: Double message on image receive — removed immediate
-//     reply from handleImage(); timer sends buildImageQuestion()
-//   • Fix: cleanBody declared before testMode block (TDZ crash)
-//     — test mode now works correctly without ReferenceError
-//   • Fix: Closed hours now answers FAQ questions (prices, hours,
-//     location, MoMo number) then appends closed notice instead
-//     of sending closed message for every single message
+// MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
+// Version : v26
+// Date    : June 2026
+// Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
-// Changes from v19b:
-//   • Upgraded to claude-opus-4-8 (most powerful)
+//
+// VERSION HISTORY
+//
+// v26 (Jun 2026) — Bug fixes
+//   • Fix: FAQ delivery regex now catches "deliver" and "delivery"
+//   • Fix: quickParse now handles space/underscore/parentheses
+//     as size-qty separators (e.g. "A4 10", "A3 (5 copies)")
+//
+// v25 (Jun 2026) — Knowledge base & file agent
+//   • admin learnbulk — paste any format, Claude parses Q&As
+//   • /train dashboard page — paste or upload any text
+//   • /api/train endpoint with Claude extraction
+//   • /api/knowledge DELETE endpoint for dashboard
+//   • Desktop file agent v2 — correct rename logic (A4 3.png)
+//   • Two-phase agent: staging on download, hot folder on payment
+//
+// v24 (Jun 2026) — Bulk knowledge base
+//   • admin learnbulk command (original Q:/A: version)
+//   • learnbulk added to admin help output
+//
+// v23 (Jun 2026) — Scenario fixes
+//   • S1:  Bill message → "Printing can *ONLY* start *AFTER* payment"
+//   • S2:  PNG/PDF images — no background question asked
+//   • S6:  Pressing tier rules hidden from customers and Claude prompt
+//   • S6:  Pressing auto-confirm timeout reduced 90s → 60s
+//   • S9:  Bot runs 24/7 — no closed-hours block
+//   • S9:  Out-of-hours new orders → silent owner alert only
+//   • S16: Sunday small order check moved to after payment confirmed
+//   • S16: Owner alerted to decide — no message or refund to customer
+//   • S21: Daily summary adds complaints, customer comments, delay reasons
+//
+// v22 (Jun 2026) — Receipt OCR fix
+//   • Fix: extractReceiptFromImage replaced fetch() with https.get()
+//   • Works on Node 16+ without native fetch (downloadBuffer helper)
+//   • package.json engines: node >=18.0.0
+//
+// v21 (Jun 2026) — Three critical fixes
+//   • Fix: Double message on image receive — handleImage() now
+//     returns null; timer sends buildImageQuestion() only once
+//   • Fix: cleanBody declared before testMode block (TDZ crash)
+//     — test mode ReferenceError resolved
+//   • Fix: Closed hours now answers FAQ questions then appends
+//     closed notice (removed in v23 — bot now runs 24/7)
+//
+// v20 (Jun 2026) — Major feature release
+//   • claude-opus-4-8 (most powerful model)
 //   • Welcome message + name capture for new customers
-//   • Shop hours 7am–10pm Mon–Sun (Sunday bulk 200+ only)
 //   • Duplicate file protection
 //   • 3-day session auto-close on no payment
 //   • Re-send bill on request
 //   • Forwarded messages stripped
-//   • File receipt ack for unknown files only (known = silent)
 //   • Rating follow-up after 2 hours if ignored
 //   • Pressing only asked if customer mentions it
-//   • Natural ready-check detection
+//   • Natural ready-check detection (isReadyCheck)
 //   • FAQ quick-match (location, prices, hours etc.)
-//   • Pressing revenue in daily summary
 //   • Queue position in payment confirmation
-//   • Dashboard pressing + queue position columns
-//   • Health endpoint with version + uptime
 //   • Pickup code only sent when job is ready (not on payment)
-//   • Bill reminder: send receipt to COMPLETE order
 //   • extractImageInstructions A4 default bug fixed
 //   • Cash payment from dashboard (admin + worker)
 //   • Dashboard bottom nav — 5 tabs professional layout
-//   • File handling: known filenames collected silently
-//   • Test mode (admin test on/off) — pending
-// ============================================================
-// ============================================================
-// Changes from v18:
-//   • WasenderAPI only — Twilio completely removed
-//   • claude-opus-4-6 (most powerful) for every Claude call
+//
+// v18–v19 (May 2026) — WasenderAPI migration
+//   • WasenderAPI fully replaces Twilio
 //   • Worker cash approval — any worker, no two-step
-//   • Cash records: worker ID + name + timestamp stored
+//   • Cash records: worker ID + name + timestamp
 //   • Owner copy on every cash payment
-//   • Receipt printing: thermal + A4 copy
-//   • WasenderAPI webhook handler
-//   • Pickup code in ready message
 //   • admin W01 bill — override bill total
 //   • // prefix — simultaneous human+bot messaging
-//   • Ready times +1 hour (min 3 hours)
-//   • Ready time removed from bill — shows after payment only
 //   • Automated delay notification with reason
 //   • Customer name capture
-//   • End of day production report
+//   • Daily production report
 //   • Confirmed payments API for desktop agent
+//
 // ============================================================
 
 'use strict';
@@ -90,7 +115,7 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── Model — most powerful available ──────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v21';
+const BOT_VERSION = 'v26';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -110,18 +135,18 @@ const FAQ = [
   { p: /how much.*(a4|a3|a2)|price.*(a4|a3|a2)|(a4|a3|a2).*(price|cost|how much)/i,
     a: `🖨 *Printing prices:*\nA4 — GHS 3.20\nA3 — GHS 6.40\nA2 — GHS 16.00` },
   { p: /how much.*press|press.*price|press.*cost|cost.*press/i,
-    a: `👕 *Pressing prices:*\n1–2 shirts — GHS 10 flat\n3–5 shirts — 1.5× rate\n6+ shirts — normal rate\nFront only GHS 2/shirt · Front+Back GHS 3/shirt · Side GHS 2/shirt\nLarge artwork +GHS 1/shirt` },
+    a: `👕 *Pressing:* Please send your files and let us know you need pressing — we'll calculate the cost for you.` },
   { p: /what.*time|when.*open|opening.*hour|close.*time|hours/i,
-    a: `🕐 We're open *7am – 10pm*, Monday to Sunday.\n_(Sundays: bulk orders of 200+ sheets only)_` },
+    a: `🕐 Our standard hours are *7am – 10pm*, Monday to Sunday. Feel free to send your files anytime!` },
   { p: /sunday|tomorrow.*(sun)/i,
-    a: `📅 We're open Sundays for bulk orders (200+ sheets). For smaller orders, we'll process yours first thing Monday.` },
+    a: `📅 Yes, we're open on Sundays! Send your files anytime.` },
   { p: /momo|mobile money|number.*pay|pay.*number/i,
     a: `🟡 *MTN MoMo:* 0552719245 · Kow Habib Baisie` },
   { p: /instagram|facebook|social|ig\b/i,
     a: `We're on Instagram — search *Migo Print Shop Accra*. 🙏` },
   { p: /sublim|embroid|screen.?print/i,
     a: `We specialise in *DTF printing and pressing* only. We do not offer sublimation, embroidery or screen printing.` },
-  { p: /delivery|dispatch|rider|send.*my guy/i,
+  { p: /deliver(y)?|dispatch|rider|send.*my guy/i,
     a: `We don't offer delivery at the moment. Orders must be collected from the shop. Your pickup code is required for collection.` },
   { p: /thank|thanks|thank you|merci/i,
     a: `You're welcome! 🙏 Let us know if you need anything else.` },
@@ -373,14 +398,9 @@ function buildShopSystem(session) {
 Shop: Circle branch, near Benz Gate, closer to Calvary Church, Accra, Ghana. DTF printing only.
 Services:
 - DTF Sheet Printing: A4=GHS 3.20, A3=GHS 6.40, A2=GHS 16.00 per sheet
-- DTF Shirt Pressing: Front only=GHS 2/shirt, Front+Back=GHS 3/shirt, Side=GHS 2/shirt
-  • 1-2 shirts = flat GHS 10.00 total regardless of impressions
-  • 3-5 shirts = 1.5x normal rate
-  • 6+ shirts = normal rate
-  • Large/oversized artwork = +GHS 1.00 per shirt
-  • Price is by impressions and artwork size only — NOT shirt size, NOT number of colours
+- DTF Shirt Pressing: pricing calculated per order based on number of shirts, impression type, and artwork size. Do not quote specific rates — just say we'll calculate it for them.
 Payment: MTN MoMo 0552719245 (Kow Habib Baisie) or cash at shop.
-Hours: Mon–Sun 7am–10pm. Sundays: bulk orders (200+ sheets) only.
+Hours: Standard hours Mon–Sun 7am–10pm. Orders accepted anytime — send files whenever convenient.
 Style: Clear British English. Warm, professional. 1–4 sentences. Never reveal you are AI.${nameNote}
 If you genuinely cannot answer: say "Let me get someone to assist you shortly." and nothing else.
 You have full context of this customer's order in the conversation history.${kb}`;
@@ -743,6 +763,23 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
 
       scheduleWorkerReminders(matchedKey, matched, jobId);
 
+      // S16: Sunday small order — alert owner to decide, no message to customer
+      const { isSunday } = shopStatus();
+      if (isSunday && (matched.a4eq || 0) < 200) {
+        alertOwner([
+          `📅 *SUNDAY SMALL ORDER — PAYMENT RECEIVED*`,
+          ``,
+          `📱 Customer: ${displayPhone(matchedKey)}`,
+          `🔖 Job ID:   ${jobId}`,
+          `💰 Amount:   GHS ${paid.toFixed(2)}`,
+          `🖨 Size:     ${matched.a4eq} A4-equivalent sheets`,
+          ``,
+          `This is below the 200-sheet Sunday minimum.`,
+          `Please decide: process now or defer to Monday.`,
+          `Use: admin W01 override ${last4(matchedKey)} [your message]`,
+        ].join('\n')).catch(() => {});
+      }
+
       // Queue for desktop agent to move files to hot folder after payment
       confirmedPayments.push({
         id:    crypto.randomBytes(8).toString('hex'),
@@ -874,16 +911,40 @@ async function handleMomoEvent(parsed, source) {
 }
 
 // ── Receipt OCR ───────────────────────────────────────────────
+// Uses https (built-in) instead of fetch — works on Node 16+
+function downloadBuffer(url) {
+  return new Promise((resolve, reject) => {
+    const protocol = url.startsWith('https') ? https : require('http');
+    protocol.get(url, (res) => {
+      // Follow redirects (301/302)
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        return downloadBuffer(res.headers.location).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      const mime = res.headers['content-type'] || 'image/jpeg';
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve({ buffer: Buffer.concat(chunks), mime }));
+      res.on('error', reject);
+    }).on('error', reject)
+      .setTimeout(10000, function() { this.destroy(); reject(new Error('Download timeout')); });
+  });
+}
+
 async function extractReceiptFromImage(mediaUrl) {
   try {
-    const resp = await fetch(mediaUrl);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const base64 = Buffer.from(await resp.arrayBuffer()).toString('base64');
-    const mime   = resp.headers.get('content-type') || 'image/jpeg';
+    const { buffer, mime } = await downloadBuffer(mediaUrl);
+    const base64 = buffer.toString('base64');
+    // Ensure mime is a valid image type for Anthropic
+    const safeMime = ['image/jpeg','image/png','image/gif','image/webp'].includes(mime)
+      ? mime : 'image/jpeg';
     const r = await anthropic.messages.create({
       model: MODEL, max_tokens: 200,
       messages: [{ role: 'user', content: [
-        { type: 'image', source: { type: 'base64', media_type: mime, data: base64 } },
+        { type: 'image', source: { type: 'base64', media_type: safeMime, data: base64 } },
         { type: 'text', text: `Ghana MTN MoMo receipt. Extract ONLY valid JSON:
 {"amount":<number|null>,"txId":"<digits|null>","reference":"<string|null>","senderName":"<string|null>"}` },
       ]}],
@@ -899,7 +960,7 @@ async function extractReceiptFromImage(mediaUrl) {
 function quickParse(text) {
   if (!text) return [{ size: null, qty: null, isUnknown: true, isMoreOf: null }];
   const results = [];
-  const re = /(?:(\d+)\s*[xX×]\s*)?([Aa][234])(?:\s*[xX×-]\s*(\d+))?|(\d+)\s*[xX×]?\s*([Aa][234])/g;
+  const re = /(?:(\d+)\s*[xX×]\s*)?([Aa][234])(?:\s*[xX×\-_ ]\s*\(?(\d+)\)?)?|(\d+)\s*[xX×]?\s*([Aa][234])/g;
   let m;
   while ((m = re.exec(text)) !== null) {
     let size, qty;
@@ -1084,14 +1145,23 @@ function buildReadyMsg(jobId) {
 
 function buildImageQuestion(session) {
   const imgs = session.pendingImages;
-  if (imgs.length === 1) return [`I received your image. Please provide:`, ``,
-    `  1️⃣  *Print size* — A4, A3, or A2?`,
-    `  2️⃣  *Quantity* — How many copies?`,
-    `  3️⃣  *Background* — Keep or remove?`].join('\n');
+  // Background question not needed for PNG or PDF files — they already have transparent bg or are print-ready
+  const noBgTypes = /image\/png|application\/pdf/i;
+  const allNoBg = imgs.length > 0 && imgs.every(img => noBgTypes.test(img.mediaType || ''));
+
+  if (imgs.length === 1) {
+    const lines = [`I received your image. Please provide:`, ``,
+      `  1️⃣  *Print size* — A4, A3, or A2?`,
+      `  2️⃣  *Quantity* — How many copies?`];
+    if (!allNoBg) lines.push(`  3️⃣  *Background* — Keep or remove?`);
+    return lines.join('\n');
+  }
   const list = imgs.map((img, i) => `  🖼 Image ${i+1}${img.caption ? ` — "${img.caption}"` : ''}`).join('\n');
-  return [`I received *${imgs.length} images*. Please provide for each:`, ``,
+  const lines = [`I received *${imgs.length} images*. Please provide for each:`, ``,
     list, ``, `  1️⃣  Size — A4, A3, or A2`,
-    `  2️⃣  Quantity — copies`, `  3️⃣  Background — keep or remove`].join('\n');
+    `  2️⃣  Quantity — copies`];
+  if (!allNoBg) lines.push(`  3️⃣  Background — keep or remove`);
+  return lines.join('\n');
 }
 
 function startReceiveTimer(phone, session) {
@@ -1128,7 +1198,7 @@ async function proceedToSummary(phone, session) {
     session.askedPressing = true;
     session.state = 'asking_pressing';
     await sendMsg(phone, `Pressing details — how many shirts and front only, front+back, or side? (Type *no* to skip)`);
-    setTimer(phone, 'pressing_timeout', 90000, async () => {
+    setTimer(phone, 'pressing_timeout', 60000, async () => {
       if (session.state === 'asking_pressing') {
         session.pressing = null;
         session.state = 'confirming';
@@ -1147,23 +1217,7 @@ async function proceedToSummary(phone, session) {
   });
 }
 
-async function sendBill(phone, session) {
-  // Sunday: only bulk (200+ A4 equivalent)
-  const { isSunday } = shopStatus();
-  if (isSunday && (session.a4eq || 0) < 200) {
-    clearTimers(phone);
-    session.state = 'idle';
-    session.files = []; session.unknownFiles = []; session.pendingImages = [];
-    session.totalBill = null; session.a4eq = 0; session.askedPressing = false; session.pressingMentioned = false;
-    return sendMsg(phone, [
-      `📅 *Sunday Notice*`,
-      `On Sundays we process bulk orders only (200+ sheets).`,
-      `Your order is below our Sunday minimum.`,
-      `We'll process yours *first thing Monday*. Sorry for the inconvenience! 🙏`,
-    ].join('\n'));
-  }
-
-  session.state = 'awaiting_payment';
+async function sendBill(phone, session) {  session.state = 'awaiting_payment';
   audit('BILL_SENT', phone, `GHS ${session.totalBill?.toFixed(2)}`);
   await sendMsg(phone, `Order received. Sending your bill now. 🙏`);
 
@@ -1182,7 +1236,7 @@ async function sendBill(phone, session) {
     await sendMsg(phone, [
       `📌 Please send your payment receipt or MoMo confirmation screenshot to *__COMPLETE__* your order.`,
       ``,
-      `No payment = No printing. 🙏`,
+      `Printing can *ONLY* start *AFTER* payment. 🙏`,
     ].join('\n'));
     setTimer(phone, 'pay1', 600000, () => {
       if (session.state === 'awaiting_payment')
@@ -1232,14 +1286,14 @@ function scheduleWorkerReminders(phone, session, jobId) {
     setTimer(phone, 'overdue', readyMs + 60000 - now, () => overdueFn(1));
 }
 
-async function handleImage(from, session, mediaUrl, caption) {
+async function handleImage(from, session, mediaUrl, caption, mediaType) {
   // Duplicate check
   const isDuplicate = session.files.some(f => f.sourceUrl === mediaUrl)
     || session.pendingImages.some(p => p.url === mediaUrl);
   if (isDuplicate) return null; // silently ignore
 
   // Track for desktop agent
-  trackFile(from, mediaUrl, caption || 'image.jpg', 'image/jpeg', caption, session);
+  trackFile(from, mediaUrl, caption || 'image.jpg', mediaType || 'image/jpeg', caption, session);
   const orders = await extractOrder(caption, '', session);
   const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
   if (valid.length > 0) {
@@ -1251,7 +1305,8 @@ async function handleImage(from, session, mediaUrl, caption) {
     return null; // ✅ silent — info was in caption/filename
   }
   // Unknown — queue for details, timer will send buildImageQuestion covering all pending images
-  session.pendingImages.push({ url: mediaUrl, caption, index: session.pendingImages.length + 1 });
+  // Store mediaType so buildImageQuestion knows whether to ask about background
+  session.pendingImages.push({ url: mediaUrl, caption, index: session.pendingImages.length + 1, mediaType: mediaType || '' });
   startReceiveTimer(from, session);
   return null; // ✅ No immediate reply — timer sends buildImageQuestion() after 60s inactivity
 }
@@ -1345,9 +1400,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   // ── First-time welcome + name ask ────────────────────────
   if (session.isFirstTime && !session.customerName && session.state !== 'asking_name') {
     session.isFirstTime = false;
-    const { isSunday } = shopStatus();
-    const sundayNote = isSunday ? `\n\n_Note: Sundays we process bulk orders (200+ sheets) only._` : ``;
-    await sendMsg(from, `👋 Welcome to *Migo Print Shop!* 🖨️\nCircle branch · Near Benz Gate · Accra${sundayNote}\n\nMay I know your name please?`);
+    await sendMsg(from, `👋 Welcome to *Migo Print Shop!* 🖨️\nCircle branch · Near Benz Gate · Accra\n\nMay I know your name please?`);
     session.state = 'asking_name';
     return null;
   }
@@ -1393,7 +1446,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   if (session.state === 'idle') {
     if (mediaUrl) {
       session.state = 'receiving';
-      if (isImage) return handleImage(from, session, mediaUrl, msg);
+      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType);
       return handleDoc(from, session, mediaUrl, msg, filename);
     }
     if (msg) {
@@ -1414,7 +1467,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   // ── RECEIVING ───────────────────────────────────────────────
   if (session.state === 'receiving') {
     if (mediaUrl) {
-      if (isImage) return handleImage(from, session, mediaUrl, msg);
+      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType);
       return handleDoc(from, session, mediaUrl, msg, filename);
     }
     if (msg) {
@@ -1505,7 +1558,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     if (isYes(msg)) { await proceedToSummary(from, session); return null; }
     if (mediaUrl) {
       session.state = 'receiving';
-      if (isImage) return handleImage(from, session, mediaUrl, msg);
+      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType);
       return handleDoc(from, session, mediaUrl, msg, filename);
     }
     const orders = await extractOrder(msg, null, session);
@@ -1605,7 +1658,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   if (session.state === 'processing') {
     if (mediaUrl) {
       session.state = 'receiving'; session.files = []; session.unknownFiles = []; session.pendingImages = [];
-      if (isImage) return handleImage(from, session, mediaUrl, msg);
+      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType);
       return handleDoc(from, session, mediaUrl, msg, filename);
     }
     return replyWithClaude(msg, session);
@@ -1901,6 +1954,74 @@ async function handleAdmin(from, msg) {
     return `✅ Learned: "${fact}" (${knowledgeBase.length} facts total)`;
   }
 
+  // ── learnbulk — paste any list, Claude figures out the Q&As ──
+  // Send as one WhatsApp message. Any format works:
+  //   admin learnbulk
+  //   Do you deliver?
+  //   No, collection only from Circle.
+  //   Do you do sublimation?
+  //   No, DTF only.
+  if (cmd === 'learnbulk') {
+    const content = msg.split(/\r?\n/).slice(1).join('\n').trim();
+    if (!content || content.length < 5)
+      return [
+        `❌ No content found. Just paste your list after:`,
+        ``,
+        `admin learnbulk`,
+        `Do you deliver?`,
+        `No, collection only from Circle.`,
+        `Do you do sublimation?`,
+        `No, DTF only.`,
+        `How long does pressing take?`,
+        `About 30 minutes after printing.`,
+      ].join('\n');
+
+    // Use Claude to parse any format into clean Q&A pairs
+    let parsed = [];
+    try {
+      const r = await askClaude([{ role: 'user', content:
+        `You are parsing a Q&A list for a DTF print shop knowledge base.\n` +
+        `Extract all question-answer pairs from this text. The format may be messy — ` +
+        `numbered, dashed, plain alternating lines, Q:/A: prefixed, or anything else.\n\n` +
+        `TEXT:\n${content}\n\n` +
+        `Return ONLY a valid JSON array. Each object: {"q":"question","a":"answer"}\n` +
+        `If a line is a standalone fact (not a Q&A), use {"q":null,"a":"the fact"}\n` +
+        `No markdown. No explanation. JSON only.`
+      }], null, 800, 12000);
+      const raw = r.content.map(c => c.text || '').join('').trim().replace(/```json|```/g, '').trim();
+      parsed = JSON.parse(raw);
+    } catch(e) {
+      // Fallback — add each non-empty line as a raw fact
+      console.error('learnbulk Claude parse error:', e.message);
+      parsed = content.split(/\r?\n/).filter(l => l.trim().length > 3)
+        .map(l => ({ q: null, a: l.trim() }));
+    }
+
+    if (!Array.isArray(parsed) || parsed.length === 0)
+      return `❌ Could not parse any facts from that content. Try again.`;
+
+    const added = [];
+    for (const item of parsed) {
+      if (!item.a) continue;
+      const fact = item.q ? `Q: ${item.q} A: ${item.a}` : item.a;
+      knowledgeBase.push(fact);
+      added.push(`  • ${(item.q || item.a).slice(0, 60)}`);
+    }
+
+    audit('KNOWLEDGE_BULK', from, `${added.length} facts added`, false, workerId);
+
+    if (added.length === 0) return `❌ Nothing could be extracted. Try a clearer format.`;
+
+    return [
+      `✅ *${added.length} fact(s) added to knowledge base:*`,
+      ``,
+      ...added,
+      ``,
+      `Total facts: ${knowledgeBase.length}`,
+      `Use: admin knowledge — to review all`,
+    ].join('\n');
+  }
+
   if (cmd === 'unlearn') {
     const idx = parseInt(args[0]) - 1;
     if (isNaN(idx) || idx < 0 || idx >= knowledgeBase.length)
@@ -2029,6 +2150,7 @@ async function handleAdmin(from, msg) {
       `admin unlock W01`,``,
       `*TRAINING:*`,
       `admin learn <fact>`,
+      `admin learnbulk  (multiline Q&A list)`,
       `admin unlearn <n>`,
       `admin knowledge`,``,
       `*BOT:*`,
@@ -2110,6 +2232,29 @@ async function sendDailySummary() {
   const overdueCount = auditLog.filter(a => a.action === 'JOB_OVERDUE' && a.date === todayStr()).length;
 
   const pressingT = todayP.reduce((s, p) => s + (p.pressingFee || 0), 0);
+
+  // Complaints — bad ratings (1-2) with comments today
+  const todayComplaints = todayR.filter(r => r.score <= 2);
+  const complaintsLines = todayComplaints.length > 0
+    ? todayComplaints.map(r =>
+        `  • ...${r.phone.slice(-4)} — ⭐${r.score}/5${r.comment ? `: "${r.comment}"` : ''} | Job: ${r.jobId}`
+      ).join('\n')
+    : '  None';
+
+  // Rating comments (all ratings with comments today)
+  const todayComments = todayR.filter(r => r.comment && r.comment.trim());
+  const commentsLines = todayComments.length > 0
+    ? todayComments.map(r =>
+        `  • ...${r.phone.slice(-4)} (⭐${r.score}): "${r.comment}"`
+      ).join('\n')
+    : '  None';
+
+  // Delay reasons — from audit log today
+  const todayDelays = auditLog.filter(a => a.action === 'JOB_DELAY' && a.date === todayStr());
+  const delayLines = todayDelays.length > 0
+    ? todayDelays.map(d => `  • ${d.phone}: ${d.detail}`).join('\n')
+    : '  None';
+
   await alertOwner([
     `━━━━━━━━━━━━━━━━━━━━━━`,
     `📊 *MIGO DAILY SUMMARY*`,
@@ -2133,6 +2278,15 @@ async function sendDailySummary() {
     `✅ Completed: ${completed}`,
     `❌ Abandoned: ${abandoned}`,
     `⚠️ Overdue:   ${overdueCount}`,
+    `━━━━━━━━━━━━━━━━━━━━━━`,
+    `😠 *COMPLAINTS (${todayComplaints.length})*`,
+    complaintsLines,
+    `━━━━━━━━`,
+    `💬 *CUSTOMER COMMENTS*`,
+    commentsLines,
+    `━━━━━━━━`,
+    `🕐 *DELAY REASONS (${todayDelays.length})*`,
+    delayLines,
     `━━━━━━━━━━━━━━━━━━━━━━`,
   ].filter(l => l !== '').join('\n'));
 }
@@ -2240,19 +2394,23 @@ app.post('/webhook', async (req, res) => {
     }
   }
 
-  // ── Shop hours check ─────────────────────────────────────────
+  // ── Shop hours — bot runs 24/7 ───────────────────────────────
+  // No closed-hours block. Orders are accepted at any time.
+  // Owner is alerted when a new order arrives outside 7am–10pm so they can decide.
   const { open, isSunday } = shopStatus();
   const session = getSession(from);
   if (!open && !cleanBody?.toLowerCase().startsWith('admin')) {
-    const closedNotice = `We're currently closed. We're open *7am – 10pm*, Mon–Sun.\nSend your files anytime and we'll process them first thing when we open. 🙏`;
-    // Still answer FAQ questions when closed — just append closed notice
-    const faqHit = cleanBody ? tryFAQ(cleanBody) : null;
-    if (faqHit) {
-      await sendMsg(from, faqHit + `\n\n` + closedNotice);
-    } else {
-      await sendMsg(from, closedNotice);
+    // Only alert owner on first message of a new session (state idle/asking_name)
+    if (session.state === 'idle' || session.state === 'asking_name') {
+      alertOwner([
+        `🌙 *OUT-OF-HOURS ORDER*`,
+        `📱 Customer: ${displayPhone(from)}`,
+        `💬 Message: "${(cleanBody||'').slice(0, 80)}"`,
+        `🕐 Time: ${nowStr()}`,
+        ``,
+        `Bot is processing normally. Reply to decide.`,
+      ].join('\n')).catch(() => {});
     }
-    return;
   }
 
   // Sunday: only bulk (200+ A4eq)
@@ -2887,6 +3045,142 @@ async function loginWorker(){
 </body></html>`;
 }
 
+// ── Train page HTML ───────────────────────────────────────────
+function trainHTML() {
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Migo — Train Bot</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0f172a;color:#f1f5f9;font-family:Arial,sans-serif;min-height:100vh;padding:20px}
+.wrap{max-width:700px;margin:0 auto}
+h1{font-size:22px;font-weight:800;margin-bottom:4px}
+.sub{color:#64748b;font-size:13px;margin-bottom:24px}
+.card{background:#1e293b;border:1px solid #334155;border-radius:16px;padding:24px;margin-bottom:20px}
+h2{font-size:15px;font-weight:700;margin-bottom:12px;color:#94a3b8;text-transform:uppercase;letter-spacing:.5px}
+textarea{width:100%;min-height:220px;padding:12px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#f1f5f9;font-size:14px;line-height:1.6;resize:vertical}
+textarea:focus{outline:none;border-color:#3b82f6}
+.btn{padding:12px 24px;background:#3b82f6;color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer;margin-top:12px}
+.btn:hover{background:#2563eb}
+.btn-red{background:#ef4444}.btn-red:hover{background:#dc2626}
+.btn-sm{padding:6px 12px;font-size:12px;margin:0}
+.result{margin-top:16px;padding:14px;background:#0f172a;border-radius:8px;font-size:13px;line-height:1.7;display:none}
+.result.ok{border-left:4px solid #10b981}
+.result.err{border-left:4px solid #ef4444}
+.fact-list{list-style:none}
+.fact-list li{display:flex;align-items:flex-start;gap:10px;padding:10px 0;border-bottom:1px solid #1e293b;font-size:13px;line-height:1.5}
+.fact-list li:last-child{border-bottom:none}
+.fact-num{color:#64748b;min-width:24px;font-size:12px;padding-top:1px}
+.fact-text{flex:1}
+.hint{color:#64748b;font-size:12px;margin-top:8px;line-height:1.6}
+.loading{color:#94a3b8;font-size:13px;margin-top:12px;display:none}
+</style></head><body>
+<div class="wrap">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
+    <div>
+      <h1>🧠 Train the Bot</h1>
+      <div class="sub">Paste any list — Claude reads it and extracts the Q&As automatically</div>
+    </div>
+    <a href="/login" style="color:#64748b;font-size:13px;text-decoration:none">← Dashboard</a>
+  </div>
+
+  <!-- Paste area -->
+  <div class="card">
+    <h2>Paste your content</h2>
+    <textarea id="content" placeholder="Paste anything — a list of questions and answers, FAQs, notes, any format:
+
+Do you deliver?
+No, collection only from our Circle branch.
+
+Do you do sublimation?
+No, DTF printing only.
+
+How long does pressing take?
+About 30 minutes after printing is done.
+
+1. Do you accept JPEG?
+   Yes, we accept JPG, PNG, and PDF.
+
+Q: What payment methods do you accept?
+A: MTN MoMo and cash at the counter."></textarea>
+    <div class="hint">Any format works — numbered, dashed, Q:/A:, plain alternating lines, or paragraphs. Claude figures it out.</div>
+    <button class="btn" onclick="trainBot()">📤 Extract & Save to Bot</button>
+    <div class="loading" id="loading">⏳ Claude is reading your content...</div>
+    <div class="result" id="result"></div>
+  </div>
+
+  <!-- Current knowledge base -->
+  <div class="card">
+    <h2>Current Knowledge Base (<span id="factCount">...</span> facts)</h2>
+    <ul class="fact-list" id="factList"><li style="color:#64748b;font-size:13px">Loading...</li></ul>
+  </div>
+</div>
+
+<script>
+const TK = localStorage.getItem('migo_token');
+if (!TK) window.location = '/login';
+
+async function api(path, method, body) {
+  const r = await fetch(path, {
+    method: method || 'GET',
+    headers: { 'Content-Type': 'application/json', 'X-Dashboard-Token': TK },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return r.json();
+}
+
+async function loadFacts() {
+  const d = await api('/api/knowledge');
+  if (!d.ok) return;
+  document.getElementById('factCount').textContent = d.facts.length;
+  const ul = document.getElementById('factList');
+  if (d.facts.length === 0) {
+    ul.innerHTML = '<li style="color:#64748b;font-size:13px">No facts yet. Paste content above to add some.</li>';
+    return;
+  }
+  ul.innerHTML = d.facts.map((f, i) => \`
+    <li>
+      <span class="fact-num">\${i+1}</span>
+      <span class="fact-text">\${f.replace(/</g,'&lt;')}</span>
+      <button class="btn btn-red btn-sm" onclick="deleteFact(\${i})">✕</button>
+    </li>
+  \`).join('');
+}
+
+async function deleteFact(idx) {
+  if (!confirm('Remove this fact?')) return;
+  const d = await api('/api/knowledge/' + idx, 'DELETE');
+  if (d.ok) loadFacts();
+  else alert('Error: ' + d.error);
+}
+
+async function trainBot() {
+  const content = document.getElementById('content').value.trim();
+  if (!content) { alert('Please paste some content first.'); return; }
+  document.getElementById('loading').style.display = 'block';
+  document.getElementById('result').style.display = 'none';
+  const d = await api('/api/train', 'POST', { content });
+  document.getElementById('loading').style.display = 'none';
+  const res = document.getElementById('result');
+  if (d.ok) {
+    res.className = 'result ok';
+    res.innerHTML = '<strong>✅ ' + d.added.length + ' fact(s) added:</strong><br><br>' +
+      d.added.map(f => '• ' + f.replace(/</g,'&lt;')).join('<br>') +
+      '<br><br>Total facts in knowledge base: <strong>' + d.total + '</strong>';
+    document.getElementById('content').value = '';
+    loadFacts();
+  } else {
+    res.className = 'result err';
+    res.innerHTML = '❌ ' + (d.error || 'Something went wrong.');
+  }
+  res.style.display = 'block';
+}
+
+loadFacts();
+</script>
+</body></html>`;
+}
+
 // ── Dashboard inline (no external file needed) ───────────────
 // Basic dashboard routes built directly here
 (function setupDashboard() {
@@ -2976,7 +3270,59 @@ async function loginWorker(){
     res.json({ ok: true, facts: knowledgeBase });
   });
 
-  // Cash payment from dashboard
+  // Delete a knowledge fact
+  app.delete('/api/knowledge/:index', authMiddleware, (req, res) => {
+    if (req.role !== 'admin') return res.status(403).json({ ok: false, error: 'Admin only' });
+    const idx = parseInt(req.params.index);
+    if (isNaN(idx) || idx < 0 || idx >= knowledgeBase.length)
+      return res.json({ ok: false, error: 'Invalid index' });
+    const removed = knowledgeBase.splice(idx, 1)[0];
+    audit('KNOWLEDGE_DELETED', null, `"${removed.slice(0,80)}" via dashboard`);
+    res.json({ ok: true, removed });
+  });
+
+  // Train — paste or upload any text, Claude extracts Q&As automatically
+  app.post('/api/train', authMiddleware, async (req, res) => {
+    if (req.role !== 'admin') return res.status(403).json({ ok: false, error: 'Admin only' });
+    const { content } = req.body || {};
+    if (!content || content.trim().length < 5)
+      return res.json({ ok: false, error: 'No content provided' });
+
+    let parsed = [];
+    try {
+      const r = await askClaude([{ role: 'user', content:
+        `You are parsing a Q&A list for a DTF print shop knowledge base.\n` +
+        `Extract all question-answer pairs and standalone facts from this text.\n` +
+        `The format may be anything — numbered, dashed, plain, Q:/A:, paragraphs, etc.\n\n` +
+        `TEXT:\n${content.slice(0, 4000)}\n\n` +
+        `Return ONLY a valid JSON array. Each object: {"q":"question or null","a":"answer or fact"}\n` +
+        `For standalone facts (no clear question): {"q":null,"a":"the fact"}\n` +
+        `No markdown. No explanation. JSON only.`
+      }], null, 1500, 20000);
+      const raw = r.content.map(c => c.text || '').join('').trim().replace(/```json|```/g, '').trim();
+      parsed = JSON.parse(raw);
+    } catch(e) {
+      console.error('Train endpoint Claude error:', e.message);
+      return res.json({ ok: false, error: 'Could not parse content. Try a cleaner format.' });
+    }
+
+    if (!Array.isArray(parsed) || parsed.length === 0)
+      return res.json({ ok: false, error: 'No facts extracted.' });
+
+    const added = [];
+    for (const item of parsed) {
+      if (!item.a) continue;
+      const fact = item.q ? `Q: ${item.q} A: ${item.a}` : item.a;
+      knowledgeBase.push(fact);
+      added.push(fact);
+    }
+
+    audit('KNOWLEDGE_TRAIN', null, `${added.length} facts added via dashboard train`);
+    res.json({ ok: true, added, total: knowledgeBase.length });
+  });
+
+  // Train page HTML
+  app.get('/train', (req, res) => { res.send(trainHTML()); });
   app.post('/api/cash-payment', authMiddleware, async (req, res) => {
     const { phone, amount, pin } = req.body || {};
     if (!phone || !amount || !pin) return res.json({ ok: false, error: 'Missing fields' });
