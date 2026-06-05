@@ -1,13 +1,17 @@
 {
-  "name": "dtf-print-bot",
-  "version": "1.0.0",
+  "name": "migo-dtf-print-bot",
+  "version": "35.0.0",
+  "description": "Migo DTF Print Shop — WhatsApp Order Management Bot",
   "main": "index.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "openai": "^4.0.0",
     "express": "^4.18.2",
-    "twilio": "^4.19.0",
-    "@anthropic-ai/sdk": "^0.20.0"
+    "fs-extra": "^11.1.1"
   }
 }
