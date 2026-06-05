@@ -1,6 +1,6 @@
 // ============================================================
 // MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
-// Version : v30
+// Version : v31
 // Date    : June 2026
 // Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
@@ -136,7 +136,7 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── Model — most powerful available ──────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v30';
+const BOT_VERSION = 'v31';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -1200,16 +1200,31 @@ function buildImageQuestion(session) {
 }
 
 function startReceiveTimer(phone, session) {
-  // Change 6: If 2+ files already received, don't fire the 60s auto-timer.
-  // Wait for the customer to send a text message indicating they're done.
-  // The timer only auto-fires for single-file orders.
   const fileCount = session.files.length + session.pendingImages.length + session.unknownFiles.length;
+
   if (fileCount >= 2) {
-    // Cancel any existing timer — do not restart it
-    clearTimeout(timers.get(phone)?.checkin);
-    if (timers.has(phone)) delete timers.get(phone).checkin;
+    // Bulk: set a short 5s timer after the LAST file arrives.
+    // Each new file resets this timer — so it only fires 5s after they stop sending.
+    setTimer(phone, 'checkin', 5000, async () => {
+      if (session.state !== 'receiving') return;
+      // Still have unresolved images without size info — ask for details
+      if (session.pendingImages.length > 0) {
+        session.state = 'asking_image_info';
+        await sendMsg(phone, buildImageQuestion(session));
+        setTimer(phone, 'imageTimeout', 300000, async () => {
+          if (session.state !== 'asking_image_info') return;
+          session.pendingImages = [];
+          await proceedToSummary(phone, session);
+        });
+        return;
+      }
+      // All files have size info — go straight to bill
+      await proceedToSummary(phone, session);
+    });
     return;
   }
+
+  // Single file — wait 60s for more files before asking
   setTimer(phone, 'checkin', 60000, async () => {
     if (session.state !== 'receiving') return;
     if (session.pendingImages.length > 0) {
@@ -1532,13 +1547,9 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
         startReceiveTimer(from, session);
         return null;
       }
-      // Any text from customer when 2+ files are in — treat as "done, send bill"
-      const fileCount = session.files.length + session.pendingImages.length + session.unknownFiles.length;
-      if (fileCount >= 2) {
-        clearTimers(from);
-        await proceedToSummary(from, session);
-        return null;
-      }
+      // Customer sent text while receiving — not a size instruction
+      // If 2+ files in session the 5s timer will fire automatically
+      // Otherwise ask Claude
       return replyWithClaude(msg, session);
     }
     return null;
