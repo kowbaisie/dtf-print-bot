@@ -1,5 +1,14 @@
 // ============================================================
-// MIGO DTF PRINT SHOP — WhatsApp Bot (v20)
+// MIGO DTF PRINT SHOP — WhatsApp Bot (v21)
+// Changes from v20:
+//   • Fix: Double message on image receive — removed immediate
+//     reply from handleImage(); timer sends buildImageQuestion()
+//   • Fix: cleanBody declared before testMode block (TDZ crash)
+//     — test mode now works correctly without ReferenceError
+//   • Fix: Closed hours now answers FAQ questions (prices, hours,
+//     location, MoMo number) then appends closed notice instead
+//     of sending closed message for every single message
+// ============================================================
 // Changes from v19b:
 //   • Upgraded to claude-opus-4-8 (most powerful)
 //   • Welcome message + name capture for new customers
@@ -72,12 +81,16 @@ const SHOP_NUMBER  = '233552719245';                             // 0552719245
 // WasenderAPI base URL (used in all API calls below)
 const WA_API_SEND = 'https://www.wasenderapi.com/api/send-message';
 
+// ── Pricing ───────────────────────────────────────────────────
+const PRICES = { A4: 3.20, A3: 6.40, A2: 16.00 };
+const A4_EQ  = { A4: 1,    A3: 2,    A2: 4     };
+
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 
 // ── Model — most powerful available ──────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v20';
+const BOT_VERSION = 'v21';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -86,7 +99,7 @@ function shopStatus() {
   const d   = new Date(now);
   const hr  = d.getHours();
   const day = d.getDay(); // 0=Sun
-  const open = hr >= 7 && hr < 23; // 7am–11pm
+  const open = hr >= 7 && hr < 22; // 7am–10pm
   return { open, isSunday: day === 0, hour: hr };
 }
 
@@ -1237,10 +1250,10 @@ async function handleImage(from, session, mediaUrl, caption) {
     startReceiveTimer(from, session);
     return null; // ✅ silent — info was in caption/filename
   }
-  // Unknown — ask for details
+  // Unknown — queue for details, timer will send buildImageQuestion covering all pending images
   session.pendingImages.push({ url: mediaUrl, caption, index: session.pendingImages.length + 1 });
   startReceiveTimer(from, session);
-  return `📥 Received! Size? (A4 / A3 / A2) · Qty? · Background? (keep/remove)`;
+  return null; // ✅ No immediate reply — timer sends buildImageQuestion() after 60s inactivity
 }
 
 async function handleDoc(from, session, mediaUrl, caption, filename) {
@@ -2211,6 +2224,9 @@ app.post('/webhook', async (req, res) => {
   console.log(`📩 WA: ${from} — "${(body||'').slice(0,60)}" media=${!!mediaUrl}`);
   logMsg(from, 'in', body || '[media]');
 
+  // Strip WhatsApp forwarded prefix — must be before testMode block uses cleanBody
+  const cleanBody = stripForwarded(body);
+
   // ── Test mode filter ─────────────────────────────────────────
   // When test mode is ON, only owner's private number gets replies
   // Admin commands from the shop number always pass through
@@ -2224,14 +2240,18 @@ app.post('/webhook', async (req, res) => {
     }
   }
 
-  // Strip WhatsApp forwarded prefix
-  const cleanBody = stripForwarded(body);
-
   // ── Shop hours check ─────────────────────────────────────────
   const { open, isSunday } = shopStatus();
   const session = getSession(from);
   if (!open && !cleanBody?.toLowerCase().startsWith('admin')) {
-    await sendMsg(from, `We're currently closed. We're open *7am – 10pm*, Mon–Sun.\nSend your files anytime and we'll process them first thing when we open. 🙏`);
+    const closedNotice = `We're currently closed. We're open *7am – 10pm*, Mon–Sun.\nSend your files anytime and we'll process them first thing when we open. 🙏`;
+    // Still answer FAQ questions when closed — just append closed notice
+    const faqHit = cleanBody ? tryFAQ(cleanBody) : null;
+    if (faqHit) {
+      await sendMsg(from, faqHit + `\n\n` + closedNotice);
+    } else {
+      await sendMsg(from, closedNotice);
+    }
     return;
   }
 
