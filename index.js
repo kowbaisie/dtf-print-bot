@@ -1,6 +1,6 @@
 // ============================================================
 // MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
-// Version : v31
+// Version : v34
 // Date    : June 2026
 // Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
@@ -136,7 +136,7 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── Model — most powerful available ──────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v31';
+const BOT_VERSION = 'v34';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -1180,23 +1180,13 @@ function buildReadyMsg(jobId) {
 
 function buildImageQuestion(session) {
   const imgs = session.pendingImages;
-  // Background question not needed for PNG or PDF files — they already have transparent bg or are print-ready
-  const noBgTypes = /image\/png|application\/pdf/i;
-  const allNoBg = imgs.length > 0 && imgs.every(img => noBgTypes.test(img.mediaType || ''));
+  const count = imgs.length;
 
-  if (imgs.length === 1) {
-    const lines = [`I received your image. Please provide:`, ``,
-      `  1️⃣  *Print size* — A4, A3, or A2?`,
-      `  2️⃣  *Quantity* — How many copies?`];
-    if (!allNoBg) lines.push(`  3️⃣  *Background* — Keep or remove?`);
-    return lines.join('\n');
+  if (count === 1) {
+    return `What size (A4 / A3 / A2) and how many copies?`;
   }
-  const list = imgs.map((img, i) => `  🖼 Image ${i+1}${img.caption ? ` — "${img.caption}"` : ''}`).join('\n');
-  const lines = [`I received *${imgs.length} images*. Please provide for each:`, ``,
-    list, ``, `  1️⃣  Size — A4, A3, or A2`,
-    `  2️⃣  Quantity — copies`];
-  if (!allNoBg) lines.push(`  3️⃣  Background — keep or remove`);
-  return lines.join('\n');
+  // Multiple images — ask for size and qty of each, no listing
+  return `Got *${count} images*. What size and quantity for each? e.g: A4 5, A3 2, A4 10`;
 }
 
 function startReceiveTimer(phone, session) {
@@ -1391,17 +1381,36 @@ async function handleDoc(from, session, mediaUrl, caption, filename) {
   if (isDuplicate) return null;
 
   trackFile(from, mediaUrl, filename || 'file.pdf', 'application/pdf', caption, session);
+
+  // Check if it's a PDF — could be multi-page
+  const isPdf = /\.pdf$/i.test(filename || '') || /application\/pdf/i.test('');
   const orders = await extractOrder(caption, filename, session);
   const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
+
   if (valid.length > 0) {
+    // For PDFs with clear size/qty, still check if multi-page is possible
+    if (isPdf && !caption && !filename?.match(/\d+\s*(page|pg|copy|copies|cop)/i)) {
+      // Size/qty clear from filename — add and ask about pages only if filename has no page info
+      valid.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, caption || filename, ''));
+      startReceiveTimer(from, session);
+      return null;
+    }
     valid.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, caption || filename, ''));
     startReceiveTimer(from, session);
-    return null; // ✅ silent — info was in caption/filename
+    return null;
   }
-  // Unknown — ask for size and qty
+
+  // Unknown PDF — ask which page(s), size, and quantity
+  if (isPdf) {
+    session.unknownFiles.push({ name: filename || 'your file', url: mediaUrl });
+    startReceiveTimer(from, session);
+    return `📄 PDF received! If it has more than 1 page, which page(s) do you want printed?\nAlso — what size (A4 / A3 / A2) and how many copies?`;
+  }
+
+  // Non-PDF unknown file
   session.unknownFiles.push({ name: filename || 'your file', url: mediaUrl });
   startReceiveTimer(from, session);
-  return `📥 File received! What size is *"${filename || 'your file'}"*? (A4 / A3 / A2) and how many copies?`;
+  return `📥 File received! What size (A4 / A3 / A2) and how many copies?`;
 }
 
 // ── File tracking for desktop agent ──────────────────────────
@@ -1664,6 +1673,10 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       return null;
     }
     const lower = (msg || '').toLowerCase();
+    // Cash or no-MoMo indication — remind them payment must be confirmed
+    if (/\b(cash|bring cash|pay cash|no momo|don.?t have momo|no mobile money|pay when i come|pay on arrival|pay at shop|i.?ll pay|coming to pay|bring the money|i have cash|physical(ly)?|in person)\b/i.test(msg)) {
+      return `Printing can only start after Payment Confirmation. Thank you.`;
+    }
     const txIdTyped = (msg || '').match(/\b(\d{8,})\b/);
     if (txIdTyped) {
       session.pendingTxId = txIdTyped[1]; session.awaitingTxId = false;
