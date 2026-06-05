@@ -1,11 +1,17 @@
 // ============================================================
 // MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
-// Version : v27
+// Version : v28
 // Date    : June 2026
 // Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
 //
 // VERSION HISTORY
+//
+// v28 (Jun 2026) — Bill sending fixes
+//   • Fix: sendBill wrapped in try/catch — bill failures now visible
+//     instead of silently dropping the bill message
+//   • Fix: *__COMPLETE__* → *COMPLETE* (WhatsApp renders underscores
+//     as italic markers, breaking the bold formatting)
 //
 // v27 (Jun 2026) — Critical filename parsing fix
 //   • Fix: handleImage now receives and uses filename for parsing
@@ -121,7 +127,7 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── Model — most powerful available ──────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v27';
+const BOT_VERSION = 'v28';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -1223,7 +1229,8 @@ async function proceedToSummary(phone, session) {
   });
 }
 
-async function sendBill(phone, session) {  session.state = 'awaiting_payment';
+async function sendBill(phone, session) {
+  session.state = 'awaiting_payment';
   audit('BILL_SENT', phone, `GHS ${session.totalBill?.toFixed(2)}`);
   await sendMsg(phone, `Order received. Sending your bill now. 🙏`);
 
@@ -1237,13 +1244,18 @@ async function sendBill(phone, session) {  session.state = 'awaiting_payment';
   });
 
   setTimeout(async () => {
-    await sendMsg(phone, buildBill(session));
-    // Reminder to send receipt
-    await sendMsg(phone, [
-      `📌 Please send your payment receipt or MoMo confirmation screenshot to *__COMPLETE__* your order.`,
-      ``,
-      `Printing can *ONLY* start *AFTER* payment. 🙏`,
-    ].join('\n'));
+    try {
+      const billMsg = buildBill(session);
+      await sendMsg(phone, billMsg);
+      await sendMsg(phone, [
+        `📌 Please send your payment receipt or MoMo confirmation screenshot to *COMPLETE* your order.`,
+        ``,
+        `Printing can *ONLY* start *AFTER* payment. 🙏`,
+      ].join('\n'));
+    } catch(e) {
+      console.error('❌ sendBill inner error:', e.message);
+      alertOwner(`⚠️ Bill failed to send to ${displayPhone(phone)}: ${e.message}`).catch(()=>{});
+    }
     setTimer(phone, 'pay1', 600000, () => {
       if (session.state === 'awaiting_payment')
         sendMsg(phone, `⏰ Reminder: Pay *GHS ${session.totalBill?.toFixed(2)}* to MoMo *0552719245*. 🙏`);
