@@ -1,6 +1,6 @@
 // ============================================================
 // MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
-// Version : v44
+// Version : v45
 // Date    : June 2026
 // Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
@@ -136,7 +136,7 @@ const openai = new OpenAI({ apiKey: OPENAI_KEY });
 // ── Model ─────────────────────────────────────────────────────
 const MODEL = 'gpt-5.5-2026-04-23';
 
-const BOT_VERSION = 'v44';
+const BOT_VERSION = 'v45';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -1415,20 +1415,29 @@ function buildBill(order) {
   }
   const grandTotal = subtotal + pressingFee;
   order.totalBill = grandTotal;
-  const items = lines.map(l => `🖨 ${l.size}  ·  ${l.qty} sheet${l.qty!==1?'s':''}  ·  *GHS ${l.price.toFixed(2)}*`).join('\n');
+  const items = lines.map(l =>
+    `🖨 *${l.size}*  ×  ${l.qty} sheet${l.qty!==1?'s':''}  =  *GHS ${l.price.toFixed(2)}*`
+  ).join('\n');
   const pressingLine = pressingFee > 0
-    ? `\n👕 Pressing  ·  *GHS ${pressingFee.toFixed(2)}*`
+    ? `\n👕 *Pressing*  =  *GHS ${pressingFee.toFixed(2)}*`
     : '';
+  const orderRef = order.ref > 1 ? `\n📋 Order #${order.ref}` : '';
   return [
-    `--------------------`, `🧾 *MIGO PRINT SHOP*`,
-    `📍 _Circle · Near Benz Gate · Accra_`, `--------------------`,
-    `📄 *ORDER DETAILS*`, `--------------------`,
+    `--------------------`,
+    `🧾 *MIGO PRINT SHOP*${orderRef}`,
+    `📍 Circle · Near Benz Gate · Accra`,
+    `--------------------`,
+    `📄 *ORDER BREAKDOWN*`,
+    `--------------------`,
     items + pressingLine,
     `--------------------`,
     `💰 *TOTAL:  GHS ${grandTotal.toFixed(2)}*`,
-    `--------------------`, `🟡 *MTN MOBILE MONEY*`, ``,
-    `   📱 *0552719245*`, `   👤 *KOW HABIB BAISIE*`, ``,
-    `🗓 ${nowStr()}`, `--------------------`,
+    `--------------------`,
+    `🟡 *MTN MOBILE MONEY*`, ``,
+    `   📱 *0552719245*`,
+    `   👤 *KOW HABIB BAISIE*`, ``,
+    `🗓 ${nowStr()}`,
+    `--------------------`,
     `_Thank you for choosing Migo!_ 🙏`,
   ].join('\n');
 }
@@ -1566,7 +1575,7 @@ async function sendBill(phone, session, order) {
     try {
       await sendMsg(phone, billMsg);
       await sendMsg(phone, [
-        `📌 Please send your payment receipt or MoMo confirmation screenshot to complete your order.`,
+        `📌 Please send your MoMo receipt to complete your order.`,
         `Printing can *ONLY* start *AFTER* payment. 🙏`,
       ].join('\n'));
     } catch(e) {
@@ -1575,15 +1584,15 @@ async function sendBill(phone, session, order) {
     }
     // Gentle reminders — no cancellation, no threats
     setTimer(phone, 'pay1', 600000, () => {
-      if (session.state === 'awaiting_payment')
+      if (order.state === 'awaiting_payment')
         sendMsg(phone, `Please send your payment receipt to complete your order. 🙏`);
     });
     setTimer(phone, 'pay2', 1800000, () => {
-      if (session.state === 'awaiting_payment')
+      if (order.state === 'awaiting_payment')
         sendMsg(phone, `Please send your payment receipt to complete your order. 🙏`);
     });
     setTimer(phone, 'pay3', 3600000, () => {
-      if (session.state === 'awaiting_payment')
+      if (order.state === 'awaiting_payment')
         sendMsg(phone, `Please send your payment receipt to complete your order. 🙏`);
     });
   }, 2000);
@@ -1780,6 +1789,12 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       }
     }
     return greetingReply(msg);
+  }
+
+  // ── FAQ quick-match — runs for ALL states ─────────────────
+  if (msg) {
+    const faqAnswer = tryFAQ(msg);
+    if (faqAnswer) return faqAnswer;
   }
 
   // ── New message while awaiting payment ───────────────────
@@ -2947,7 +2962,7 @@ function adminHTML() {
   --amber:#ffb020;
   --blue:#4d9fff;
   --red:#ff4d6a;
-  --nav-h:64px;
+  --nav-h:56px;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif;min-height:100vh;padding-bottom:calc(var(--nav-h) + 12px)}
@@ -3028,10 +3043,10 @@ tr:hover td{background:#ffffff04}
 
 /* ── NAV ── */
 nav{position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:2px solid var(--border);display:grid;grid-template-columns:repeat(5,1fr);height:var(--nav-h);z-index:100}
-.nav-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;cursor:pointer;color:var(--muted);font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;border:none;background:none;font-family:inherit;transition:color .15s;padding:0;border-top:3px solid transparent;transition:all .15s}
-.nav-btn:hover{color:var(--text)}
+.nav-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;cursor:pointer;color:#ffffff;font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:.5px;border:none;background:none;font-family:inherit;transition:color .15s;padding:0;border-top:3px solid transparent;transition:all .15s}
+.nav-btn:hover{color:var(--amber)}
 .nav-btn.on{color:var(--amber);border-top-color:var(--amber)}
-.nav-icon{font-size:20px;line-height:1}
+.nav-icon{font-size:18px;line-height:1}
 
 /* ── MONO ── */
 .mono{font-family:'JetBrains Mono',monospace;font-size:12px}
@@ -3150,7 +3165,7 @@ ${`<!-- TEST BANNER -->`}
 
 <script>
 var TK=localStorage.getItem('migo_token');
-if(!TK)window.location='/login';
+if(!TK)window.location.href='/login';
 
 function api(p,m,b){return fetch(p,{method:m||'GET',headers:{'Content-Type':'application/json','X-Dashboard-Token':TK},body:b?JSON.stringify(b):null}).then(function(r){return r.json();});}
 
@@ -3162,8 +3177,8 @@ function sw(i){
   [lq,lp,lw,lr,la][i]();
 }
 
-var stateBadge={awaiting_payment:'b-amber',processing:'b-blue',confirming:'b-amber',ready:'b-green',idle:'b-red',receiving:'b-blue'};
-var stateLabel={awaiting_payment:'Awaiting Payment',processing:'Printing',confirming:'Confirming',ready:'Ready',idle:'Idle',receiving:'Receiving'};
+var stateBadge={awaiting_payment:'b-amber',processing:'b-blue',confirming:'b-amber',ready:'b-green',idle:'b-red',receiving:'b-blue',asked_done:'b-blue',asking_image_info:'b-blue',asking_pressing:'b-blue'};
+var stateLabel={awaiting_payment:'Awaiting Payment',processing:'Printing',confirming:'Confirming',ready:'Ready ✅',idle:'Idle',receiving:'Receiving Files',asked_done:'Done?',asking_image_info:'Asking Details',asking_pressing:'Asking Pressing'};
 
 function lq(){
   api('/api/stats').then(function(st){
@@ -3174,15 +3189,20 @@ function lq(){
   });
   api('/api/sessions').then(function(se){
     if(!se.ok)return;
-    var rows=(se.sessions||[]).map(function(s,i){
+    // Show ALL sessions except pure idle with no files
+    var all=(se.sessions||[]).filter(function(s){
+      return s.state!=='idle' || s.files>0 || s.totalBill;
+    });
+    var rows=all.map(function(s){
       var btn='';
       if(s.state==='processing') btn='<button class="btn-action btn-green" onclick="rd(\''+s.phone+'\')">✅ Ready</button>';
       if(s.state==='awaiting_payment') btn='<button class="btn-action btn-blue" onclick="showCash(\''+s.phone+'\','+(s.totalBill||0).toFixed(2)+')">💵 Cash</button>';
       var qp=s.queuePosition?'#'+s.queuePosition:'—';
-      var bill=s.totalBill?'<span style="color:var(--green);font-weight:800">GHS '+s.totalBill.toFixed(2)+'</span>':'—';
-      var jid=s.jobId?'<span class="mono" style="color:var(--muted)">'+s.jobId+'</span>':'—';
+      var bill=s.totalBill?'<b style="color:var(--green)">GHS '+s.totalBill.toFixed(2)+'</b>':'—';
+      var jid=s.jobId?'<span class="mono" style="color:var(--muted);font-size:11px">'+s.jobId+'</span>':'—';
       var badge='<span class="badge '+(stateBadge[s.state]||'b-blue')+'">'+(stateLabel[s.state]||s.state)+'</span>';
-      return '<tr><td style="font-weight:800;color:var(--muted)">'+qp+'</td><td style="font-weight:700">'+(s.customerName||s.phone)+'</td><td>'+badge+'</td><td style="font-weight:700">'+s.files+'</td><td>'+bill+'</td><td>'+jid+'</td><td>'+btn+'</td></tr>';
+      var name='<b>'+(s.customerName||s.phone)+'</b>';
+      return '<tr><td style="font-weight:800;color:var(--muted)">'+qp+'</td><td>'+name+'</td><td>'+badge+'</td><td style="font-weight:700">'+s.files+'</td><td>'+bill+'</td><td>'+jid+'</td><td>'+btn+'</td></tr>';
     }).join('');
     document.getElementById('qb').innerHTML=rows||'<tr><td colspan="7"><div class="empty"><div class="empty-icon">🖨️</div><div class="empty-txt">No active jobs</div></div></td></tr>';
   });
@@ -3277,7 +3297,7 @@ function la(){
   });
 }
 
-function logout(){localStorage.removeItem('migo_token');localStorage.removeItem('migo_role');window.location='/login';}
+function logout(){localStorage.removeItem('migo_token');localStorage.removeItem('migo_role');window.location.href='/login';}
 
 // Close modal on backdrop click
 document.getElementById('cm').addEventListener('click',function(e){if(e.target===this)closeCash();});
@@ -3298,7 +3318,7 @@ function workerHTML() {
 <title>Migo — Worker View</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#0a0a0f;--surface:#111118;--card:#18181f;--border:#2a2a35;--text:#f0f0f5;--muted:#6b6b80;--green:#00d68f;--amber:#ffb020;--blue:#4d9fff;--red:#ff4d6a;--nav-h:64px;}
+:root{--bg:#0a0a0f;--surface:#111118;--card:#18181f;--border:#2a2a35;--text:#f0f0f5;--muted:#6b6b80;--green:#00d68f;--amber:#ffb020;--blue:#4d9fff;--red:#ff4d6a;--nav-h:56px;}
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif;min-height:100vh;padding-bottom:calc(var(--nav-h)+12px)}
 .hd{background:var(--surface);border-bottom:2px solid var(--border);padding:0 16px;height:56px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:100}
@@ -3343,10 +3363,10 @@ tr:hover td{background:#ffffff04}
 .empty-icon{font-size:40px;margin-bottom:10px;opacity:.5}
 .empty-txt{font-size:13px;font-weight:600}
 nav{position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:2px solid var(--border);display:grid;grid-template-columns:repeat(2,1fr);height:var(--nav-h);z-index:100}
-.nav-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;cursor:pointer;color:var(--muted);font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;border:none;background:none;font-family:inherit;transition:all .15s;border-top:3px solid transparent}
-.nav-btn:hover{color:var(--text)}
+.nav-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;cursor:pointer;color:#ffffff;font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:.5px;border:none;background:none;font-family:inherit;transition:all .15s;border-top:3px solid transparent}
+.nav-btn:hover{color:var(--amber)}
 .nav-btn.on{color:var(--blue);border-top-color:var(--blue)}
-.nav-icon{font-size:22px;line-height:1}
+.nav-icon{font-size:18px;line-height:1}
 .mono{font-family:'JetBrains Mono',monospace;font-size:12px}
 </style>
 </head>
@@ -3410,7 +3430,7 @@ nav{position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:
 
 <script>
 var TK=localStorage.getItem('migo_token');
-if(!TK)window.location='/login';
+if(!TK)window.location.href='/login';
 
 function api(p,m,b){return fetch(p,{method:m||'GET',headers:{'Content-Type':'application/json','X-Dashboard-Token':TK},body:b?JSON.stringify(b):null}).then(function(r){return r.json();});}
 
@@ -3483,7 +3503,7 @@ function lp(){
 }
 
 document.getElementById('cm').addEventListener('click',function(e){if(e.target===this)closeCash();});
-function logout(){localStorage.removeItem('migo_token');localStorage.removeItem('migo_role');window.location='/login';}
+function logout(){localStorage.removeItem('migo_token');localStorage.removeItem('migo_role');window.location.href='/login';}
 
 load();
 setInterval(load,15000);
@@ -3559,7 +3579,7 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-ser
     </div>
     <div class="err" id="err"></div>
   </div>
-  <div class="ver">Migo Bot v40 · Circle, Accra</div>
+  <div class="ver">Migo Bot v45 · Circle, Accra</div>
 </div>
 <script>
 function setTab(t){
