@@ -1,6 +1,6 @@
 // ============================================================
 // MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
-// Version : v45
+// Version : v47
 // Date    : June 2026
 // Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
@@ -136,7 +136,7 @@ const openai = new OpenAI({ apiKey: OPENAI_KEY });
 // ── Model ─────────────────────────────────────────────────────
 const MODEL = 'gpt-5.5-2026-04-23';
 
-const BOT_VERSION = 'v45';
+const BOT_VERSION = 'v47';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -484,7 +484,7 @@ YOUR RESPONSIBILITIES:
 4. If files are waiting for size/qty → ask clearly, set action="ask_size_qty"
 5. Answer FAQs about location, prices, hours, MoMo number directly
 6. If customer mentions cash/no MoMo → say exactly: "Printing can only start after Payment Confirmation. Thank you."
-7. For greetings → mirror the greeting warmly and stop. Nothing else. No DTF prompt.
+7. For ANY greeting or informal opener (hi, hello, good morning, afernon, morning, yoo man, whatsup, migo, dtf, etc — even misspelled or informal) → reply with the SHORTEST possible warm response. Just 1-3 words + emoji. e.g. Hi! 👋 or Good morning! 😊. Nothing more. Do NOT add DTF prompt.
 8. If you cannot answer → say "Let me get someone to assist you shortly."
 9. AUDIT your response before returning — make sure sizes, quantities and prices are 100% correct
 10. NEVER swap sizes between files. Image 1 = first file mentioned, Image 2 = second file, etc.
@@ -535,7 +535,7 @@ YOUR RESPONSIBILITIES:
 4. If files are waiting for size/qty → ask clearly, set action="ask_size_qty"
 5. Answer FAQs about location, prices, hours, MoMo number directly
 6. If customer mentions cash/no MoMo → say exactly: "Printing can only start after Payment Confirmation. Thank you."
-7. For greetings → mirror the greeting warmly and stop. Nothing else. No DTF prompt.
+7. For ANY greeting or informal opener (hi, hello, good morning, afernon, morning, yoo man, whatsup, migo, dtf, etc — even misspelled or informal) → reply with the SHORTEST possible warm response. Just 1-3 words + emoji. e.g. Hi! 👋 or Good morning! 😊. Nothing more. Do NOT add DTF prompt.
 8. If you cannot answer → say "Let me get someone to assist you shortly."
 9. AUDIT your response before returning — make sure sizes, quantities and prices are 100% correct
 10. NEVER swap sizes between files. Image 1 = first file mentioned, Image 2 = second file, etc.
@@ -1777,24 +1777,17 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   // Get active order
   let order = getActiveOrder(session);
 
-  // ── Greeting → always start fresh if no active pending order ─
-  if (msg && isGreeting(msg)) {
-    const pendingOrder = getPendingOrder(session);
-    if (!pendingOrder && ['idle','receiving','asked_done','asking_image_info','asking_pressing'].includes(order.state)) {
-      // Clear timers and reset active order
-      clearTimers(from);
-      if (order.state !== 'idle' || order.files.length > 0) {
-        // Start new order
-        order = startNewOrder(session);
-      }
-    }
-    return greetingReply(msg);
-  }
 
   // ── FAQ quick-match — runs for ALL states ─────────────────
   if (msg) {
     const faqAnswer = tryFAQ(msg);
     if (faqAnswer) return faqAnswer;
+  }
+
+  // ── New message — reset session if idle and no pending order ─
+  if (msg && order.state === 'idle' && order.files.length === 0) {
+    const pendingOrder = getPendingOrder(session);
+    if (!pendingOrder) clearTimers(from);
   }
 
   // ── New message while awaiting payment ───────────────────
@@ -3178,7 +3171,7 @@ function sw(i){
 }
 
 var stateBadge={awaiting_payment:'b-amber',processing:'b-blue',confirming:'b-amber',ready:'b-green',idle:'b-red',receiving:'b-blue',asked_done:'b-blue',asking_image_info:'b-blue',asking_pressing:'b-blue'};
-var stateLabel={awaiting_payment:'Awaiting Payment',processing:'Printing',confirming:'Confirming',ready:'Ready ✅',idle:'Idle',receiving:'Receiving Files',asked_done:'Done?',asking_image_info:'Asking Details',asking_pressing:'Asking Pressing'};
+var stateLabel={awaiting_payment:'Awaiting Payment',processing:'Printing',confirming:'Confirming',ready:'Ready',idle:'Idle',receiving:'Receiving',asked_done:'Done?',asking_image_info:'Asking Details',asking_pressing:'Pressing?'};
 
 function lq(){
   api('/api/stats').then(function(st){
@@ -3189,35 +3182,42 @@ function lq(){
   });
   api('/api/sessions').then(function(se){
     if(!se.ok)return;
-    // Show ALL sessions except pure idle with no files
     var all=(se.sessions||[]).filter(function(s){
-      return s.state!=='idle' || s.files>0 || s.totalBill;
+      return s.state!=='idle'||s.files>0||s.totalBill;
     });
     var rows=all.map(function(s){
       var btn='';
-      if(s.state==='processing') btn='<button class="btn-action btn-green" onclick="rd(\''+s.phone+'\')">✅ Ready</button>';
-      if(s.state==='awaiting_payment') btn='<button class="btn-action btn-blue" onclick="showCash(\''+s.phone+'\','+(s.totalBill||0).toFixed(2)+')">💵 Cash</button>';
-      var qp=s.queuePosition?'#'+s.queuePosition:'—';
-      var bill=s.totalBill?'<b style="color:var(--green)">GHS '+s.totalBill.toFixed(2)+'</b>':'—';
-      var jid=s.jobId?'<span class="mono" style="color:var(--muted);font-size:11px">'+s.jobId+'</span>':'—';
-      var badge='<span class="badge '+(stateBadge[s.state]||'b-blue')+'">'+(stateLabel[s.state]||s.state)+'</span>';
+      if(s.state==='processing'){
+        btn='<button class="btn-action btn-green" onclick="rd(this)" data-phone="'+s.phone+'">Ready</button>';
+      }
+      if(s.state==='awaiting_payment'){
+        var amt=s.totalBill?s.totalBill.toFixed(2):'0.00';
+        btn='<button class="btn-action btn-blue" onclick="showCash(this)" data-phone="'+s.phone+'" data-amt="'+amt+'">Cash</button>';
+      }
+      var qp=s.queuePosition?'#'+s.queuePosition:'&mdash;';
+      var bill=s.totalBill?'<b style="color:#00d68f">GHS '+s.totalBill.toFixed(2)+'</b>':'&mdash;';
+      var jid=s.jobId?'<span style="font-size:11px;color:#6b6b80">'+s.jobId+'</span>':'&mdash;';
+      var bclass=stateBadge[s.state]||'b-blue';
+      var blabel=stateLabel[s.state]||s.state;
+      var badge='<span class="badge '+bclass+'">'+blabel+'</span>';
       var name='<b>'+(s.customerName||s.phone)+'</b>';
-      return '<tr><td style="font-weight:800;color:var(--muted)">'+qp+'</td><td>'+name+'</td><td>'+badge+'</td><td style="font-weight:700">'+s.files+'</td><td>'+bill+'</td><td>'+jid+'</td><td>'+btn+'</td></tr>';
+      return '<tr><td>'+qp+'</td><td>'+name+'</td><td>'+badge+'</td><td>'+s.files+'</td><td>'+bill+'</td><td>'+jid+'</td><td>'+btn+'</td></tr>';
     }).join('');
-    document.getElementById('qb').innerHTML=rows||'<tr><td colspan="7"><div class="empty"><div class="empty-icon">🖨️</div><div class="empty-txt">No active jobs</div></div></td></tr>';
+    document.getElementById('qb').innerHTML=rows||'<tr><td colspan="7" style="text-align:center;padding:24px;color:#6b6b80">No active jobs</td></tr>';
   });
 }
 
-function rd(phone){
-  if(!confirm('Mark job as ready and send pickup code?'))return;
-  api('/api/mark-ready','POST',{phone:phone}).then(function(r){
-    if(r.ok)lq(); else alert(r.error||'Failed');
-  });
+function rd(el){
+  var phone=el.getAttribute('data-phone');
+  if(!confirm('Mark ready and send pickup code?'))return;
+  api('/api/mark-ready','POST',{phone:phone}).then(function(r){if(r.ok)lq();else alert(r.error||'Failed');});
 }
 
 var cashPhone='',cashAmt=0;
-function showCash(phone,amt){
-  cashPhone=phone;cashAmt=amt;
+function showCash(el){
+  cashPhone=el.getAttribute('data-phone');
+  cashAmt=parseFloat(el.getAttribute('data-amt'))||0;
+  var phone=cashPhone, amt=cashAmt;
   document.getElementById('cm-phone').textContent=phone.replace('@s.whatsapp.net','');
   document.getElementById('cm-amt').textContent='GHS '+amt.toFixed(2);
   document.getElementById('cm-custom').value='';
@@ -3579,7 +3579,7 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-ser
     </div>
     <div class="err" id="err"></div>
   </div>
-  <div class="ver">Migo Bot v45 · Circle, Accra</div>
+  <div class="ver">Migo Bot v47 · Circle, Accra</div>
 </div>
 <script>
 function setTab(t){
