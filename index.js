@@ -1,6 +1,6 @@
 // ============================================================
 // MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
-// Version : v34
+// Version : v35
 // Date    : June 2026
 // Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
@@ -105,14 +105,14 @@
 const express   = require('express');
 const crypto    = require('crypto');
 const https     = require('https');
-const Anthropic = require('@anthropic-ai/sdk');
+const OpenAI  = require('openai');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 // ── Config ────────────────────────────────────────────────────
-const ANTHROPIC_KEY  = process.env.ANTHROPIC_API_KEY;
+const OPENAI_KEY     = process.env.OPENAI_API_KEY;
 const ADMIN_PIN      = process.env.ADMIN_PIN      || '1914';
 const ADMIN_DASH_PW  = process.env.ADMIN_DASHBOARD_PASSWORD || '1914';
 const WASENDER_KEY   = process.env.WASENDER_API_KEY;
@@ -131,12 +131,12 @@ const WA_API_SEND = 'https://www.wasenderapi.com/api/send-message';
 const PRICES = { A4: 3.20, A3: 6.40, A2: 16.00 };
 const A4_EQ  = { A4: 1,    A3: 2,    A2: 4     };
 
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
+const openai = new OpenAI({ apiKey: OPENAI_KEY });
 
-// ── Model — most powerful available ──────────────────────────
-const MODEL = 'claude-opus-4-8';
+// ── Model ─────────────────────────────────────────────────────
+const MODEL = 'gpt-5.5-2026-04-23';
 
-const BOT_VERSION = 'v34';
+const BOT_VERSION = 'v35';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -410,14 +410,19 @@ async function alertOwner(body) {
   });
 }
 
-// ── Claude — all calls use MODEL ──────────────────────────────
-async function askClaude(messages, system, maxTokens = 400, timeoutMs = 10000) {
-  const opts = { model: MODEL, max_tokens: maxTokens, messages };
-  if (system) opts.system = system;
+// ── GPT-5.5 — all calls use MODEL ────────────────────────────
+async function askGPT(messages, system, maxTokens = 400, timeoutMs = 15000) {
+  const msgs = system
+    ? [{ role: 'system', content: system }, ...messages]
+    : messages;
   return Promise.race([
-    anthropic.messages.create(opts),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('Claude timeout')), timeoutMs)),
+    openai.chat.completions.create({ model: MODEL, max_tokens: maxTokens, messages: msgs }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('GPT timeout')), timeoutMs)),
   ]);
+}
+
+function gptText(r) {
+  return (r?.choices?.[0]?.message?.content || '').trim();
 }
 
 // ── Knowledge base system prompt ─────────────────────────────
@@ -446,21 +451,21 @@ function addToHistory(s, role, content) {
   if (s.chatHistory.length > 40) s.chatHistory = s.chatHistory.slice(-40);
 }
 
-async function replyWithClaude(msg, session) {
+async function replyWithGPT(msg, session) {
   addToHistory(session, 'user', msg);
   try {
-    const r = await askClaude(session.chatHistory, buildShopSystem(session), 400, 10000);
-    const reply = r.content.map(c => c.text || '').join('').trim();
+    const r = await askGPT(session.chatHistory, buildShopSystem(session), 400, 15000);
+    const reply = gptText(r);
     if (reply) addToHistory(session, 'assistant', reply);
 
     // Customer name capture — try to extract name from conversation
     if (!session.customerName && session.chatHistory.length >= 2) {
       try {
-        const nameR = await askClaude([{ role: 'user', content:
+        const nameR = await askGPT([{ role: 'user', content:
           `From this conversation snippet: ${JSON.stringify(session.chatHistory.slice(-4))}\n`+
           `Did the customer mention their name? Return ONLY valid JSON: {"name":"Kofi"} or {"name":null}` }],
           null, 50, 3000);
-        const parsed = JSON.parse(nameR.content.map(c=>c.text||'').join('').trim().replace(/```json|```/g,''));
+        const parsed = JSON.parse(gptText(nameR).replace(/```json|```/g,''));
         if (parsed?.name && parsed.name.length > 1) {
           session.customerName = parsed.name;
           audit('NAME_CAPTURED', session.phone, parsed.name);
@@ -480,7 +485,7 @@ async function replyWithClaude(msg, session) {
     }
     return reply || null;
   } catch (e) {
-    console.error('Claude error:', e.message);
+    console.error('GPT error:', e.message);
     return null;
   }
 }
@@ -973,18 +978,16 @@ async function extractReceiptFromImage(mediaUrl) {
   try {
     const { buffer, mime } = await downloadBuffer(mediaUrl);
     const base64 = buffer.toString('base64');
-    // Ensure mime is a valid image type for Anthropic
     const safeMime = ['image/jpeg','image/png','image/gif','image/webp'].includes(mime)
       ? mime : 'image/jpeg';
-    const r = await anthropic.messages.create({
+    const r = await openai.chat.completions.create({
       model: MODEL, max_tokens: 200,
       messages: [{ role: 'user', content: [
-        { type: 'image', source: { type: 'base64', media_type: safeMime, data: base64 } },
-        { type: 'text', text: `Ghana MTN MoMo receipt. Extract ONLY valid JSON:
-{"amount":<number|null>,"txId":"<digits|null>","reference":"<string|null>","senderName":"<string|null>"}` },
+        { type: 'image_url', image_url: { url: `data:${safeMime};base64,${base64}` } },
+        { type: 'text', text: `Ghana MTN MoMo receipt. Extract ONLY valid JSON:\n{"amount":<number|null>,"txId":"<digits|null>","reference":"<string|null>","senderName":"<string|null>"}` },
       ]}],
     });
-    return JSON.parse(r.content.map(c => c.text || '').join('').trim().replace(/```json|```/g, ''));
+    return JSON.parse(gptText(r).replace(/```json|```/g, '').trim());
   } catch (e) {
     console.error('Receipt OCR error:', e.message);
     return null;
@@ -1024,8 +1027,8 @@ Return ONLY a valid JSON array. No text. No markdown. No explanation.
 Each object: {"size":"A4|A3|A2","qty":number,"isUnknown":false,"isMoreOf":"A4|A3|A2|null"}
 If cannot parse: [{"size":null,"qty":null,"isUnknown":true,"isMoreOf":null}]`;
   try {
-    const r = await askClaude([{ role: 'user', content: prompt }], null, 300, 8000);
-    const raw = r.content.map(c => c.text || '').join('').trim();
+    const r = await askGPT([{ role: 'user', content: prompt }], null, 300, 8000);
+    const raw = gptText(r);
     const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
     return Array.isArray(parsed) ? parsed : [parsed];
   } catch (e) {
@@ -1052,8 +1055,8 @@ CRITICAL RULES:
 - NEVER assign a size that was not mentioned by the customer.
 - NEVER default to A4 when the customer has specified a different size.`;
   try {
-    const r = await askClaude([{ role: 'user', content: prompt }], null, 400, 8000);
-    const raw = r.content.map(c => c.text || '').join('').trim();
+    const r = await askGPT([{ role: 'user', content: prompt }], null, 400, 8000);
+    const raw = gptText(r);
     const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
     return Array.isArray(parsed) ? parsed : [];
   } catch (e) {
@@ -1523,7 +1526,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
         return `Got it! Please send your file(s). 📎`;
       }
       // Claude — fallback to DTF prompt if no reply
-      const claudeReply = await replyWithClaude(msg, session);
+      const claudeReply = await replyWithGPT(msg, session);
       return claudeReply || `Hi! Please send your DTF files. 🖨️`;
     }
     return null;
@@ -1559,7 +1562,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       // Customer sent text while receiving — not a size instruction
       // If 2+ files in session the 5s timer will fire automatically
       // Otherwise ask Claude
-      return replyWithClaude(msg, session);
+      return replyWithGPT(msg, session);
     }
     return null;
   }
@@ -1694,7 +1697,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     }
     if (/how much|total|bill|balance|amount/.test(lower))
       return `Total: *GHS ${session.totalBill?.toFixed(2) || '—'}*\n🟡 MoMo *0552719245* (Kow Habib Baisie)`;
-    return replyWithClaude(msg, session);
+    return replyWithGPT(msg, session);
   }
 
   // ── PROCESSING ───────────────────────────────────────────────
@@ -1704,7 +1707,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType, filename);
       return handleDoc(from, session, mediaUrl, msg, filename);
     }
-    return replyWithClaude(msg, session);
+    return replyWithGPT(msg, session);
   }
 
   // ── READY ────────────────────────────────────────────────────
@@ -1732,7 +1735,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       lastRating.comment = msg;
       return `Thank you for letting us know. We take all feedback seriously. 🙏`;
     }
-    return replyWithClaude(msg, session);
+    return replyWithGPT(msg, session);
   }
   return null;
 }
@@ -2022,7 +2025,7 @@ async function handleAdmin(from, msg) {
     // Use Claude to parse any format into clean Q&A pairs
     let parsed = [];
     try {
-      const r = await askClaude([{ role: 'user', content:
+      const r = await askGPT([{ role: 'user', content:
         `You are parsing a Q&A list for a DTF print shop knowledge base.\n` +
         `Extract all question-answer pairs from this text. The format may be messy — ` +
         `numbered, dashed, plain alternating lines, Q:/A: prefixed, or anything else.\n\n` +
@@ -2031,11 +2034,11 @@ async function handleAdmin(from, msg) {
         `If a line is a standalone fact (not a Q&A), use {"q":null,"a":"the fact"}\n` +
         `No markdown. No explanation. JSON only.`
       }], null, 800, 12000);
-      const raw = r.content.map(c => c.text || '').join('').trim().replace(/```json|```/g, '').trim();
+      const raw = gptText(r).replace(/```json|```/g, '').trim();
       parsed = JSON.parse(raw);
     } catch(e) {
       // Fallback — add each non-empty line as a raw fact
-      console.error('learnbulk Claude parse error:', e.message);
+      console.error('learnbulk GPT parse error:', e.message);
       parsed = content.split(/\r?\n/).filter(l => l.trim().length > 3)
         .map(l => ({ q: null, a: l.trim() }));
     }
@@ -3333,7 +3336,7 @@ loadFacts();
 
     let parsed = [];
     try {
-      const r = await askClaude([{ role: 'user', content:
+      const r = await askGPT([{ role: 'user', content:
         `You are parsing a Q&A list for a DTF print shop knowledge base.\n` +
         `Extract all question-answer pairs and standalone facts from this text.\n` +
         `The format may be anything — numbered, dashed, plain, Q:/A:, paragraphs, etc.\n\n` +
@@ -3342,7 +3345,7 @@ loadFacts();
         `For standalone facts (no clear question): {"q":null,"a":"the fact"}\n` +
         `No markdown. No explanation. JSON only.`
       }], null, 1500, 20000);
-      const raw = r.content.map(c => c.text || '').join('').trim().replace(/```json|```/g, '').trim();
+      const raw = gptText(r).replace(/```json|```/g, '').trim();
       parsed = JSON.parse(raw);
     } catch(e) {
       console.error('Train endpoint Claude error:', e.message);
@@ -3455,7 +3458,7 @@ app.listen(PORT, async () => {
   console.log(`🚀 MIGO Print Bot ${BOT_VERSION} — port ${PORT}`);
   console.log(`   WasenderAPI : ${WASENDER_KEY ? '✅ set' : 'NOT SET ❌'}`);
   console.log(`   Session     : ${WASENDER_SID}`);
-  console.log(`   Anthropic   : ${ANTHROPIC_KEY ? '✅ set' : 'NOT SET ❌'}`);
+  console.log(`   OpenAI      : ${OPENAI_KEY ? '✅ set' : 'NOT SET ❌'}`);
   console.log(`   Model       : ${MODEL}`);
   console.log(`   Admin PIN   : ${ADMIN_PIN !== '1914' ? '✅ custom' : '⚠️  default 1914'}`);
   console.log(`   Owner       : +${OWNER_NUMBER}`);
