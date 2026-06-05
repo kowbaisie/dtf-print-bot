@@ -1,6 +1,6 @@
 // ============================================================
 // MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
-// Version : v29
+// Version : v30
 // Date    : June 2026
 // Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
@@ -136,7 +136,7 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── Model — most powerful available ──────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v29';
+const BOT_VERSION = 'v30';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -149,7 +149,21 @@ function shopStatus() {
   return { open, isSunday: day === 0, hour: hr };
 }
 
-// ── FAQ quick-match ───────────────────────────────────────────
+// ── Greeting detector ────────────────────────────────────────
+// Any greeting → mirror it + "Please send your DTF files."
+function isGreeting(msg) {
+  return /^\s*(hi+|hello+|hey+|good\s*(morning|afternoon|evening|night|day)|howdy|greetings|sup|what'?s up|yo\b|hy|helo|holla|morning|afternoon|evening|night|how are you|how r u)\b/i.test((msg||'').trim());
+}
+function greetingReply(msg) {
+  // Mirror the greeting back naturally
+  const m = (msg||'').trim();
+  if (/good\s*morning/i.test(m)) return `Good morning! Please send your DTF files. 🖨️`;
+  if (/good\s*afternoon/i.test(m)) return `Good afternoon! Please send your DTF files. 🖨️`;
+  if (/good\s*evening/i.test(m)) return `Good evening! Please send your DTF files. 🖨️`;
+  if (/good\s*night/i.test(m)) return `Good night! Please send your DTF files. 🖨️`;
+  if (/good\s*day/i.test(m)) return `Good day! Please send your DTF files. 🖨️`;
+  return `Hi! Please send your DTF files. 🖨️`;
+}
 const FAQ = [
   { p: /where.*(you|shop|locate|find|address|located)/i,
     a: `📍 We're at Circle branch, near Benz Gate, closer to Calvary Church, Accra.` },
@@ -1186,6 +1200,16 @@ function buildImageQuestion(session) {
 }
 
 function startReceiveTimer(phone, session) {
+  // Change 6: If 2+ files already received, don't fire the 60s auto-timer.
+  // Wait for the customer to send a text message indicating they're done.
+  // The timer only auto-fires for single-file orders.
+  const fileCount = session.files.length + session.pendingImages.length + session.unknownFiles.length;
+  if (fileCount >= 2) {
+    // Cancel any existing timer — do not restart it
+    clearTimeout(timers.get(phone)?.checkin);
+    if (timers.has(phone)) delete timers.get(phone).checkin;
+    return;
+  }
   setTimer(phone, 'checkin', 60000, async () => {
     if (session.state !== 'receiving') return;
     if (session.pendingImages.length > 0) {
@@ -1222,20 +1246,15 @@ async function proceedToSummary(phone, session) {
     setTimer(phone, 'pressing_timeout', 60000, async () => {
       if (session.state === 'asking_pressing') {
         session.pressing = null;
-        session.state = 'confirming';
-        await sendMsg(phone, buildSummary(session));
-        setTimer(phone, 'autoconfirm', 60000, async () => {
-          if (session.state === 'confirming') await sendBill(phone, session);
-        });
+        // Calculate bill totals before sending
+        calcBill(session.files); // sets session.a4eq via buildBill
+        await sendBill(phone, session);
       }
     });
     return;
   }
-  session.state = 'confirming';
-  await sendMsg(phone, buildSummary(session));
-  setTimer(phone, 'autoconfirm', 60000, async () => {
-    if (session.state === 'confirming') await sendBill(phone, session);
-  });
+  // No summary — go straight to bill
+  await sendBill(phone, session);
 }
 
 async function sendBill(phone, session) {
@@ -1249,10 +1268,8 @@ async function sendBill(phone, session) {
   } catch(e) {
     console.error('❌ buildBill error:', e.message);
     await alertOwner(`⚠️ buildBill crashed for ${displayPhone(phone)}: ${e.message}`).catch(()=>{});
-    return; // abort — do not send confusing partial messages
+    return;
   }
-
-  await sendMsg(phone, `Order received. Sending your bill now. 🙏`);
 
   // 3-day auto-close if no payment
   setTimer(phone, 'pay_expire', 3 * 24 * 3600000, async () => {
@@ -1438,28 +1455,8 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   // ── Detect pressing mention anywhere in message ───────────
   if (/\bpress(ing|ed)?\b/i.test(msg || '')) session.pressingMentioned = true;
 
-  // ── First-time welcome + name ask ────────────────────────
-  if (session.isFirstTime && !session.customerName && session.state !== 'asking_name') {
-    session.isFirstTime = false;
-    await sendMsg(from, `👋 Welcome to *Migo Print Shop!* 🖨️\nCircle branch · Near Benz Gate · Accra\n\nMay I know your name please?`);
-    session.state = 'asking_name';
-    return null;
-  }
-
   // ── Name greeting helper ──────────────────────────────────
   const greet = session.customerName ? `${session.customerName.split(' ')[0]}, ` : ``;
-
-  // ── ASKING NAME ───────────────────────────────────────────
-  if (session.state === 'asking_name') {
-    const name = (msg || '').trim().replace(/^(i.?m|my name is|call me|its|it.?s)\s*/i, '').trim();
-    if (name.length > 1 && name.length < 40 && !/\d{5}/.test(name)) {
-      session.customerName = name.charAt(0).toUpperCase() + name.slice(1);
-    }
-    session.state = 'idle';
-    const first = session.customerName ? session.customerName.split(' ')[0] : 'there';
-    await sendMsg(from, `Nice to meet you, *${first}*! 😊\nHow can we help you today?`);
-    return null;
-  }
 
   // ── Job-ready check (natural language) ───────────────────
   if (isReadyCheck(msg || '') && session.state !== 'idle') {
@@ -1479,6 +1476,8 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
 
   // ── FAQ quick-match ───────────────────────────────────────
   if (msg && session.state === 'idle') {
+    // Greeting → instant reply, no Claude needed
+    if (isGreeting(msg)) return greetingReply(msg);
     const faqAnswer = tryFAQ(msg);
     if (faqAnswer) return faqAnswer;
   }
@@ -1494,13 +1493,14 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       const orders = await extractOrder(msg, null, session);
       const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
       if (valid.length > 0) {
-        // Add sizes directly — customer will send files next (v16 behaviour)
         session.state = 'receiving';
         valid.forEach(o => addFile(session, o, msg, ''));
         startReceiveTimer(from, session);
-        return `Got it! Please send your file(s) and we'll sort it out. 📎`;
+        return `Got it! Please send your file(s). 📎`;
       }
-      return replyWithClaude(msg, session);
+      // Claude — fallback to DTF prompt if no reply
+      const claudeReply = await replyWithClaude(msg, session);
+      return claudeReply || `Hi! Please send your DTF files. 🖨️`;
     }
     return null;
   }
@@ -1515,24 +1515,28 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       const orders = await extractOrder(msg, null, session);
       const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
       if (valid.length > 0) {
-        // Scenario 5: "all A3 1 each" — apply to all unknown files and pending images
+        // "all A3 1 each" — apply to all unknown files and pending images
         const allKeywords = /\ball\b/i.test(msg);
         const eachKeywords = /\beach\b/i.test(msg);
         if ((allKeywords || eachKeywords) && valid.length === 1 && session.unknownFiles.length > 0) {
           const { size, qty } = valid[0];
-          // Apply to every unknown file
           session.unknownFiles.forEach(() => addFile(session, { size, qty, isUnknown: false, isMoreOf: null }, msg, ''));
           session.unknownFiles = [];
-          // Apply to every pending image too
           session.pendingImages.forEach(() => addFile(session, { size, qty, isUnknown: false, isMoreOf: null }, msg, ''));
           session.pendingImages = [];
           clearTimers(from);
           await proceedToSummary(from, session);
           return null;
         }
-        // Normal: add sizes to session directly, keep receiving files
         valid.forEach(o => addFile(session, o, msg, ''));
         startReceiveTimer(from, session);
+        return null;
+      }
+      // Any text from customer when 2+ files are in — treat as "done, send bill"
+      const fileCount = session.files.length + session.pendingImages.length + session.unknownFiles.length;
+      if (fileCount >= 2) {
+        clearTimers(from);
+        await proceedToSummary(from, session);
         return null;
       }
       return replyWithClaude(msg, session);
@@ -1574,7 +1578,6 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     if (lower === 'no' || lower === 'nope' || lower === 'nah' || lower === 'skip') {
       session.pressing = null;
     } else {
-      // Parse pressing info: "10 front", "5 front+back", "3 side", "10 front large"
       const shirtsMatch = msg.match(/(\d+)/);
       const shirts = shirtsMatch ? parseInt(shirtsMatch[1]) : 1;
       const type = /front.?back|both/i.test(msg) ? 'front_back'
@@ -1584,11 +1587,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       session.pressing = { shirts, type, largeArtwork };
     }
     session.askedPressing = true;
-    session.state = 'confirming';
-    await sendMsg(from, buildSummary(session));
-    setTimer(from, 'autoconfirm', 60000, async () => {
-      if (session.state === 'confirming') await sendBill(from, session);
-    });
+    await sendBill(from, session);
     return null;
   }
 
@@ -1596,41 +1595,20 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   if (session.state === 'asked_done') {
     clearTimers(from);
     if (isNo(msg))  { session.state = 'receiving'; startReceiveTimer(from, session); return null; }
-    if (isYes(msg)) { await proceedToSummary(from, session); return null; }
+    if (isYes(msg) || msg) { await proceedToSummary(from, session); return null; }
     if (mediaUrl) {
       session.state = 'receiving';
       if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType, filename);
       return handleDoc(from, session, mediaUrl, msg, filename);
     }
-    const orders = await extractOrder(msg, null, session);
-    const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
-    if (valid.length > 0) {
-      valid.forEach(o => addFile(session, o, msg, ''));
-      session.state = 'receiving'; startReceiveTimer(from, session); return null;
-    }
-    session.state = 'receiving'; startReceiveTimer(from, session);
-    return replyWithClaude(msg, session);
+    return null;
   }
 
-  // ── CONFIRMING ──────────────────────────────────────────────
+  // ── CONFIRMING (legacy — should not be reached in v30) ──────
   if (session.state === 'confirming') {
-    if (session.unknownFiles.length > 0 && msg && !isYes(msg)) {
-      const orders = await extractOrder(msg, null, session);
-      const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
-      let resolved = 0;
-      for (const order of valid) {
-        if (resolved < session.unknownFiles.length) { addFile(session, order, msg, ''); resolved++; }
-      }
-      session.unknownFiles.splice(0, resolved);
-      if (session.unknownFiles.length > 0)
-        return `Still need size for:\n${session.unknownFiles.map(u=>`  • ${u.name}`).join('\n')}\n_e.g. 5 A3_`;
-      clearTimers(from); await proceedToSummary(from, session); return null;
-    }
     clearTimers(from);
-    if (isYes(msg)) { await sendBill(from, session); return null; }
-    session.state = 'receiving'; session.files = []; session.unknownFiles = []; session.pendingImages = [];
-    await sendMsg(from, `No problem! What's the correct size and quantity? 📝`);
-    startReceiveTimer(from, session); return null;
+    await sendBill(from, session);
+    return null;
   }
 
   // ── AWAITING PAYMENT ─────────────────────────────────────────
