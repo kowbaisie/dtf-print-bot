@@ -1,6 +1,6 @@
 // ============================================================
 // MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
-// Version : v35
+// Version : v40
 // Date    : June 2026
 // Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
@@ -136,7 +136,7 @@ const openai = new OpenAI({ apiKey: OPENAI_KEY });
 // ── Model ─────────────────────────────────────────────────────
 const MODEL = 'gpt-5.5-2026-04-23';
 
-const BOT_VERSION = 'v35';
+const BOT_VERSION = 'v40';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -425,68 +425,141 @@ function gptText(r) {
   return (r?.choices?.[0]?.message?.content || '').trim();
 }
 
-// ── Knowledge base system prompt ─────────────────────────────
-function buildShopSystem(session) {
-  const kb = knowledgeBase.length > 0
-    ? `\n\nADDITIONAL SHOP INFORMATION:\n${knowledgeBase.map((f,i)=>`${i+1}. ${f}`).join('\n')}`
-    : '';
-  const nameNote = session?.customerName
-    ? `\nThe customer's name is ${session.customerName}. Use their name naturally in responses.`
-    : '';
-  return `You are a professional and helpful customer service representative for Migo Print Shop.
+// ── GPT Full Control Engine ───────────────────────────────────
+// GPT-5.5 reads the entire conversation and decides what to do.
+// Returns structured JSON: { reply, action, files, pressing }
 
-Shop: Circle branch, near Benz Gate, closer to Calvary Church, Accra, Ghana. DTF printing only.
-Services:
-- DTF Sheet Printing: A4=GHS 3.20, A3=GHS 6.40, A2=GHS 16.00 per sheet
-- DTF Shirt Pressing: pricing calculated per order based on number of shirts, impression type, and artwork size. Do not quote specific rates — just say we'll calculate it for them.
-Payment: MTN MoMo 0552719245 (Kow Habib Baisie) or cash at shop.
-Hours: Standard hours Mon–Sun 7am–10pm. Orders accepted anytime — send files whenever convenient.
-Style: Clear British English. Warm, professional. 1–4 sentences. Never reveal you are AI.${nameNote}
-If you genuinely cannot answer: say "Let me get someone to assist you shortly." and nothing else.
-You have full context of this customer's order in the conversation history.${kb}`;
+function buildMasterSystem(session) {
+  const kb = knowledgeBase.length > 0
+    ? `\n\nSHOP KNOWLEDGE BASE:\n${knowledgeBase.map((f,i)=>`${i+1}. ${f}`).join('\n')}`
+    : '';
+
+  const filesReceived = session.files.length > 0
+    ? `\nFILES ALREADY COLLECTED:\n${session.files.map((f,i)=>
+        `  ${i+1}. ${f.name||'file'} → Size: ${f.size||'?'}, Qty: ${f.qty||'?'}`
+      ).join('\n')}`
+    : '';
+
+  const pendingFiles = session.pendingImages.length > 0
+    ? `\nFILES WAITING FOR SIZE/QTY:\n${session.pendingImages.map((f,i)=>
+        `  ${i+1}. ${f.caption||f.url?.split('/').pop()||'image'} (mediaType: ${f.mediaType||'image'})`
+      ).join('\n')}`
+    : '';
+
+  const unknownFiles = session.unknownFiles.length > 0
+    ? `\nFILES WITH UNKNOWN SIZE:\n${session.unknownFiles.map((f,i)=>
+        `  ${i+1}. ${f.name||'file'}`
+      ).join('\n')}`
+    : '';
+
+  const currentBill = session.totalBill
+    ? `\nCURRENT BILL: GHS ${session.totalBill.toFixed(2)}`
+    : '';
+
+  const customerName = session.customerName
+    ? `\nCUSTOMER NAME: ${session.customerName}. Use their name naturally.`
+    : '';
+
+  return `You are the AI brain for Migo Print Shop WhatsApp bot. You have FULL CONTROL of this conversation.
+
+SHOP INFO:
+- Name: Migo Print Shop
+- Location: Circle branch, near Benz Gate, Calvary Church side, Accra, Ghana
+- Service: DTF sheet printing ONLY
+- Payment: MTN MoMo 0552719245 (Kow Habib Baisie) or cash at shop
+- Hours: Open Mon–Sun, orders accepted anytime${customerName}
+
+PRICING (NEVER guess or change these):
+- A4 sheet = GHS 3.20
+- A3 sheet = GHS 6.40
+- A2 sheet = GHS 16.00
+- Pressing: calculated per order — do NOT quote rates to customers${filesReceived}${pendingFiles}${unknownFiles}${currentBill}${kb}
+
+YOUR RESPONSIBILITIES:
+1. Read the ENTIRE conversation history before responding
+2. Understand what files have been sent and what sizes/quantities were given
+3. When ALL files have size and quantity → set action="send_bill" with the files array
+4. If files are waiting for size/qty → ask clearly, set action="ask_size_qty"
+5. Answer FAQs about location, prices, hours, MoMo number directly
+6. If customer mentions cash/no MoMo → say exactly: "Printing can only start after Payment Confirmation. Thank you."
+7. For greetings → reply warmly + "Please send your DTF files."
+8. If you cannot answer → say "Let me get someone to assist you shortly."
+9. AUDIT your response before returning — make sure sizes, quantities and prices are 100% correct
+10. NEVER swap sizes between files. Image 1 = first file mentioned, Image 2 = second file, etc.
+
+BILL CALCULATION RULES (when action=send_bill):
+- List every file with its size and qty in the files array
+- The code will calculate the exact price — you do NOT calculate
+- Only set send_bill when you are 100% sure all files have size AND quantity
+
+RESPONSE FORMAT — return ONLY valid JSON, no markdown, no explanation:
+{
+  "reply": "your message to the customer",
+  "action": "none | send_bill | ask_size_qty | cannot_answer",
+  "files": [{"size":"A4","qty":10},{"size":"A3","qty":5}],
+  "pressing": null,
+  "customerName": null
+}
+
+- files: array of all files with confirmed size+qty. Empty [] if not ready.
+- pressing: {"shirts":5,"type":"front","largeArtwork":false} or null
+- customerName: extracted name if customer mentioned it, or null
+- action "send_bill": only when files array has ALL files with size+qty confirmed
+- action "none": normal conversation, no bill yet
+- action "ask_size_qty": waiting for size/qty from customer
+- action "cannot_answer": escalate to human
+
+STYLE: Warm, professional, clear British English. Short and direct. Never say you are AI.`;
 }
 
 function addToHistory(s, role, content) {
   s.chatHistory.push({ role, content });
-  if (s.chatHistory.length > 40) s.chatHistory = s.chatHistory.slice(-40);
+  if (s.chatHistory.length > 60) s.chatHistory = s.chatHistory.slice(-60);
 }
 
-async function replyWithGPT(msg, session) {
-  addToHistory(session, 'user', msg);
-  try {
-    const r = await askGPT(session.chatHistory, buildShopSystem(session), 400, 15000);
-    const reply = gptText(r);
-    if (reply) addToHistory(session, 'assistant', reply);
+async function gptDecide(msg, session, extraContext) {
+  // Add current message to history
+  if (msg) addToHistory(session, 'user', msg);
+  if (extraContext) addToHistory(session, 'user', extraContext);
 
-    // Customer name capture — try to extract name from conversation
-    if (!session.customerName && session.chatHistory.length >= 2) {
-      try {
-        const nameR = await askGPT([{ role: 'user', content:
-          `From this conversation snippet: ${JSON.stringify(session.chatHistory.slice(-4))}\n`+
-          `Did the customer mention their name? Return ONLY valid JSON: {"name":"Kofi"} or {"name":null}` }],
-          null, 50, 3000);
-        const parsed = JSON.parse(gptText(nameR).replace(/```json|```/g,''));
-        if (parsed?.name && parsed.name.length > 1) {
-          session.customerName = parsed.name;
-          audit('NAME_CAPTURED', session.phone, parsed.name);
-        }
-      } catch(e) { /* silent fail */ }
+  try {
+    const system = buildMasterSystem(session);
+    const r = await askGPT(session.chatHistory, system, 600, 20000);
+    const raw = gptText(r).replace(/```json|```/g, '').trim();
+
+    let decision;
+    try {
+      decision = JSON.parse(raw);
+    } catch(e) {
+      // GPT returned plain text — treat as reply with no action
+      return { reply: raw || null, action: 'none', files: [], pressing: null, customerName: null };
     }
 
-    if (reply && reply.toLowerCase().includes('let me get someone to assist')) {
+    // Capture customer name if GPT found it
+    if (decision.customerName && decision.customerName.length > 1 && !session.customerName) {
+      session.customerName = decision.customerName;
+      audit('NAME_CAPTURED', session.phone, decision.customerName);
+    }
+
+    // Log to history
+    if (decision.reply) addToHistory(session, 'assistant', decision.reply);
+
+    // Escalate to human if needed
+    if (decision.action === 'cannot_answer') {
       await alertOwner([
         `❓ *BOT CANNOT ANSWER*`,
         `📱 Customer: ${displayPhone(session.phone)}`,
-        `💬 Question: "${msg.slice(0, 100)}"`,
+        `💬 Question: "${(msg||'').slice(0, 100)}"`,
         ``,
         `Use: admin W01 override ${last4(session.phone)} Your reply`,
         `Or: admin W01 pause ${last4(session.phone)} to take over`,
-      ].join('\n'));
+      ].join('\n')).catch(()=>{});
     }
-    return reply || null;
-  } catch (e) {
-    console.error('GPT error:', e.message);
-    return null;
+
+    return decision;
+  } catch(e) {
+    console.error('GPT decide error:', e.message);
+    return { reply: `Hi! Please send your DTF files. 🖨️`, action: 'none', files: [], pressing: null, customerName: null };
   }
 }
 
@@ -1039,21 +1112,32 @@ If cannot parse: [{"size":null,"qty":null,"isUnknown":true,"isMoreOf":null}]`;
 
 async function extractImageInstructions(msg, pendingImages) {
   const count = pendingImages.length;
-  const prompt = `DTF print shop Ghana. Customer has sent ${count} image(s) and now providing instructions.
+  const imageList = pendingImages.map((img, i) =>
+    `Image ${i+1}: caption="${img.caption || 'none'}"`
+  ).join('\n');
+
+  const prompt = `DTF print shop Ghana. A customer sent ${count} image(s) and is now giving print instructions.
+
 Customer message: "${msg}"
-Images waiting: ${JSON.stringify(pendingImages.map(i => ({ index: i.index, caption: i.caption || '' })))}
 
-Extract print instructions for EACH image.
-Return ONLY a valid JSON array with ${count} objects.
-Each: {"size":"A3|A4|A2","qty":number,"background":"keep|remove|null"}
-If size/qty unknown for an image, use null.
+Images (in order):
+${imageList}
 
-CRITICAL RULES:
-- Only use sizes explicitly mentioned by the customer.
-- If customer says "all A3" or "all are A3" — every single object MUST be A3. No exceptions.
-- If customer says "all A4" — every object MUST be A4.
-- NEVER assign a size that was not mentioned by the customer.
-- NEVER default to A4 when the customer has specified a different size.`;
+TASK: Match the customer's instructions to each image IN ORDER (Image 1 first, Image 2 second, etc).
+When customer says "first one" or "1st" → Image 1.
+When customer says "second one" or "2nd" → Image 2.
+When customer says "both/all" → apply to all images.
+
+Return ONLY a valid JSON array with exactly ${count} objects in order.
+Each object: {"size":"A4|A3|A2","qty":number}
+If size/qty unknown for an image, use {"size":null,"qty":null}
+
+STRICT RULES:
+- Preserve the ORDER — array index 0 = Image 1, index 1 = Image 2, etc.
+- NEVER swap sizes between images.
+- NEVER guess — only use what the customer explicitly said.
+- No markdown. No explanation. JSON array only.`;
+
   try {
     const r = await askGPT([{ role: 'user', content: prompt }], null, 400, 8000);
     const raw = gptText(r);
@@ -1061,7 +1145,7 @@ CRITICAL RULES:
     return Array.isArray(parsed) ? parsed : [];
   } catch (e) {
     const fb = quickParse(msg)[0] || {};
-    return Array.from({ length: count }, () => ({ size: fb.size || null, qty: fb.qty || null, background: null }));
+    return Array.from({ length: count }, () => ({ size: fb.size || null, qty: fb.qty || null }));
   }
 }
 
@@ -1279,39 +1363,30 @@ async function sendBill(phone, session) {
     return;
   }
 
-  // 3-day auto-close if no payment
-  setTimer(phone, 'pay_expire', 3 * 24 * 3600000, async () => {
-    if (session.state === 'awaiting_payment') {
-      const waId = phone.includes('@') ? phone : toWaId(phone);
-      await sendMsg(waId, `Hi${session.customerName ? ' ' + session.customerName.split(' ')[0] : ''}! Your order has been cancelled as we didn't receive payment. Send your files again whenever you're ready. 🙏`);
-      archiveSession(waId, session, 'expired_no_payment');
-    }
-  });
-
   // Send bill after short delay (feels natural, avoids WhatsApp rate limits)
   setTimeout(async () => {
     try {
       await sendMsg(phone, billMsg);
       await sendMsg(phone, [
-        `📌 Please send your payment receipt or MoMo confirmation screenshot to *COMPLETE* your order.`,
-        ``,
+        `📌 Please send your payment receipt or MoMo confirmation screenshot to complete your order.`,
         `Printing can *ONLY* start *AFTER* payment. 🙏`,
       ].join('\n'));
     } catch(e) {
       console.error('❌ Bill send error:', e.message);
       alertOwner(`⚠️ Bill failed to send to ${displayPhone(phone)}: ${e.message}`).catch(()=>{});
     }
+    // Gentle reminders — no cancellation, no threats
     setTimer(phone, 'pay1', 600000, () => {
       if (session.state === 'awaiting_payment')
-        sendMsg(phone, `⏰ Reminder: Pay *GHS ${session.totalBill?.toFixed(2)}* to MoMo *0552719245*. 🙏`);
+        sendMsg(phone, `Please send your payment receipt to complete your order. 🙏`);
     });
     setTimer(phone, 'pay2', 1800000, () => {
       if (session.state === 'awaiting_payment')
-        sendMsg(phone, `🔔 *GHS ${session.totalBill?.toFixed(2)}* still pending. Please pay to keep your slot.`);
+        sendMsg(phone, `Please send your payment receipt to complete your order. 🙏`);
     });
     setTimer(phone, 'pay3', 3600000, () => {
       if (session.state === 'awaiting_payment')
-        sendMsg(phone, `⚠️ Last reminder: Your order will be cancelled if payment is not received. MoMo: *0552719245*.`);
+        sendMsg(phone, `Please send your payment receipt to complete your order. 🙏`);
     });
   }, 2000);
 }
@@ -1433,6 +1508,25 @@ function trackFile(phone, url, filename, mediaType, caption, session) {
 }
 
 // ── Main message handler ──────────────────────────────────────
+// ── Apply GPT's confirmed file list to session ────────────────
+function _applyGPTFiles(gptFiles, session) {
+  // Merge GPT's confirmed sizes/qtys with pending/unknown files by position
+  const pending = [...session.pendingImages, ...session.unknownFiles];
+  gptFiles.forEach((f, i) => {
+    if (!f.size || !f.qty) return;
+    const src = pending[i];
+    if (src) {
+      addFile(session, { size: f.size, qty: f.qty, sourceUrl: src.url, isUnknown: false, isMoreOf: null },
+        src.caption || src.name || `file ${i+1}`, '');
+    } else if (session.files.length === 0 || !session.files.find(sf => sf.size === f.size && sf.qty === f.qty)) {
+      // Text-only order or new file
+      addFile(session, { size: f.size, qty: f.qty, isUnknown: false, isMoreOf: null }, 'order', '');
+    }
+  });
+  session.pendingImages = [];
+  session.unknownFiles = [];
+}
+
 async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage) {
   const msg     = (body || '').trim();
   logMsg(from, 'in', msg || '[media]');
@@ -1479,236 +1573,146 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   }
   session.lastActivity = Date.now();
 
-  // ── Detect pressing mention anywhere in message ───────────
+  // ── Detect pressing mention ───────────────────────────────
   if (/\bpress(ing|ed)?\b/i.test(msg || '')) session.pressingMentioned = true;
 
-  // ── Name greeting helper ──────────────────────────────────
-  const greet = session.customerName ? `${session.customerName.split(' ')[0]}, ` : ``;
-
-  // ── Job-ready check (natural language) ───────────────────
-  if (isReadyCheck(msg || '') && session.state !== 'idle') {
-    if (session.state === 'ready') {
-      return `✅ Yes${greet}your order is ready! Come in with your pickup code *${session.jobId}* and we'll sort you out. 📍 Near Benz Gate, Circle.`;
-    }
-    if (session.state === 'processing') {
-      const eta = session.readyTime
-        ? session.readyTime.toLocaleTimeString('en-GH', { timeZone: 'Africa/Accra', hour12: true, hour: '2-digit', minute: '2-digit' })
-        : 'shortly';
-      return `Not yet${greet}we're still working on it. 🖨️ Estimated ready: *${eta}*. We'll notify you as soon as it's done!`;
-    }
-    if (session.state === 'awaiting_payment') {
-      return `We haven't received your payment yet${greet}Once payment is confirmed we'll start printing and notify you. 🙏`;
-    }
-  }
-
-  // ── FAQ quick-match ───────────────────────────────────────
-  if (msg && session.state === 'idle') {
-    // Greeting → instant reply, no Claude needed
-    if (isGreeting(msg)) return greetingReply(msg);
-    const faqAnswer = tryFAQ(msg);
-    if (faqAnswer) return faqAnswer;
-  }
-
-  // ── IDLE ─────────────────────────────────────────────────
-  if (session.state === 'idle') {
-    if (mediaUrl) {
-      session.state = 'receiving';
-      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType, filename);
-      return handleDoc(from, session, mediaUrl, msg, filename);
-    }
-    if (msg) {
-      const orders = await extractOrder(msg, null, session);
-      const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
-      if (valid.length > 0) {
-        session.state = 'receiving';
-        valid.forEach(o => addFile(session, o, msg, ''));
-        startReceiveTimer(from, session);
-        return `Got it! Please send your file(s). 📎`;
-      }
-      // Claude — fallback to DTF prompt if no reply
-      const claudeReply = await replyWithGPT(msg, session);
-      return claudeReply || `Hi! Please send your DTF files. 🖨️`;
-    }
-    return null;
-  }
-
-  // ── RECEIVING ───────────────────────────────────────────────
-  if (session.state === 'receiving') {
-    if (mediaUrl) {
-      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType, filename);
-      return handleDoc(from, session, mediaUrl, msg, filename);
-    }
-    if (msg) {
-      const orders = await extractOrder(msg, null, session);
-      const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
-      if (valid.length > 0) {
-        // "all A3 1 each" — apply to all unknown files and pending images
-        const allKeywords = /\ball\b/i.test(msg);
-        const eachKeywords = /\beach\b/i.test(msg);
-        if ((allKeywords || eachKeywords) && valid.length === 1 && session.unknownFiles.length > 0) {
-          const { size, qty } = valid[0];
-          session.unknownFiles.forEach(() => addFile(session, { size, qty, isUnknown: false, isMoreOf: null }, msg, ''));
-          session.unknownFiles = [];
-          session.pendingImages.forEach(() => addFile(session, { size, qty, isUnknown: false, isMoreOf: null }, msg, ''));
-          session.pendingImages = [];
-          clearTimers(from);
-          await proceedToSummary(from, session);
-          return null;
-        }
-        valid.forEach(o => addFile(session, o, msg, ''));
-        startReceiveTimer(from, session);
-        return null;
-      }
-      // Customer sent text while receiving — not a size instruction
-      // If 2+ files in session the 5s timer will fire automatically
-      // Otherwise ask Claude
-      return replyWithGPT(msg, session);
-    }
-    return null;
-  }
-
-  // ── ASKING IMAGE INFO ────────────────────────────────────────
-  if (session.state === 'asking_image_info') {
-    if (mediaUrl && isImage) {
-      const orders = await extractOrder(msg, '', session);
-      const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
-      if (valid.length > 0) valid.forEach(o => addFile(session, o, msg || 'image', ''));
-      else session.pendingImages.push({ url: mediaUrl, caption: msg, index: session.pendingImages.length + 1 });
-      return null;
-    }
-    if (msg) {
-      const parsed = await extractImageInstructions(msg, session.pendingImages);
-      const unresolved = [];
-      for (let i = 0; i < parsed.length; i++) {
-        const item = parsed[i];
-        if (item.size && item.qty) {
-          addFile(session, { size: item.size, qty: item.qty, isUnknown: false, isMoreOf: null },
-            `image ${i+1}`, item.background === 'remove' ? 'remove background' : item.background === 'keep' ? 'keep background' : '');
-        } else unresolved.push(session.pendingImages[i]);
-      }
-      session.pendingImages = unresolved;
-      if (session.pendingImages.length > 0)
-        return `Still need details for ${session.pendingImages.length} image(s). Size / qty / background?`;
-      clearTimers(from); await proceedToSummary(from, session); return null;
-    }
-    return null;
-  }
-
-  // ── ASKING PRESSING ─────────────────────────────────────────
-  if (session.state === 'asking_pressing') {
-    clearTimers(from);
-    const lower = (msg || '').toLowerCase().trim();
-    if (lower === 'no' || lower === 'nope' || lower === 'nah' || lower === 'skip') {
-      session.pressing = null;
-    } else {
-      const shirtsMatch = msg.match(/(\d+)/);
-      const shirts = shirtsMatch ? parseInt(shirtsMatch[1]) : 1;
-      const type = /front.?back|both/i.test(msg) ? 'front_back'
-                 : /side/i.test(msg)              ? 'side'
-                 :                                  'front';
-      const largeArtwork = /large|big/i.test(msg);
-      session.pressing = { shirts, type, largeArtwork };
-    }
-    session.askedPressing = true;
-    await sendBill(from, session);
-    return null;
-  }
-
-  // ── ASKED DONE ──────────────────────────────────────────────
-  if (session.state === 'asked_done') {
-    clearTimers(from);
-    if (isNo(msg))  { session.state = 'receiving'; startReceiveTimer(from, session); return null; }
-    if (isYes(msg) || msg) { await proceedToSummary(from, session); return null; }
-    if (mediaUrl) {
-      session.state = 'receiving';
-      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType, filename);
-      return handleDoc(from, session, mediaUrl, msg, filename);
-    }
-    return null;
-  }
-
-  // ── CONFIRMING (legacy — should not be reached in v30) ──────
-  if (session.state === 'confirming') {
-    clearTimers(from);
-    await sendBill(from, session);
-    return null;
-  }
-
-  // ── AWAITING PAYMENT ─────────────────────────────────────────
+  // ── PAYMENT / PROCESSING / READY — code handles these ────
   if (session.state === 'awaiting_payment') {
-    if (mediaUrl && isImage) {
-      // Only treat as receipt if it has an amount (GHS value) — otherwise it's a new design file
-      const ocr = await extractReceiptFromImage(mediaUrl);
-      if (ocr && ocr.amount) {
-        // Has amount = it's a MoMo receipt
-        if (ocr.txId) {
-          session.pendingTxId = ocr.txId; session.pendingTxAmount = ocr.amount;
-          audit('RECEIPT_SCANNED', from, `TxID:${ocr.txId}`);
-        }
-        return ocr.txId
-          ? `Got it! TxID *${ocr.txId}* noted — GHS ${ocr.amount.toFixed(2)}. We'll confirm shortly. 🙏`
-          : `Got it! GHS ${ocr.amount.toFixed(2)} noted. Please reply with your *Transaction ID* so we can confirm faster.`;
-      }
-      // No amount = treat as a new design file
-      if (msg) {
-        const orders = await extractOrder(msg, '', session);
-        const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
-        if (valid.length > 0) {
-          valid.forEach(o => addFile(session, o, msg, ''));
-          const billMsg = buildBill(session); // buildBill recalcs including pressing
-          await sendMsg(from, `New file added. Updated total:`);
-          setTimeout(() => sendMsg(from, billMsg), 1000);
-          return null;
-        }
-      }
-      // Image with no caption and no OCR amount — ask for details
-      session.pendingImages.push({ url: mediaUrl, caption: msg, index: session.pendingImages.length + 1 });
-      return `Got the image! Size and quantity? (e.g. A4 × 5)`;
-    }
-    if (mediaUrl && !isImage) {
-      const prev = session.files.length;
-      await handleDoc(from, session, mediaUrl, msg, filename);
-      if (session.files.length > prev) {
-        const billMsg = buildBill(session); // buildBill handles pressing too
-        await sendMsg(from, `New file added. Updated total:`);
-        setTimeout(() => sendMsg(from, billMsg), 1000);
-      }
-      return null;
-    }
     const lower = (msg || '').toLowerCase();
-    // Cash or no-MoMo indication — remind them payment must be confirmed
-    if (/\b(cash|bring cash|pay cash|no momo|don.?t have momo|no mobile money|pay when i come|pay on arrival|pay at shop|i.?ll pay|coming to pay|bring the money|i have cash|physical(ly)?|in person)\b/i.test(msg)) {
+    if (/\b(cash|bring cash|pay cash|no momo|don.?t have momo|no mobile money|pay when i come|pay on arrival|pay at shop|i.?ll pay|coming to pay|bring the money|i have cash|physical(ly)?|in person)\b/i.test(msg))
       return `Printing can only start after Payment Confirmation. Thank you.`;
+    if (isReadyCheck(msg || ''))
+      return `We haven't received your payment yet. Once payment is confirmed we'll start printing. 🙏`;
+    if (/send.*bill|bill again|resend|can.?t see|didn.?t (get|receive)|show.*bill/i.test(lower)) {
+      await sendMsg(from, buildBill(session)); return null;
     }
+    if (/how much|total|amount|balance/.test(lower))
+      return `Total: *GHS ${session.totalBill?.toFixed(2) || '—'}*\nMoMo: *0552719245*`;
     const txIdTyped = (msg || '').match(/\b(\d{8,})\b/);
     if (txIdTyped) {
-      session.pendingTxId = txIdTyped[1]; session.awaitingTxId = false;
+      session.pendingTxId = txIdTyped[1];
       audit('TXID_PROVIDED', from, `TxID:${txIdTyped[1]}`);
       return `Got it! TxID *${txIdTyped[1]}* noted. We'll confirm shortly. 🙏`;
     }
-    if (isMomoReceipt(lower)) {
-      if (!session.totalBill || session.totalBill <= 0) return null;
-      return `Got it! We'll confirm your payment shortly. 🙏`;
+    if (mediaUrl && isImage) {
+      const ocr = await extractReceiptFromImage(mediaUrl);
+      if (ocr?.amount) {
+        if (ocr.txId) { session.pendingTxId = ocr.txId; session.pendingTxAmount = ocr.amount; }
+        return ocr.txId
+          ? `Got it! TxID *${ocr.txId}* — GHS ${ocr.amount.toFixed(2)}. Confirming now. 🙏`
+          : `Got it! GHS ${ocr.amount.toFixed(2)} noted. Please reply with your Transaction ID to confirm faster.`;
+      }
     }
-    // Re-send bill request
-    if (/send.*bill|bill again|resend.*bill|can.?t see|didn.?t (get|receive)|show.*bill|send.*again/i.test(lower)) {
-      await sendMsg(from, buildBill(session));
-      return null;
-    }
-    if (/how much|total|bill|balance|amount/.test(lower))
-      return `Total: *GHS ${session.totalBill?.toFixed(2) || '—'}*\n🟡 MoMo *0552719245* (Kow Habib Baisie)`;
-    return replyWithGPT(msg, session);
+    const d0 = await gptDecide(msg, session);
+    return d0.reply || null;
   }
 
-  // ── PROCESSING ───────────────────────────────────────────────
   if (session.state === 'processing') {
-    if (mediaUrl) {
-      session.state = 'receiving'; session.files = []; session.unknownFiles = []; session.pendingImages = [];
-      if (isImage) return handleImage(from, session, mediaUrl, msg, mediaType, filename);
-      return handleDoc(from, session, mediaUrl, msg, filename);
+    if (isReadyCheck(msg || '')) {
+      const eta = session.readyTime
+        ? session.readyTime.toLocaleTimeString('en-GH', { timeZone:'Africa/Accra', hour12:true, hour:'2-digit', minute:'2-digit' })
+        : 'shortly';
+      return `Still printing. 🖨️ Ready by *${eta}*. We'll notify you!`;
     }
-    return replyWithGPT(msg, session);
+    const d0 = await gptDecide(msg, session);
+    return d0.reply || null;
   }
+
+  // ── FILE RECEIVED — silent collect, 30s timer ────────────
+  if (mediaUrl) {
+    const fileLabel = filename || (isImage ? 'image' : 'file');
+    const captionNote = msg ? `, caption: "${msg}"` : '';
+    const fileDesc = `[FILE RECEIVED: "${fileLabel}", type: ${mediaType||'unknown'}${captionNote}]`;
+
+    if (isImage) {
+      const isDup = session.files.some(f=>f.sourceUrl===mediaUrl) || session.pendingImages.some(p=>p.url===mediaUrl);
+      if (isDup) return null;
+      trackFile(from, mediaUrl, filename||msg||'image.jpg', mediaType||'image/jpeg', msg, session);
+
+      const parseSource = msg || filename || '';
+      const orders = await extractOrder(parseSource, filename||'', session);
+      const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
+      if (valid.length > 0) {
+        valid.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, msg||filename||'image', ''));
+        addToHistory(session, 'user', `${fileDesc} → auto-parsed: ${valid.map(v=>`${v.size}×${v.qty}`).join(', ')}`);
+      } else {
+        session.pendingImages.push({ url: mediaUrl, caption: msg, index: session.pendingImages.length+1, mediaType: mediaType||'' });
+        addToHistory(session, 'user', fileDesc);
+      }
+    } else {
+      const isDup = session.files.some(f=>f.sourceUrl===mediaUrl) || session.unknownFiles.some(u=>u.url===mediaUrl);
+      if (isDup) return null;
+      trackFile(from, mediaUrl, filename||'file.pdf', 'application/pdf', msg, session);
+      const orders = await extractOrder(msg, filename, session);
+      const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
+      if (valid.length > 0) {
+        valid.forEach(o => addFile(session, { ...o, sourceUrl: mediaUrl }, msg||filename, ''));
+        addToHistory(session, 'user', `${fileDesc} → auto-parsed: ${valid.map(v=>`${v.size}×${v.qty}`).join(', ')}`);
+      } else {
+        session.unknownFiles.push({ name: filename||'file', url: mediaUrl });
+        addToHistory(session, 'user', fileDesc);
+      }
+    }
+
+    session.state = 'receiving';
+
+    // 30s timer — fires after customer stops sending files
+    // Resets every time a new file arrives
+    setTimer(from, 'checkin', 30000, async () => {
+      if (session.state !== 'receiving') return;
+      session.state = 'asked_done';
+      await sendMsg(from, `Are you done sending? 👍`);
+      // If no reply in 60s, assume yes and proceed
+      setTimer(from, 'nodone', 60000, async () => {
+        if (session.state === 'asked_done') {
+          await proceedToSummary(from, session);
+        }
+      });
+    });
+
+    return null; // Silent — no reply while collecting files
+  }
+
+  // ── TEXT MESSAGE ─────────────────────────────────────────
+
+  // Handle "Are you done sending?" reply
+  if (session.state === 'asked_done') {
+    clearTimers(from);
+    if (isNo(msg)) {
+      // Customer still sending — go back to receiving
+      session.state = 'receiving';
+      setTimer(from, 'checkin', 30000, async () => {
+        if (session.state !== 'receiving') return;
+        session.state = 'asked_done';
+        await sendMsg(from, `Are you done sending? 👍`);
+        setTimer(from, 'nodone', 60000, async () => {
+          if (session.state === 'asked_done') await proceedToSummary(from, session);
+        });
+      });
+      return null;
+    }
+    // Yes or any text → proceed
+    await proceedToSummary(from, session);
+    return null;
+  }
+
+  // GPT handles everything else
+  const d = await gptDecide(msg, session);
+
+  if (d.action === 'send_bill') {
+    clearTimers(from);
+    if (d.files?.length > 0) _applyGPTFiles(d.files, session);
+    if (d.pressing) session.pressing = d.pressing;
+    if (session.files.length > 0) {
+      await sendBill(from, session);
+      return null;
+    }
+  }
+
+  if (d.action === 'ask_size_qty') session.state = 'asking_image_info';
+
+  return d.reply || (session.state === 'idle' ? `Hi! Please send your DTF files. 🖨️` : null);
+
 
   // ── READY ────────────────────────────────────────────────────
   if (session.state === 'ready') {
