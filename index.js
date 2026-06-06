@@ -1,6 +1,6 @@
 // ============================================================
 // MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
-// Version : v47
+// Version : v49
 // Date    : June 2026
 // Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
@@ -105,14 +105,14 @@
 const express   = require('express');
 const crypto    = require('crypto');
 const https     = require('https');
-const OpenAI  = require('openai');
+const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 // ── Config ────────────────────────────────────────────────────
-const OPENAI_KEY     = process.env.OPENAI_API_KEY;
+const ANTHROPIC_KEY  = process.env.ANTHROPIC_API_KEY;
 const ADMIN_PIN      = process.env.ADMIN_PIN      || '1914';
 const ADMIN_DASH_PW  = process.env.ADMIN_DASHBOARD_PASSWORD || '1914';
 const WASENDER_KEY   = process.env.WASENDER_API_KEY;
@@ -131,12 +131,12 @@ const WA_API_SEND = 'https://www.wasenderapi.com/api/send-message';
 const PRICES = { A4: 3.20, A3: 6.40, A2: 16.00 };
 const A4_EQ  = { A4: 1,    A3: 2,    A2: 4     };
 
-const openai = new OpenAI({ apiKey: OPENAI_KEY });
+const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 
 // ── Model ─────────────────────────────────────────────────────
-const MODEL = 'gpt-5.5-2026-04-23';
+const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v47';
+const BOT_VERSION = 'v49';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -409,19 +409,18 @@ async function alertOwner(body) {
   });
 }
 
-// ── GPT-5.5 — all calls use MODEL ────────────────────────────
+// ── Claude — all calls use MODEL ─────────────────────────────
 async function askGPT(messages, system, maxTokens = 400, timeoutMs = 15000) {
-  const msgs = system
-    ? [{ role: 'system', content: system }, ...messages]
-    : messages;
+  const opts = { model: MODEL, max_tokens: maxTokens, messages };
+  if (system) opts.system = system;
   return Promise.race([
-    openai.chat.completions.create({ model: MODEL, max_tokens: maxTokens, messages: msgs }),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('GPT timeout')), timeoutMs)),
+    anthropic.messages.create(opts),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Claude timeout')), timeoutMs)),
   ]);
 }
 
 function gptText(r) {
-  return (r?.choices?.[0]?.message?.content || '').trim();
+  return (r?.content?.map(c => c.text || '').join('') || '').trim();
 }
 
 // ── GPT Full Control Engine ───────────────────────────────────
@@ -1232,10 +1231,10 @@ async function extractReceiptFromImage(mediaUrl) {
     const base64 = buffer.toString('base64');
     const safeMime = ['image/jpeg','image/png','image/gif','image/webp'].includes(mime)
       ? mime : 'image/jpeg';
-    const r = await openai.chat.completions.create({
+    const r = await anthropic.messages.create({
       model: MODEL, max_tokens: 200,
       messages: [{ role: 'user', content: [
-        { type: 'image_url', image_url: { url: `data:${safeMime};base64,${base64}` } },
+        { type: 'image', source: { type: 'base64', media_type: safeMime, data: base64 } },
         { type: 'text', text: `Ghana MTN MoMo receipt. Extract ONLY valid JSON:\n{"amount":<number|null>,"txId":"<digits|null>","reference":"<string|null>","senderName":"<string|null>"}` },
       ]}],
     });
@@ -1778,13 +1777,33 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   let order = getActiveOrder(session);
 
 
+  // ── Instant greeting reply — no GPT delay ────────────────
+  // Catches any opening message that looks like a greeting
+  // including misspelled ones like "Afernon", "Godd monrin"
+  if (msg && order.state === 'idle' && order.files.length === 0 && !getPendingOrder(session)) {
+    const m = msg.trim().toLowerCase();
+    const isSimpleGreeting =
+      /^(hi+|hey+|hello+|helo|hy|holla|howdy|yo+|sup)[\s!.,\w]*$/i.test(m) ||
+      /^good[\s]*(morning|afternoon|evening|night|day|morn\w*|aftern\w*|even\w*|nite)/i.test(m) ||
+      /^(morning|afternoon|evening|night|morn\w*|aftern\w*|evenin\w*)/i.test(m) ||
+      /^(afern|afternon|afternn|aftenon)\w*/i.test(m);
+
+    if (isSimpleGreeting) {
+      if (/morning|^morn/i.test(m)) return `Good morning! 😊`;
+      if (/afternoon|^aftern|^afern/i.test(m)) return `Good afternoon! 😊`;
+      if (/evening|^evenin|nite/i.test(m)) return `Good evening! 😊`;
+      if (/night/i.test(m)) return `Good night! 😊`;
+      return `Hi! 👋`;
+    }
+  }
+
   // ── FAQ quick-match — runs for ALL states ─────────────────
   if (msg) {
     const faqAnswer = tryFAQ(msg);
     if (faqAnswer) return faqAnswer;
   }
 
-  // ── New message — reset session if idle and no pending order ─
+  // ── Reset timers if idle with no files ───────────────────
   if (msg && order.state === 'idle' && order.files.length === 0) {
     const pendingOrder = getPendingOrder(session);
     if (!pendingOrder) clearTimers(from);
@@ -3579,7 +3598,7 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-ser
     </div>
     <div class="err" id="err"></div>
   </div>
-  <div class="ver">Migo Bot v47 · Circle, Accra</div>
+  <div class="ver">Migo Bot v49 · Circle, Accra</div>
 </div>
 <script>
 function setTab(t){
@@ -3980,7 +3999,7 @@ app.listen(PORT, async () => {
   console.log(`🚀 MIGO Print Bot ${BOT_VERSION} — port ${PORT}`);
   console.log(`   WasenderAPI : ${WASENDER_KEY ? '✅ set' : 'NOT SET ❌'}`);
   console.log(`   Session     : ${WASENDER_SID}`);
-  console.log(`   OpenAI      : ${OPENAI_KEY ? '✅ set' : 'NOT SET ❌'}`);
+  console.log(`   Anthropic   : ${ANTHROPIC_KEY ? '✅ set' : 'NOT SET ❌'}`);
   console.log(`   Model       : ${MODEL}`);
   console.log(`   Admin PIN   : ${ADMIN_PIN !== '1914' ? '✅ custom' : '⚠️  default 1914'}`);
   console.log(`   Owner       : +${OWNER_NUMBER}`);
