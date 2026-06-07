@@ -1,6 +1,6 @@
 {
   "name": "migo-dtf-print-bot",
-  "version": "49.0.0",
+  "version": "50.0.0",
   "description": "Migo DTF Print Shop — WhatsApp Order Management Bot",
   "main": "index.js",
   "engines": {
