@@ -1,6 +1,6 @@
 // ============================================================
 // MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
-// Version : v49
+// Version : v50
 // Date    : June 2026
 // Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
@@ -136,7 +136,7 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── Model ─────────────────────────────────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v49';
+const BOT_VERSION = 'v50';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -487,6 +487,9 @@ YOUR RESPONSIBILITIES:
 8. If you cannot answer → say "Let me get someone to assist you shortly."
 9. AUDIT your response before returning — make sure sizes, quantities and prices are 100% correct
 10. NEVER swap sizes between files. Image 1 = first file mentioned, Image 2 = second file, etc.
+11. NEVER ask for information the customer already gave. If they said "one", "5 copies", "ten pieces" — use it. Do not ask again.
+12. If customer ONLY asks about prices (how much, price, cost etc.) → give prices and STOP. Never push for an order after a price enquiry.
+13. Read filenames and captions carefully to extract size and quantity. "A3_5copies.png" means A3×5. "A2 13COPIES.png" means A2×13. Use this — never ignore filename info.
 
 BILL CALCULATION RULES (when action=send_bill):
 - List every file with its size and qty in the files array
@@ -538,6 +541,9 @@ YOUR RESPONSIBILITIES:
 8. If you cannot answer → say "Let me get someone to assist you shortly."
 9. AUDIT your response before returning — make sure sizes, quantities and prices are 100% correct
 10. NEVER swap sizes between files. Image 1 = first file mentioned, Image 2 = second file, etc.
+11. NEVER ask for information the customer already gave. If they said "one", "5 copies", "ten pieces" — use it. Do not ask again.
+12. If customer ONLY asks about prices (how much, price, cost etc.) → give prices and STOP. Never push for an order after a price enquiry.
+13. Read filenames and captions carefully to extract size and quantity. "A3_5copies.png" means A3×5. "A2 13COPIES.png" means A2×13. Use this — never ignore filename info.
 
 BILL CALCULATION RULES (when action=send_bill):
 - List every file with its size and qty in the files array
@@ -1414,8 +1420,9 @@ function buildBill(order) {
   }
   const grandTotal = subtotal + pressingFee;
   order.totalBill = grandTotal;
+  const UNIT = { A4: 3.20, A3: 6.40, A2: 16.00 };
   const items = lines.map(l =>
-    `🖨 *${l.size}*  ×  ${l.qty} sheet${l.qty!==1?'s':''}  =  *GHS ${l.price.toFixed(2)}*`
+    `🖨 *${l.size}*  ×  ${l.qty} sheet${l.qty!==1?'s':''}  @  GHS ${UNIT[l.size].toFixed(2)}  =  *GHS ${l.price.toFixed(2)}*`
   ).join('\n');
   const pressingLine = pressingFee > 0
     ? `\n👕 *Pressing*  =  *GHS ${pressingFee.toFixed(2)}*`
@@ -3598,7 +3605,7 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-ser
     </div>
     <div class="err" id="err"></div>
   </div>
-  <div class="ver">Migo Bot v49 · Circle, Accra</div>
+  <div class="ver">Migo Bot v50 · Circle, Accra</div>
 </div>
 <script>
 function setTab(t){
@@ -3994,6 +4001,7 @@ process.on('unhandledRejection', async (reason) => {
 });
 
 // ── Start ──────────────────────────────────────────────────────
+app.get('/health', (req, res) => res.json({ status: 'ok', version: BOT_VERSION, model: MODEL, uptime: Math.floor((Date.now()-BOT_START)/1000)+'s' }));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`🚀 MIGO Print Bot ${BOT_VERSION} — port ${PORT}`);
