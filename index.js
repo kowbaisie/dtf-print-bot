@@ -105,6 +105,8 @@
 const express   = require('express');
 const crypto    = require('crypto');
 const https     = require('https');
+const fs        = require('fs');
+const path      = require('path');
 const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
@@ -136,7 +138,7 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── Model ─────────────────────────────────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v51';
+const BOT_VERSION = 'v53';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -259,11 +261,17 @@ const overdueFlow = new Map();
 const workers    = new Map();
 const pinLockout = new Map();
 
-// ── Rate limiter ──────────────────────────────────────────────
-let msgCount = 0;
-let msgWindowStart = Date.now();
-const MSG_LIMIT  = 20;
-const MSG_WINDOW = 60000;
+// ── Outbound send queue ───────────────────────────────────────
+// WasenderAPI account protection allows only 1 message every 5 seconds.
+// ALL outbound messages (customer + owner) flow through ONE FIFO queue
+// that spaces sends ~6s apart and retries on HTTP 429, so nothing is
+// silently dropped. Enqueue resolves immediately (fire-and-forget) so
+// webhook handlers never hang waiting for the queue to drain.
+const SEND_GAP_MS      = 6000;   // safe margin over WasenderAPI's 1-per-5s rule
+const MAX_SEND_RETRIES = 4;
+const sendQueue        = [];
+let   sendQueueRunning = false;
+let   nextSendAt       = 0;
 
 // ── Job ID counter ────────────────────────────────────────────
 const JOB_BASE = Math.floor((Date.now() / 1000) % 8000) + 1000;
@@ -325,6 +333,58 @@ function generateJobId(phone) {
 function dailyPayments() { return paymentLedger.filter(p => p.date === todayStr()); }
 
 // ── Audit ─────────────────────────────────────────────────────
+// ── Persistent state (survives restarts when DATA_DIR is on a Render disk) ──
+const DATA_DIR  = process.env.DATA_DIR || path.join(__dirname, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'migo-state.json');
+
+function saveStateNow() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    const state = {
+      v: 1,
+      savedAt: new Date().toISOString(),
+      sessions:          [...sessions.entries()],
+      workers:           [...workers.entries()],
+      paymentLedger,
+      knowledgeBase,
+      jobCounters,
+      confirmedPayments,
+      auditLog:  auditLog.slice(-500),
+      ratingsLog: ratingsLog.slice(-500),
+    };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(state));
+  } catch (e) { console.error('💾 save error:', e.message); }
+}
+
+let _saveTimer = null;
+function saveState() { // debounced — coalesces rapid changes
+  if (_saveTimer) return;
+  _saveTimer = setTimeout(() => { _saveTimer = null; saveStateNow(); }, 2000);
+}
+
+function loadState() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) { console.log('💾 No saved state — starting fresh.'); return; }
+    const s = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    if (Array.isArray(s.sessions)) for (const [k, v] of s.sessions) {
+      if (v && v.orders) for (const o of v.orders) if (o && o.readyTime) o.readyTime = new Date(o.readyTime);
+      sessions.set(k, v);
+    }
+    if (Array.isArray(s.workers))           for (const [k, v] of s.workers) workers.set(k, v);
+    if (Array.isArray(s.paymentLedger))     paymentLedger.push(...s.paymentLedger);
+    if (Array.isArray(s.knowledgeBase))     knowledgeBase.push(...s.knowledgeBase);
+    if (s.jobCounters)                      Object.assign(jobCounters, s.jobCounters);
+    if (Array.isArray(s.confirmedPayments)) confirmedPayments.push(...s.confirmedPayments);
+    if (Array.isArray(s.auditLog))          auditLog.push(...s.auditLog);
+    if (Array.isArray(s.ratingsLog))        ratingsLog.push(...s.ratingsLog);
+    console.log(`💾 State restored: ${sessions.size} session(s), ${paymentLedger.length} payment(s). Last saved ${s.savedAt}`);
+  } catch (e) { console.error('💾 load error:', e.message); }
+}
+
+// ── WhatsApp session health monitor ───────────────────────────
+let consecutiveSendFails = 0;
+let sessionDownAlerted   = false;
+
 function audit(action, phone, detail, flag = false, workerId = null) {
   const wn = workerId ? (workers.get(workerId)?.name || workerId) : '—';
   auditLog.unshift({
@@ -345,30 +405,11 @@ function logMsg(phone, dir, body) {
 }
 
 // ── WasenderAPI send message ──────────────────────────────────
-async function sendMsg(to, body) {
-  // Rate limit
-  const now = Date.now();
-  if (now - msgWindowStart > MSG_WINDOW) { msgCount = 0; msgWindowStart = now; }
-  if (msgCount >= MSG_LIMIT) {
-    const wait = MSG_WINDOW - (now - msgWindowStart) + 1000;
-    await new Promise(r => setTimeout(r, wait));
-    msgCount = 0; msgWindowStart = Date.now();
-  }
-  msgCount++;
-
-  // Human-like delay 800ms–2000ms
-  await new Promise(r => setTimeout(r, 800 + Math.random() * 1200));
-
-  const waId = to.includes('@') ? to : toWaId(to);
-  logMsg(waId, 'out', body);
-
-  // WasenderAPI correct endpoint and payload format (confirmed by support)
-  // WasenderAPI send-message needs plain phone number (no @s.whatsapp.net)
-  const toPhone = waId.replace('@s.whatsapp.net', '').replace('@c.us', '');
+// Low-level HTTP POST to WasenderAPI. Resolves { status, body, retryAfter }.
+function rawSend(toPhone, body) {
   const payload = JSON.stringify({ to: toPhone, text: body });
-
   return new Promise((resolve) => {
-    const options = {
+    const req = https.request({
       hostname: 'www.wasenderapi.com',
       path:     '/api/send-message',
       method:   'POST',
@@ -377,55 +418,98 @@ async function sendMsg(to, body) {
         'Authorization':  `Bearer ${WASENDER_KEY}`,
         'Content-Length': Buffer.byteLength(payload),
       },
-    };
-    const req = https.request(options, (res) => {
+    }, (res) => {
       let data = '';
       res.on('data', d => data += d);
       res.on('end', () => {
-        if (res.statusCode === 200 || res.statusCode === 201) {
-          console.log(`✅ WA sent to ${displayPhone(waId)}: "${body.slice(0, 50)}"`);
-        } else {
-          console.error(`❌ WA error ${res.statusCode}: ${data.slice(0, 100)}`);
-          if (waId !== toWaId(OWNER_NUMBER)) {
-            alertOwner(`⚠️ Message send failed to ${displayPhone(waId)}: HTTP ${res.statusCode}`).catch(() => {});
-          }
+        let retryAfter = null;
+        if (res.statusCode === 429) {
+          const hdr = parseInt(res.headers['retry-after'], 10);
+          if (!isNaN(hdr)) retryAfter = hdr;
+          else { try { const j = JSON.parse(data); retryAfter = j.retry_after || j.retryAfter || null; } catch (_) {} }
         }
-        resolve();
+        resolve({ status: res.statusCode, body: data, retryAfter });
       });
     });
-    req.on('error', (err) => {
-      console.error(`❌ WA network error:`, err.message);
-      resolve();
-    });
-    req.setTimeout(15000, () => { req.destroy(); resolve(); });
+    req.on('error', (err) => resolve({ status: 0, body: err.message, retryAfter: null }));
+    req.setTimeout(15000, () => { req.destroy(); resolve({ status: 0, body: 'timeout', retryAfter: null }); });
     req.write(payload);
     req.end();
   });
 }
 
-async function alertOwner(body) {
-  const waId = toWaId(OWNER_NUMBER);
-  logMsg(waId, 'out', body);
-  // WasenderAPI send-message needs plain phone number (no @s.whatsapp.net)
+// Drains the outbound queue, spacing sends ≥ SEND_GAP_MS apart and retrying 429s.
+async function processSendQueue() {
+  if (sendQueueRunning) return;
+  sendQueueRunning = true;
+  try {
+    while (sendQueue.length) {
+      const waitMs = nextSendAt - Date.now();
+      if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
+
+      const job = sendQueue[0]; // peek — keep at front until done
+      const result = await rawSend(job.toPhone, job.body);
+
+      if (result.status === 429 && job.attempts < MAX_SEND_RETRIES) {
+        job.attempts++;
+        const backoffSec = result.retryAfter && result.retryAfter > 0 ? result.retryAfter : 6;
+        nextSendAt = Date.now() + (backoffSec * 1000);
+        console.error(`⏳ WA 429 — retry ${job.attempts}/${MAX_SEND_RETRIES} for ${displayPhone(job.waId)} in ${backoffSec}s`);
+        continue; // leave job at front, retry after backoff
+      }
+
+      sendQueue.shift(); // remove — delivered or permanently failed
+      nextSendAt = Date.now() + SEND_GAP_MS;
+
+      if (result.status === 200 || result.status === 201) {
+        console.log(`✅ WA sent to ${displayPhone(job.waId)}: "${job.body.slice(0, 50)}"`);
+        if (sessionDownAlerted) {
+          sessionDownAlerted = false;
+          alertOwner(`✅ WhatsApp sending recovered — Migo bot back to normal.`).catch(() => {});
+        }
+        consecutiveSendFails = 0;
+      } else {
+        console.error(`❌ WA error ${result.status}: ${String(result.body).slice(0, 100)}`);
+        // Non-owner failures are the signal that the WhatsApp session may be dead
+        if (job.waId !== toWaId(OWNER_NUMBER) && result.status !== 429) {
+          consecutiveSendFails++;
+          alertOwner(`⚠️ Message send failed to ${displayPhone(job.waId)}: HTTP ${result.status}`).catch(() => {});
+          if (consecutiveSendFails >= 3 && !sessionDownAlerted) {
+            sessionDownAlerted = true;
+            alertOwner([
+              `🔴 *WHATSAPP SESSION MAY BE DOWN*`, ``,
+              `${consecutiveSendFails} messages failed in a row.`,
+              `Check WasenderAPI — the WhatsApp session may have disconnected`,
+              `(phone offline, or logged out).`,
+            ].join('\n')).catch(() => {});
+          }
+        }
+      }
+    }
+  } finally {
+    sendQueueRunning = false;
+  }
+}
+
+// Enqueue a message. Resolves immediately (fire-and-forget); queue delivers in background.
+function enqueueSend(waId, toPhone, body) {
+  sendQueue.push({ waId, toPhone, body, attempts: 0 });
+  processSendQueue();
+  return Promise.resolve();
+}
+
+async function sendMsg(to, body) {
+  const waId    = to.includes('@') ? to : toWaId(to);
   const toPhone = waId.replace('@s.whatsapp.net', '').replace('@c.us', '');
-  const payload = JSON.stringify({ to: toPhone, text: body });
-  return new Promise((resolve) => {
-    const opts = {
-      hostname: 'www.wasenderapi.com',
-      path:     '/api/send-message',
-      method:   'POST',
-      headers:  {
-        'Content-Type':   'application/json',
-        'Authorization':  `Bearer ${WASENDER_KEY}`,
-        'Content-Length': Buffer.byteLength(payload),
-      },
-    };
-    const req = https.request(opts, (res) => { res.resume(); resolve(); });
-    req.on('error', () => resolve());
-    req.setTimeout(10000, () => { req.destroy(); resolve(); });
-    req.write(payload);
-    req.end();
-  });
+  logMsg(waId, 'out', body);
+  return enqueueSend(waId, toPhone, body);
+}
+
+async function alertOwner(body) {
+  const waId    = toWaId(OWNER_NUMBER);
+  const toPhone = waId.replace('@s.whatsapp.net', '').replace('@c.us', '');
+  logMsg(waId, 'out', body);
+  return enqueueSend(waId, toPhone, body);
 }
 
 // ── Claude — all calls use MODEL ─────────────────────────────
@@ -1025,6 +1109,7 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
       files: [...(matchedOrder.confirmedFiles || []), ...(matchedOrder.files || [])],
     };
     paymentLedger.push(ledgerEntry);
+    saveState(); // money recorded — persist right away
 
     if ((matchedOrder.totalBill || 0) - matchedOrder.paymentReceived <= 0.01) {
       const overpaid = matchedOrder.paymentReceived - (matchedOrder.totalBill || 0);
@@ -1603,8 +1688,9 @@ async function sendBill(phone, session, order) {
   // Send bill after short delay (feels natural, avoids WhatsApp rate limits)
   setTimeout(async () => {
     try {
-      await sendMsg(phone, billMsg);
       await sendMsg(phone, [
+        billMsg,
+        ``,
         `📌 Please send your MoMo receipt to complete your order.`,
         `Printing can *ONLY* start *AFTER* payment. 🙏`,
       ].join('\n'));
@@ -1886,8 +1972,12 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   // ── AWAITING PAYMENT ──────────────────────────────────────
   if (order.state === 'awaiting_payment') {
     const lower = (msg || '').toLowerCase();
-    if (/\b(cash|bring cash|pay cash|no momo|don.?t have momo|no mobile money|pay when i come|pay on arrival|pay at shop|i.?ll pay|coming to pay|bring the money|i have cash|physical(ly)?|in person)\b/i.test(msg))
+    if (/\b(cash|bring cash|pay cash|no momo|don.?t have momo|no mobile money|pay when i come|pay on arrival|pay at shop|i.?ll pay|coming to pay|bring the money|i have cash|physical(ly)?|in person)\b/i.test(msg)) {
+      const nowTs = Date.now();
+      if (order.lastCashNudgeAt && nowTs - order.lastCashNudgeAt < 60000) return null; // already nudged within 60s
+      order.lastCashNudgeAt = nowTs;
       return `Printing can only start after Payment Confirmation. Thank you.`;
+    }
     if (isReadyCheck(msg || ''))
       return `We haven't received your payment yet. Once payment is confirmed we'll start printing. 🙏`;
     if (/send.*bill|bill again|resend|can.?t see|didn.?t (get|receive)|show.*bill/i.test(lower)) {
@@ -2694,6 +2784,27 @@ function schedule8pm() {
   console.log(`⏰ Daily summary scheduled in ${Math.round((next-now)/60000)} mins`);
 }
 
+// Daily heartbeat — if the owner does NOT get this each morning, the bot is down.
+function scheduleHeartbeat() {
+  const now  = new Date();
+  const next = new Date(); next.setHours(7, 0, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+  setTimeout(async () => {
+    const today = (typeof todayStr === 'function') ? todayStr() : '';
+    const todayPays = paymentLedger.filter(p => p.date === today);
+    const momo = todayPays.filter(p => p.type === 'momo').reduce((s, p) => s + p.amount, 0);
+    const cash = todayPays.filter(p => p.type === 'cash').reduce((s, p) => s + p.amount, 0);
+    await alertOwner([
+      `💚 *Migo Bot Healthy* — ${BOT_VERSION}`,
+      `🕐 ${nowStr()}`,
+      `📈 Yesterday: ${todayPays.length} payment(s) · MoMo GHS ${momo.toFixed(2)} · Cash GHS ${cash.toFixed(2)}`,
+      `⚙️ All systems running.`,
+    ].join('\n')).catch(() => {});
+    scheduleHeartbeat();
+  }, next - now);
+  console.log(`💚 Heartbeat scheduled in ${Math.round((next - now) / 60000)} mins`);
+}
+
 // ── WasenderAPI Webhook ───────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   // Verify webhook signature if secret is set
@@ -2990,18 +3101,10 @@ app.post('/api/confirmed-payments/acknowledge', (req, res) => {
 });
 
 // ── Stats API ─────────────────────────────────────────────────
-app.get('/api/stats', (req, res) => {
-  const todayP = dailyPayments();
-  res.json({
-    ok: true,
-    active:          sessions.size,
-    awaitingPayment: [...sessions.values()].filter(s=>s.orders?.some(o=>o.state==='awaiting_payment')).length,
-    printing:        [...sessions.values()].filter(s=>s.state==='processing').length,
-    momoTotal:       todayP.filter(p=>p.type==='momo').reduce((s,p)=>s+p.amount,0),
-    cashTotal:       todayP.filter(p=>p.type==='cash').reduce((s,p)=>s+p.amount,0),
-    botActive, botCrashed,
-  });
-});
+// NOTE: the live /api/stats route is defined inside setupDashboard() with
+// authMiddleware. The earlier un-authed duplicate was removed in v52 — it
+// registered first (so it always won), returned the wrong field names, and
+// leaked daily revenue without a token.
 
 // ── Health ────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
@@ -3247,7 +3350,10 @@ ${`<!-- TEST BANNER -->`}
 var TK=localStorage.getItem('migo_token');
 if(!TK)window.location.href='/login';
 
-function api(p,m,b){return fetch(p,{method:m||'GET',headers:{'Content-Type':'application/json','X-Dashboard-Token':TK},body:b?JSON.stringify(b):null}).then(function(r){return r.json();});}
+function api(p,m,b){
+  function call(){return fetch(p,{method:m||'GET',headers:{'Content-Type':'application/json','X-Dashboard-Token':TK},body:b?JSON.stringify(b):null}).then(function(r){return r.json();});}
+  return call().catch(function(){return new Promise(function(res){setTimeout(function(){call().then(res).catch(function(){res({ok:false});});},3000);});});
+}
 
 function sw(i){
   document.querySelectorAll('.panel').forEach(function(x){x.classList.remove('on');});
@@ -3519,7 +3625,10 @@ nav{position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:
 var TK=localStorage.getItem('migo_token');
 if(!TK)window.location.href='/login';
 
-function api(p,m,b){return fetch(p,{method:m||'GET',headers:{'Content-Type':'application/json','X-Dashboard-Token':TK},body:b?JSON.stringify(b):null}).then(function(r){return r.json();});}
+function api(p,m,b){
+  function call(){return fetch(p,{method:m||'GET',headers:{'Content-Type':'application/json','X-Dashboard-Token':TK},body:b?JSON.stringify(b):null}).then(function(r){return r.json();});}
+  return call().catch(function(){return new Promise(function(res){setTimeout(function(){call().then(res).catch(function(){res({ok:false});});},3000);});});
+}
 
 function sw(i){
   document.querySelectorAll('.panel').forEach(function(x){x.classList.remove('on');});
@@ -4081,8 +4190,27 @@ app.listen(PORT, async () => {
   console.log(`   Owner       : +${OWNER_NUMBER}`);
   console.log(`   Webhook URL : https://dtf-print-bot.onrender.com/webhook`);
 
+  loadState();                                   // restore sessions, ledger, workers, etc.
+  setInterval(saveStateNow, 30 * 1000);          // periodic autosave
   schedule8pm();
+  scheduleHeartbeat();                           // daily 7am "bot healthy" ping
   setInterval(runAutoArchive, 30 * 60 * 1000);
+
+  // Save a final snapshot when Render restarts/redeploys (graceful shutdown)
+  process.on('SIGTERM', () => { saveStateNow(); process.exit(0); });
+  process.on('SIGINT',  () => { saveStateNow(); process.exit(0); });
+
+  // Warn the owner if default credentials are still in use
+  if (ADMIN_PIN === '1914' || ADMIN_DASH_PW === '1914') {
+    await alertOwner([
+      `🔐 *SECURITY: default credentials in use*`,
+      `${ADMIN_PIN === '1914' ? '• Cash PIN is still 1914' : ''}`,
+      `${ADMIN_DASH_PW === '1914' ? '• Dashboard password is still 1914' : ''}`,
+      ``,
+      `Anyone who guesses these can confirm fake payments or open the dashboard.`,
+      `Set ADMIN_PIN and ADMIN_DASHBOARD_PASSWORD in Render → Environment.`,
+    ].filter(Boolean).join('\n')).catch(() => {});
+  }
 
   await alertOwner([
     `✅ *Migo Bot ${BOT_VERSION} Started*`,
