@@ -138,7 +138,7 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── Model ─────────────────────────────────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v53';
+const BOT_VERSION = 'v57';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -590,7 +590,7 @@ YOUR RESPONSIBILITIES:
 8. If you cannot answer → say "Let me get someone to assist you shortly."
 9. AUDIT your response before returning — make sure sizes, quantities and prices are 100% correct
 10. NEVER swap sizes between files. Image 1 = first file mentioned, Image 2 = second file, etc.
-11. NEVER ask for information the customer already gave. If they said "one", "5 copies", "ten pieces" — use it. Do not ask again.
+11. NEVER ask for information the customer already gave. If they said "one", "5 copies", "ten pieces" — use it. Do not ask again. If the customer gives a blanket size like "all are A3" or "make them all A4 10 copies", apply it to EVERY file they sent and proceed to the bill — do NOT re-ask or re-confirm. If a file has a known size but no quantity, assume 1 copy and continue to the bill — NEVER escalate to a human or say the order is "too complex" just because quantities are missing.
 12. If customer ONLY asks about prices (how much, price, cost etc.) → give prices and STOP. Never push for an order after a price enquiry.
 13. Read filenames and captions carefully to extract size and quantity. "A3_5copies.png" means A3×5. "A2 13COPIES.png" means A2×13. Use this — never ignore filename info.
 
@@ -644,7 +644,7 @@ YOUR RESPONSIBILITIES:
 8. If you cannot answer → say "Let me get someone to assist you shortly."
 9. AUDIT your response before returning — make sure sizes, quantities and prices are 100% correct
 10. NEVER swap sizes between files. Image 1 = first file mentioned, Image 2 = second file, etc.
-11. NEVER ask for information the customer already gave. If they said "one", "5 copies", "ten pieces" — use it. Do not ask again.
+11. NEVER ask for information the customer already gave. If they said "one", "5 copies", "ten pieces" — use it. Do not ask again. If the customer gives a blanket size like "all are A3" or "make them all A4 10 copies", apply it to EVERY file they sent and proceed to the bill — do NOT re-ask or re-confirm. If a file has a known size but no quantity, assume 1 copy and continue to the bill — NEVER escalate to a human or say the order is "too complex" just because quantities are missing.
 12. If customer ONLY asks about prices (how much, price, cost etc.) → give prices and STOP. Never push for an order after a price enquiry.
 13. Read filenames and captions carefully to extract size and quantity. "A3_5copies.png" means A3×5. "A2 13COPIES.png" means A2×13. Use this — never ignore filename info.
 
@@ -705,16 +705,26 @@ async function gptDecide(msg, session, extraContext) {
     // Log to history
     if (decision.reply) addToHistory(session, 'assistant', decision.reply);
 
-    // Escalate to human if needed
+    // Escalate to human ONLY for genuine non-order questions.
+    // If the customer is mid-order (files/images in play), never ping the owner —
+    // fall back to the deterministic enumerated question instead.
     if (decision.action === 'cannot_answer') {
-      await alertOwner([
-        `❓ *BOT CANNOT ANSWER*`,
-        `📱 Customer: ${displayPhone(session.phone)}`,
-        `💬 Question: "${(msg||'').slice(0, 100)}"`,
-        ``,
-        `Use: admin W01 override ${last4(session.phone)} Your reply`,
-        `Or: admin W01 pause ${last4(session.phone)} to take over`,
-      ].join('\n')).catch(()=>{});
+      const o = getActiveOrder(session);
+      const midOrder = (o?.pendingImages?.length > 0) || (o?.unknownFiles?.length > 0)
+                    || (o?.files?.length > 0 && !['processing','ready'].includes(o.state));
+      if (midOrder) {
+        decision.action = 'ask_size_qty';
+        decision.reply = buildImageQuestion(session);
+      } else {
+        await alertOwner([
+          `❓ *BOT CANNOT ANSWER*`,
+          `📱 Customer: ${displayPhone(session.phone)}`,
+          `💬 Question: "${(msg||'').slice(0, 100)}"`,
+          ``,
+          `Use: admin W01 override ${last4(session.phone)} Your reply`,
+          `Or: admin W01 pause ${last4(session.phone)} to take over`,
+        ].join('\n')).catch(()=>{});
+      }
     }
 
     return decision;
@@ -1067,7 +1077,14 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
 
     // Find the awaiting_payment order
     const matchedOrder = matched.orders?.find(o => o.state === 'awaiting_payment');
-    if (!matchedOrder) return { status: 'no_match', message: 'No order awaiting payment' };
+    if (!matchedOrder) {
+      const last = matched.orders?.[matched.orders.length - 1];
+      const st = last?.state || 'none';
+      const hint = (st === 'processing' || st === 'ready') ? ' (already paid)'
+                 : ['idle','receiving','asked_done','asking_image_info','asking_pressing','confirming'].includes(st) ? ' — no bill sent yet'
+                 : '';
+      return { status: 'no_match', message: `No order awaiting payment. Last order: ${st}${hint}.` };
+    }
 
     const workerName = workerId ? (workers.get(workerId)?.name || workerId) : null;
 
@@ -1366,16 +1383,44 @@ function quickParse(text) {
   let m;
   while ((m = re.exec(text)) !== null) {
     let size, qty;
-    if (m[2]) { size = m[2].toUpperCase(); qty = parseInt(m[1] || m[3]) || 1; }
-    else if (m[5]) { size = m[5].toUpperCase(); qty = parseInt(m[4]) || 1; }
+    if (m[2]) { size = m[2].toUpperCase(); qty = parseInt(m[1] || m[3]) || null; }
+    else if (m[5]) { size = m[5].toUpperCase(); qty = parseInt(m[4]) || null; }
     else continue;
     const ex = results.find(r => r.size === size);
-    if (ex) ex.qty += qty; else results.push({ size, qty, isUnknown: false, isMoreOf: null });
+    if (ex) { if (qty) ex.qty = (ex.qty || 0) + qty; }
+    else results.push({ size, qty, isUnknown: false, isMoreOf: null });
+  }
+  // Explicit copy count anywhere (e.g. "13COPIES", "2 copies", "5 prints", "x10")
+  const copyMatch = text.match(/(\d+)\s*(?:copies|copys|copy|cop|pcs|pc|pieces|prints?)\b/i);
+  const copies = copyMatch ? parseInt(copyMatch[1]) : null;
+  if (results.length === 1) {
+    if (copies) results[0].qty = copies;          // explicit copies win
+    else if (!results[0].qty) results[0].qty = 1; // single size, no qty → 1 sheet
+  } else {
+    results.forEach(r => { if (!r.qty) r.qty = 1; });
   }
   return results.length > 0 ? results : [{ size: null, qty: null, isUnknown: true, isMoreOf: null }];
 }
 
+// Detect a blanket instruction like "all are A3", "make them all A4 2 copies", "everything A2"
+function parseBlanketSize(msg) {
+  if (!msg) return null;
+  const t = msg.toLowerCase();
+  const sizeM = t.match(/\b(a[234])\b/);
+  if (!sizeM) return null;
+  if (!/\b(all|every|everything|them all|all of them|the rest|each|both|make them|they are|they're)\b/.test(t)) return null;
+  const size = sizeM[1].toUpperCase();
+  const qtyM = t.match(/(\d+)\s*(?:copies|copy|each|pcs|prints?)\b/) || t.match(/[x×]\s*(\d+)/);
+  const qty = qtyM ? parseInt(qtyM[1]) : null;
+  return { size, qty };
+}
+
 async function extractOrder(msg, filename, session) {
+  // Deterministic first pass — filenames/captions like "A2 13COPIES", "A4 5 copies",
+  // "A2 - SIZE 12 - 2 COPIES" parse reliably without an AI call.
+  const fast = quickParse(`${filename || ''} ${msg || ''}`);
+  if (fast.length && fast[0].size && fast[0].qty) return fast;
+
   const prompt = `You are a precise order parser for a DTF print shop in Ghana.
 Customer message/caption: "${msg || ''}"
 Filename: "${filename || ''}"
@@ -1569,14 +1614,21 @@ function buildReadyMsg(jobId) {
 }
 
 function buildImageQuestion(session) {
-  const imgs = session.pendingImages;
-  const count = imgs.length;
+  const order = getActiveOrder(session);
+  const pend = [...(order.pendingImages || []), ...(order.unknownFiles || [])];
+  const n = pend.length;
 
-  if (count === 1) {
-    return `What size (A4 / A3 / A2) and how many copies?`;
-  }
-  // Multiple images — ask for size and qty of each, no listing
-  return `Got *${count} images*. What size and quantity for each? e.g: A4 5, A3 2, A4 10`;
+  if (n === 0) return `What size (A4 / A3 / A2) and how many copies?`;
+  if (n === 1) return `For your image — what size (A4 / A3 / A2) and how many copies?`;
+
+  return [
+    `I have *${n} images* that need a size and quantity. Please reply for each, in order:`,
+    ``,
+    ...pend.map((p, i) => `*Image ${i + 1}* → ?`),
+    ``,
+    `Example: *Image 1: A3 2, Image 2: A4 1* … (size then copies).`,
+    `Or just say *all A3* to make them all the same. 😊`,
+  ].join('\n');
 }
 
 function startReceiveTimer(phone, session) {
@@ -1637,17 +1689,10 @@ async function proceedToSummary(phone, session, order) {
     order.state = 'receiving'; return;
   }
 
-  // Files with no size/qty — ask GPT to handle
+  // Files with no size/qty — ask deterministically, listing each image (Image 1, Image 2, …)
   if (order.pendingImages.length > 0 || order.unknownFiles.length > 0) {
     order.state = 'asking_image_info';
-    const d = await gptDecide(null, session, `[Customer said they are done sending. There are still ${order.pendingImages.length + order.unknownFiles.length} file(s) with no size or quantity. Ask for size and quantity.]`);
-    if (d.action === 'send_bill' && order.files.length > 0) {
-      if (d.files?.length > 0) _applyGPTFiles(d.files, order);
-      if (d.pressing) order.pressing = d.pressing;
-      await sendBill(phone, session, order);
-    } else {
-      await sendMsg(phone, d.reply || `Please give size and quantity of each file.`);
-    }
+    await sendMsg(phone, buildImageQuestion(session));
     return;
   }
 
@@ -1691,6 +1736,9 @@ async function sendBill(phone, session, order) {
       await sendMsg(phone, [
         billMsg,
         ``,
+        ...(order.assumedQtyCount > 0
+          ? [`ℹ️ I assumed *1 copy* for image(s) where no quantity was given. Tell me if any need more, and I'll update the bill.`, ``]
+          : []),
         `📌 Please send your MoMo receipt to complete your order.`,
         `Printing can *ONLY* start *AFTER* payment. 🙏`,
       ].join('\n'));
@@ -1835,14 +1883,16 @@ function _applyGPTFiles(gptFiles, order) {
   // Merge GPT's confirmed sizes/qtys with pending/unknown files by position
   const pending = [...order.pendingImages, ...order.unknownFiles];
   gptFiles.forEach((f, i) => {
-    if (!f.size || !f.qty) return;
+    const size = String(f.size || '').toUpperCase();
+    if (!['A4', 'A3', 'A2'].includes(size)) return;        // validate size — reject anything else
+    let qty = parseInt(f.qty);
+    if (!qty || qty < 1) { qty = 1; order.assumedQtyCount = (order.assumedQtyCount || 0) + 1; } // bill 1, flag it
     const src = pending[i];
     if (src) {
-      addFile(order, { size: f.size, qty: f.qty, sourceUrl: src.url, isUnknown: false, isMoreOf: null },
+      addFile(order, { size, qty, sourceUrl: src.url, isUnknown: false, isMoreOf: null },
         src.caption || src.name || `file ${i+1}`, '');
-    } else if (order.files.length === 0 || !order.files.find(sf => sf.size === f.size && sf.qty === f.qty)) {
-      // Text-only order or new file
-      addFile(order, { size: f.size, qty: f.qty, isUnknown: false, isMoreOf: null }, 'order', '');
+    } else if (order.files.length === 0 || !order.files.find(sf => sf.size === size && sf.qty === qty)) {
+      addFile(order, { size, qty, isUnknown: false, isMoreOf: null }, 'order', '');
     }
   });
   order.pendingImages = [];
@@ -2010,6 +2060,15 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     const captionNote = msg ? `, caption: "${msg}"` : '';
     const fileDesc = `[FILE RECEIVED: "${fileLabel}", type: ${mediaType||'unknown'}${captionNote}]`;
 
+    // Skip re-sent customer-named files (same specific filename) — count once.
+    // Only applies to meaningful custom names (size/copy keywords); generic names are never deduped.
+    const fnNorm = (filename || '').trim().toLowerCase();
+    if (fnNorm && /a[234]|cop|pcs|piece|print/i.test(fnNorm)) {
+      order._seenNames = order._seenNames || [];
+      if (order._seenNames.includes(fnNorm)) return null; // duplicate of a file already in this order
+      order._seenNames.push(fnNorm);
+    }
+
     if (isImage) {
       const isDup = order.files.some(f=>f.sourceUrl===mediaUrl) || order.pendingImages.some(p=>p.url===mediaUrl);
       if (isDup) return null;
@@ -2061,6 +2120,24 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
 
   // ── TEXT MESSAGE ─────────────────────────────────────────
 
+  // Deterministic blanket size: "all are A3", "make them all A4 2 copies".
+  // Applies to every image still waiting for a size, then goes straight to the bill.
+  const blanket = parseBlanketSize(msg);
+  if (blanket && (order.pendingImages.length > 0 || order.unknownFiles.length > 0)) {
+    clearTimers(from);
+    const pend = [...order.pendingImages, ...order.unknownFiles];
+    pend.forEach((p, i) => {
+      let qty = blanket.qty;
+      if (!qty) { qty = 1; order.assumedQtyCount = (order.assumedQtyCount || 0) + 1; }
+      addFile(order, { size: blanket.size, qty, sourceUrl: p.url, isUnknown: false, isMoreOf: null },
+        p.caption || p.name || `image ${i + 1}`, '');
+    });
+    order.pendingImages = [];
+    order.unknownFiles = [];
+    await proceedToSummary(from, session, order);
+    return null;
+  }
+
   // Handle "Are you done sending?" reply
   if (order.state === 'asked_done') {
     clearTimers(from);
@@ -2091,6 +2168,12 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     if (d.pressing) order.pressing = d.pressing;
     // FIX: Never bill without actual file attachment
     if (order.files.length > 0) {
+      // If any images still have no size, ask for those deterministically — don't bill incomplete
+      if (order.pendingImages.length > 0 || order.unknownFiles.length > 0) {
+        order.state = 'asking_image_info';
+        session.unansweredCount = 0;
+        return buildImageQuestion(session);
+      }
       session.unansweredCount = 0;
       await sendBill(from, session, order);
       return null;
@@ -2167,9 +2250,9 @@ async function handleAdmin(from, msg) {
   const parts = msg.trim().split(/\s+/);
   let workerId = null, cmd, argStart;
   if (/^[Ww]\d{1,2}$/.test(parts[1])) {
-    workerId = parts[1].toUpperCase(); cmd = (parts[2] || '').toLowerCase(); argStart = 3;
+    workerId = parts[1].toUpperCase(); cmd = (parts[2] || '').toLowerCase().replace(/[^a-z]/g, ''); argStart = 3;
   } else {
-    cmd = (parts[1] || '').toLowerCase(); argStart = 2;
+    cmd = (parts[1] || '').toLowerCase().replace(/[^a-z]/g, ''); argStart = 2;
   }
   const args = parts.slice(argStart);
   const workerName = workerId ? (workers.get(workerId)?.name || workerId) : 'Admin';
@@ -2315,6 +2398,7 @@ async function handleAdmin(from, msg) {
     const pin           = args[2] || '';
 
     if (!customerLast4 || isNaN(amount)) return `❌ Usage: admin W01 cash <last4> <amount> <PIN>`;
+    if (!pin) return `❌ PIN missing. Format:\nadmin W01 cash <last4> <amount> <PIN>`;
 
     // PIN lockout check
     if (workerId && checkPinLockout(workerId)) {
@@ -2635,6 +2719,13 @@ async function handleAdmin(from, msg) {
     ].join('\n');
   }
 
+  // Smart hint: "admin W01 6161 38.40 2007" (missing the word "cash")
+  if (!cmd) {
+    const digits = args.filter(a => /^\d+(\.\d+)?$/.test(a));
+    if (digits.length >= 2) {
+      return `❓ Did you mean a cash payment? The word *cash* is missing.\nUse: admin ${workerId || 'W01'} cash <last4> <amount> <PIN>`;
+    }
+  }
   return `❓ Unknown command. Type: admin help`;
 }
 
