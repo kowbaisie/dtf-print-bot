@@ -1,6 +1,6 @@
 // ============================================================
 // MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
-// Version : v50
+// Version : v51
 // Date    : June 2026
 // Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
@@ -136,7 +136,7 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── Model ─────────────────────────────────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v50';
+const BOT_VERSION = 'v51';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -225,6 +225,25 @@ const paymentLedger = [];
 const ratingsLog    = [];
 const auditLog      = [];
 const messageLog    = new Map();
+// ── Random fallback phrases ───────────────────────────────────
+const FALLBACK_PHRASES = [
+  `Please give me a minute. 🙏`,
+  `I'll get back to you shortly. 🙏`,
+  `One moment please. 🙏`,
+  `Bear with me a moment. 🙏`,
+  `Just a moment. 🙏`,
+  `Please hold on. 🙏`,
+  `I beg, a go get back to you soon boss. 🙏`,
+  `Give me small time boss. 🙏`,
+  `I dey come. 🙏`,
+  `Small small, I go sort you out. 🙏`,
+  `Hold on boss, I dey on it. 🙏`,
+  `I beg, one minute. 🙏`,
+];
+function randomPhrase() {
+  return FALLBACK_PHRASES[Math.floor(Math.random() * FALLBACK_PHRASES.length)];
+}
+
 const knowledgeBase = [];
 const correctionLog = [];
 const jobArchive    = [];
@@ -671,9 +690,11 @@ function getSession(phone) {
       pausedAt: null,
       isFirstTime: true,
       lastActivity: Date.now(),
-      orders: [makeOrder(1)],   // start with order 1
-      activeRef: 1,             // current active order ref
-      dayKey: getDayKey(),      // reset order numbering each day
+      orders: [makeOrder(1)],
+      activeRef: 1,
+      dayKey: getDayKey(),
+      unansweredCount: 0,      // counts messages with no bot response
+      silenceNoticeSent: false, // true after first silence notice sent
     });
   }
   const s = sessions.get(phone);
@@ -1031,6 +1052,7 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
       // Unpause bot if it was silenced (human finished, new order can start)
       matched.paused = false;
       matched.pausedAt = null;
+      matched.silenceNoticeSent = false;
       const workerLine = (type === 'cash' && workerName)
         ? `\n👤 Served by: *${workerName}* at Migo Print Shop` : '';
 
@@ -1420,31 +1442,33 @@ function buildBill(order) {
   }
   const grandTotal = subtotal + pressingFee;
   order.totalBill = grandTotal;
-  const UNIT = { A4: 3.20, A3: 6.40, A2: 16.00 };
+  const orderRef = order.ref > 1 ? ` — Order #${order.ref}` : '';
   const items = lines.map(l =>
-    `🖨 *${l.size}*  ×  ${l.qty} sheet${l.qty!==1?'s':''}  @  GHS ${UNIT[l.size].toFixed(2)}  =  *GHS ${l.price.toFixed(2)}*`
+    `*${l.size}*  ${l.qty} sheet${l.qty!==1?'s':''}  =  *GHS ${l.price.toFixed(2)}*`
   ).join('\n');
   const pressingLine = pressingFee > 0
-    ? `\n👕 *Pressing*  =  *GHS ${pressingFee.toFixed(2)}*`
+    ? `\n👕 Pressing  =  *GHS ${pressingFee.toFixed(2)}*`
     : '';
-  const orderRef = order.ref > 1 ? `\n📋 Order #${order.ref}` : '';
   return [
     `--------------------`,
     `🧾 *MIGO PRINT SHOP*${orderRef}`,
-    `📍 Circle · Near Benz Gate · Accra`,
+    `   Circle · Near Benz Gate · Accra`,
     `--------------------`,
-    `📄 *ORDER BREAKDOWN*`,
+    `🖨️ *ORDER BREAKDOWN*`,
     `--------------------`,
     items + pressingLine,
     `--------------------`,
-    `💰 *TOTAL:  GHS ${grandTotal.toFixed(2)}*`,
+    `💵 *TOTAL:  GHS ${grandTotal.toFixed(2)}*`,
     `--------------------`,
-    `🟡 *MTN MOBILE MONEY*`, ``,
-    `   📱 *0552719245*`,
-    `   👤 *KOW HABIB BAISIE*`, ``,
-    `🗓 ${nowStr()}`,
+    ``,
+    `🟡 MTN MOBILE MONEY`,
+    `      0552719245`,
+    `    Kow Habib Baisie`,
+    ``,
     `--------------------`,
-    `_Thank you for choosing Migo!_ 🙏`,
+    `🗓️ ${nowStr()}`,
+    `--------------------`,
+    `🤝 _Thank you for choosing Migo!_ 🙏`,
   ].join('\n');
 }
 
@@ -1776,7 +1800,13 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   const session = getSession(from);
 
   // ── Bot silenced — human is handling ─────────────────────
-  if (isBotSilenced(session)) return null;
+  if (isBotSilenced(session)) {
+    if (!session.silenceNoticeSent) {
+      session.silenceNoticeSent = true;
+      return `Please, I will get back to you shortly. 🙏`;
+    }
+    return null;
+  }
 
   session.lastActivity = Date.now();
 
@@ -1969,15 +1999,46 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     clearTimers(from);
     if (d.files?.length > 0) _applyGPTFiles(d.files, order);
     if (d.pressing) order.pressing = d.pressing;
+    // FIX: Never bill without actual file attachment
     if (order.files.length > 0) {
+      session.unansweredCount = 0;
       await sendBill(from, session, order);
       return null;
+    } else {
+      return `Please send your actual design file so we can process your order. 📎`;
     }
   }
 
   if (d.action === 'ask_size_qty') order.state = 'asking_image_info';
 
-  return d.reply || (session.state === 'idle' && isGreeting(msg||'') ? `Hi! Please send your DTF files. 🖨️` : d.reply || null);
+  const reply = d.reply || null;
+
+  // Track unanswered messages + stuck detection
+  if (reply) {
+    session.unansweredCount = 0;
+  } else {
+    session.unansweredCount = (session.unansweredCount || 0) + 1;
+    if (session.unansweredCount >= 3) {
+      session.unansweredCount = 0;
+      // Alert owner + all workers
+      const workerAlerts = [...workers.values()].map(w => w.phone).filter(Boolean);
+      const alertMsg = [
+        `⚠️ *BOT NEEDS HELP*`,
+        `📱 Customer: ${displayPhone(from)}`,
+        `👤 Name: ${session.customerName || 'Unknown'}`,
+        `💬 Last message: "${(msg||'').slice(0,80)}"`,
+        `❓ Bot has not responded 3+ times — please assist.`,
+      ].join('\n');
+      await alertOwner(alertMsg).catch(()=>{});
+      for (const wp of workerAlerts) {
+        await sendMsg(wp, alertMsg).catch(()=>{});
+      }
+      return randomPhrase();
+    }
+    return randomPhrase();
+  }
+
+  return reply;
 
 
   // ── READY ────────────────────────────────────────────────────
@@ -3000,8 +3061,8 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-ser
 /* ── STATS BAR ── */
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;padding:14px 14px 0}
 .stat{background:var(--card);border:1.5px solid var(--border);border-radius:12px;padding:14px 12px;text-align:center;cursor:default}
-.stat-val{font-size:22px;font-weight:800;font-family:'JetBrains Mono',monospace;line-height:1}
-.stat-lbl{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-top:5px}
+.stat-val{font-size:22px;font-weight:900;font-family:'JetBrains Mono',monospace;line-height:1;color:#ffffff}
+.stat-lbl{font-size:10px;font-weight:900;color:#ffffff;text-transform:uppercase;letter-spacing:.8px;margin-top:5px}
 .c-green{color:var(--green)}.c-amber{color:var(--amber)}.c-blue{color:var(--blue)}.c-red{color:var(--red)}
 
 /* ── TEST MODE BANNER ── */
@@ -3010,15 +3071,15 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-ser
 /* ── PANEL ── */
 .panel{padding:14px;display:none}.panel.on{display:block}
 .ph{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
-.ph h2{font-size:13px;font-weight:800;text-transform:uppercase;letter-spacing:.8px;color:var(--text)}
+.ph h2{font-size:13px;font-weight:900;text-transform:uppercase;letter-spacing:.8px;color:#ffffff}
 .refresh-btn{padding:6px 12px;background:var(--card);border:1.5px solid var(--border);border-radius:8px;color:var(--muted);font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;transition:all .15s}
 .refresh-btn:hover{border-color:var(--blue);color:var(--blue)}
 
 /* ── TABLE ── */
 .tbl-wrap{background:var(--card);border:1.5px solid var(--border);border-radius:12px;overflow:hidden}
 table{width:100%;border-collapse:collapse}
-th{background:var(--surface);padding:10px 12px;text-align:left;color:var(--muted);font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:.8px;border-bottom:1.5px solid var(--border)}
-td{padding:12px 12px;border-bottom:1px solid var(--border);vertical-align:middle;font-size:13px;font-weight:600}
+th{background:var(--surface);padding:10px 12px;text-align:left;color:#ffffff;font-weight:900;font-size:11px;text-transform:uppercase;letter-spacing:.8px;border-bottom:1.5px solid var(--border)}
+td{padding:12px 12px;border-bottom:1px solid var(--border);vertical-align:middle;font-size:13px;font-weight:700;color:#ffffff}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:#ffffff04}
 
@@ -3363,8 +3424,8 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-ser
 .refresh-btn:hover{border-color:var(--blue);color:var(--blue)}
 .tbl-wrap{background:var(--card);border:1.5px solid var(--border);border-radius:12px;overflow:hidden}
 table{width:100%;border-collapse:collapse}
-th{background:var(--surface);padding:10px 12px;text-align:left;color:var(--muted);font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:.8px;border-bottom:1.5px solid var(--border)}
-td{padding:12px 12px;border-bottom:1px solid var(--border);vertical-align:middle;font-size:13px;font-weight:600}
+th{background:var(--surface);padding:10px 12px;text-align:left;color:#ffffff;font-weight:900;font-size:11px;text-transform:uppercase;letter-spacing:.8px;border-bottom:1.5px solid var(--border)}
+td{padding:12px 12px;border-bottom:1px solid var(--border);vertical-align:middle;font-size:13px;font-weight:700;color:#ffffff}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:#ffffff04}
 .badge{padding:4px 10px;border-radius:20px;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.5px}
@@ -3605,7 +3666,7 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-ser
     </div>
     <div class="err" id="err"></div>
   </div>
-  <div class="ver">Migo Bot v50 · Circle, Accra</div>
+  <div class="ver">Migo Bot v51 · Circle, Accra</div>
 </div>
 <script>
 function setTab(t){
@@ -3776,11 +3837,23 @@ loadFacts();
 // ── Dashboard inline (no external file needed) ───────────────
 // Basic dashboard routes built directly here
 (function setupDashboard() {
-  const SESSION_TOKENS = new Map();
+  // Use stable token derived from password — survives Render restarts
+  const crypto = require('crypto');
+  function makeStableToken(pw) {
+    return crypto.createHmac('sha256', pw + 'migo-salt-2025').digest('hex');
+  }
+  const ADMIN_TOKEN = makeStableToken(ADMIN_DASH_PW);
 
   function authMiddleware(req, res, next) {
     const token = req.headers['x-dashboard-token'] || req.query.token;
-    if (SESSION_TOKENS.has(token)) { req.role = SESSION_TOKENS.get(token).role; return next(); }
+    if (!token) return res.status(401).json({ ok: false, error: 'Unauthorised' });
+    // Check admin token
+    if (token === ADMIN_TOKEN) { req.role = 'admin'; return next(); }
+    // Check worker tokens
+    for (const [wid, w] of workers.entries()) {
+      const wToken = makeStableToken(wid + w.pin);
+      if (token === wToken) { req.role = 'worker'; req.workerId = wid; return next(); }
+    }
     res.status(401).json({ ok: false, error: 'Unauthorised' });
   }
 
@@ -3788,15 +3861,12 @@ loadFacts();
   app.post('/api/login', (req, res) => {
     const { password, workerId, pin } = req.body || {};
     if (password === ADMIN_DASH_PW) {
-      const token = require('crypto').randomBytes(16).toString('hex');
-      SESSION_TOKENS.set(token, { role: 'admin', ts: Date.now() });
-      return res.json({ ok: true, token, role: 'admin' });
+      return res.json({ ok: true, token: ADMIN_TOKEN, role: 'admin' });
     }
     const w = workers.get(workerId);
     if (w && w.pin === pin) {
-      const token = require('crypto').randomBytes(16).toString('hex');
-      SESSION_TOKENS.set(token, { role: 'worker', workerId, ts: Date.now() });
-      return res.json({ ok: true, token, role: 'worker', name: w.name });
+      const wToken = makeStableToken(workerId + pin);
+      return res.json({ ok: true, token: wToken, role: 'worker', name: w.name });
     }
     res.json({ ok: false, error: 'Wrong credentials' });
   });
@@ -3920,9 +3990,7 @@ loadFacts();
   app.post('/api/cash-payment', authMiddleware, async (req, res) => {
     const { phone, amount, pin } = req.body || {};
     if (!phone || !amount || !pin) return res.json({ ok: false, error: 'Missing fields' });
-    const workerId = req.role === 'worker'
-      ? (SESSION_TOKENS.get(req.headers['x-dashboard-token'] || req.query.token)?.workerId || 'dashboard')
-      : 'admin';
+    const workerId = req.workerId || (req.role === 'worker' ? 'worker' : 'admin');
     const w = req.role === 'worker' ? workers.get(workerId) : null;
     const expectedPin = w ? w.pin : ADMIN_PIN;
     if (pin !== expectedPin) {
