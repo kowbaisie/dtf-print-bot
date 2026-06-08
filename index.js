@@ -138,7 +138,7 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── Model ─────────────────────────────────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v57';
+const BOT_VERSION = 'v59';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -711,10 +711,16 @@ async function gptDecide(msg, session, extraContext) {
     if (decision.action === 'cannot_answer') {
       const o = getActiveOrder(session);
       const midOrder = (o?.pendingImages?.length > 0) || (o?.unknownFiles?.length > 0)
+                    || (o?.qtyPending?.length > 0) || (o?.state === 'asking_qty')
                     || (o?.files?.length > 0 && !['processing','ready'].includes(o.state));
       if (midOrder) {
-        decision.action = 'ask_size_qty';
-        decision.reply = buildImageQuestion(session);
+        if (o?.qtyPending?.length > 0 || o?.state === 'asking_qty') {
+          decision.action = 'ask_size_qty';
+          decision.reply = buildQtyQuestion(o);
+        } else {
+          decision.action = 'ask_size_qty';
+          decision.reply = buildImageQuestion(session);
+        }
       } else {
         await alertOwner([
           `❓ *BOT CANNOT ANSWER*`,
@@ -764,6 +770,8 @@ function makeOrder(ref) {
     billSentAt: null,       // timestamp when bill was sent
     confirmedFiles: [],
     overdueReminders: 0,
+    qtyPending: [],         // items with known size but missing copy count (await customer reply, 5-min timeout)
+    assumedQtyCount: 0,     // how many copies were assumed=1 on timeout (drives the "I assumed 1 copy" note)
     ratingAsked: false,
     ratingGiven: false,
     pendingTxId: null,
@@ -1081,7 +1089,7 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
       const last = matched.orders?.[matched.orders.length - 1];
       const st = last?.state || 'none';
       const hint = (st === 'processing' || st === 'ready') ? ' (already paid)'
-                 : ['idle','receiving','asked_done','asking_image_info','asking_pressing','confirming'].includes(st) ? ' — no bill sent yet'
+                 : ['idle','receiving','asked_done','asking_image_info','asking_pressing','asking_qty','confirming'].includes(st) ? ' — no bill sent yet'
                  : '';
       return { status: 'no_match', message: `No order awaiting payment. Last order: ${st}${hint}.` };
     }
@@ -1416,17 +1424,22 @@ function parseBlanketSize(msg) {
 }
 
 async function extractOrder(msg, filename, session) {
-  // Deterministic first pass — filenames/captions like "A2 13COPIES", "A4 5 copies",
-  // "A2 - SIZE 12 - 2 COPIES" parse reliably without an AI call.
-  const fast = quickParse(`${filename || ''} ${msg || ''}`);
+  const cap = msg || '';
+  const fn  = filename || '';
+  // CAPTION WINS: if the typed caption names a size (A4/A3/A2), trust it and ignore the
+  // filename entirely — the customer's latest words override whatever the file is named.
+  // Otherwise combine filename + caption (filename gives size, caption can add copies).
+  const captionHasSize = /\b[aA][234]\b/.test(cap);
+  const fast = captionHasSize ? quickParse(cap) : quickParse(`${fn} ${cap}`);
   if (fast.length && fast[0].size && fast[0].qty) return fast;
 
   const prompt = `You are a precise order parser for a DTF print shop in Ghana.
-Customer message/caption: "${msg || ''}"
-Filename: "${filename || ''}"
+Customer message/caption: "${cap}"
+Filename: "${fn}"
 Existing order items: ${JSON.stringify(session.files)}
 
-TASK: Extract ALL print sizes and quantities from the customer message.
+TASK: Extract ALL print sizes and quantities.
+IMPORTANT: If the caption names a size, the CAPTION OVERRIDES the filename — use the caption's size and ignore the filename's size.
 Handle multiple sizes in one message.
 Handle Ghanaian pidgin English (e.g. "abeg print 3 A4").
 Handle formats: "A4 x5", "5xA4", "A4×5", "5 A4", "A4-5".
@@ -1442,7 +1455,7 @@ If cannot parse: [{"size":null,"qty":null,"isUnknown":true,"isMoreOf":null}]`;
     return Array.isArray(parsed) ? parsed : [parsed];
   } catch (e) {
     console.error('extractOrder error:', e.message);
-    return quickParse(msg || filename);
+    return quickParse(captionHasSize ? cap : (cap || fn));
   }
 }
 
@@ -1619,16 +1632,75 @@ function buildImageQuestion(session) {
   const n = pend.length;
 
   if (n === 0) return `What size (A4 / A3 / A2) and how many copies?`;
-  if (n === 1) return `For your image — what size (A4 / A3 / A2) and how many copies?`;
+  if (n === 1) return `What size (A4 / A3 / A2) and how many copies for your file? 🙂`;
 
   return [
-    `I have *${n} images* that need a size and quantity. Please reply for each, in order:`,
+    `What size and how many copies for your *${n} files*? 🙂`,
     ``,
-    ...pend.map((p, i) => `*Image ${i + 1}* → ?`),
-    ``,
-    `Example: *Image 1: A3 2, Image 2: A4 1* … (size then copies).`,
-    `Or just say *all A3* to make them all the same. 😊`,
+    `If they're *all the same*, just say e.g. *all A3, 1 copy each*.`,
+    `If some are different, tell me and I'll sort them out.`,
   ].join('\n');
+}
+
+// ── Missing-quantity flow (size known, copies unknown) ──────────────
+// Build ONE message asking for all missing copy counts together.
+function buildQtyQuestion(order) {
+  const items = order.qtyPending || [];
+  const n = items.length;
+  if (n === 0) return `How many copies?`;
+  if (n === 1) {
+    return [
+      `How many copies of your *${items[0].size}* file? 🙂`,
+      `(No reply in 5 min → I'll assume *1 copy* and send your bill.)`,
+    ].join('\n');
+  }
+  return [
+    `I have *${n} file(s)* that just need a quantity (how many copies of each):`,
+    ``,
+    ...items.map((it, i) => `${i + 1}. ${it.label} (${it.size}) → ? copies`),
+    ``,
+    `Reply *all 1* for one copy each, or list them in order: *2, 1, 3 …*`,
+    `(No reply in 5 min → I'll assume *1 copy each* and send your bill.)`,
+  ].join('\n');
+}
+
+// Parse a customer's reply to the quantity question into an array of counts.
+// Handles: "all 2" / "2 each" / "every 1"  → same number for all
+//          "2, 1, 3" (count matches)        → one per item, in order
+//          single number                    → same number for all
+// Returns array length === count, or null if it can't be parsed.
+function parseQtyReply(msg, count) {
+  if (!msg || count < 1) return null;
+  const t = String(msg).toLowerCase();
+  const blanket = t.match(/\b(?:all|each|every|both)\b[^\d]*(\d+)/) ||
+                  t.match(/(\d+)\s*(?:each|per|apiece|a\s*piece)\b/);
+  if (blanket) {
+    const q = parseInt(blanket[1], 10);
+    if (q >= 1) return Array(count).fill(q);
+  }
+  const nums = (t.match(/\d+/g) || []).map(n => parseInt(n, 10)).filter(n => n >= 1);
+  if (nums.length === count) return nums;
+  if (nums.length === 1) return Array(count).fill(nums[0]);
+  return null;
+}
+
+// Ask once for all missing quantities, then wait 5 minutes.
+// On timeout: assume 1 copy each (flagged) and bill.
+async function askQty(phone, session, order) {
+  if (!order) order = getActiveOrder(session);
+  if (!(order.qtyPending || []).length) { await proceedToSummary(phone, session, order); return; }
+  order.state = 'asking_qty';
+  await sendMsg(phone, buildQtyQuestion(order));
+  setTimer(phone, 'qty_timeout', 300000, async () => {
+    if (order.state !== 'asking_qty' || !(order.qtyPending || []).length) return;
+    order.qtyPending.forEach((it) => {
+      addFile(order, { size: it.size, qty: 1, sourceUrl: it.url || null, isUnknown: false, isMoreOf: null },
+              it.caption || it.label, '');
+      order.assumedQtyCount = (order.assumedQtyCount || 0) + 1;
+    });
+    order.qtyPending = [];
+    await proceedToSummary(phone, session, order);
+  });
 }
 
 function startReceiveTimer(phone, session) {
@@ -1693,6 +1765,12 @@ async function proceedToSummary(phone, session, order) {
   if (order.pendingImages.length > 0 || order.unknownFiles.length > 0) {
     order.state = 'asking_image_info';
     await sendMsg(phone, buildImageQuestion(session));
+    return;
+  }
+
+  // Size known but copies missing — ask once for all, wait 5 min (askQty handles timeout→assume 1)
+  if ((order.qtyPending || []).length > 0) {
+    await askQty(phone, session, order);
     return;
   }
 
@@ -1886,12 +1964,24 @@ function _applyGPTFiles(gptFiles, order) {
     const size = String(f.size || '').toUpperCase();
     if (!['A4', 'A3', 'A2'].includes(size)) return;        // validate size — reject anything else
     let qty = parseInt(f.qty);
-    if (!qty || qty < 1) { qty = 1; order.assumedQtyCount = (order.assumedQtyCount || 0) + 1; } // bill 1, flag it
     const src = pending[i];
+    if (!qty || qty < 1) {
+      // Size known, copies missing → defer. We'll ask once for all of them (5-min timeout assumes 1).
+      order.qtyPending = order.qtyPending || [];
+      order.qtyPending.push({
+        size,
+        url: src ? src.url : null,
+        caption: src ? (src.caption || src.name) : null,
+        label: `Image ${order.qtyPending.length + 1}`,
+      });
+      return;
+    }
     if (src) {
       addFile(order, { size, qty, sourceUrl: src.url, isUnknown: false, isMoreOf: null },
         src.caption || src.name || `file ${i+1}`, '');
-    } else if (order.files.length === 0 || !order.files.find(sf => sf.size === size && sf.qty === qty)) {
+    } else if (!order.files.some(sf => sf.size === size)) {
+      // No matching attachment slot AND this size isn't already counted → genuinely new.
+      // (Files merge by size, so we can't match individual qtys — never re-add an existing size.)
       addFile(order, { size, qty, isUnknown: false, isMoreOf: null }, 'order', '');
     }
   });
@@ -2074,8 +2164,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       if (isDup) return null;
       trackFile(from, mediaUrl, filename||msg||'image.jpg', mediaType||'image/jpeg', msg, session);
 
-      const parseSource = msg || filename || '';
-      const orders = await extractOrder(parseSource, filename||'', session);
+      const orders = await extractOrder(msg || '', filename || '', session);
       const valid  = orders.filter(o => !o.isUnknown && o.size && o.qty);
       if (valid.length > 0) {
         valid.forEach(o => addFile(order, { ...o, sourceUrl: mediaUrl }, msg||filename||'image', ''));
@@ -2121,21 +2210,43 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   // ── TEXT MESSAGE ─────────────────────────────────────────
 
   // Deterministic blanket size: "all are A3", "make them all A4 2 copies".
-  // Applies to every image still waiting for a size, then goes straight to the bill.
+  // Applies the size to every waiting image. If a count was given, bill; otherwise
+  // ask once for the copies (5-min timeout → assume 1).
   const blanket = parseBlanketSize(msg);
   if (blanket && (order.pendingImages.length > 0 || order.unknownFiles.length > 0)) {
     clearTimers(from);
     const pend = [...order.pendingImages, ...order.unknownFiles];
-    pend.forEach((p, i) => {
-      let qty = blanket.qty;
-      if (!qty) { qty = 1; order.assumedQtyCount = (order.assumedQtyCount || 0) + 1; }
-      addFile(order, { size: blanket.size, qty, sourceUrl: p.url, isUnknown: false, isMoreOf: null },
-        p.caption || p.name || `image ${i + 1}`, '');
-    });
     order.pendingImages = [];
     order.unknownFiles = [];
-    await proceedToSummary(from, session, order);
+    if (blanket.qty) {
+      pend.forEach((p, i) => {
+        addFile(order, { size: blanket.size, qty: blanket.qty, sourceUrl: p.url, isUnknown: false, isMoreOf: null },
+          p.caption || p.name || `image ${i + 1}`, '');
+      });
+      await proceedToSummary(from, session, order);
+    } else {
+      order.qtyPending = pend.map((p, i) => ({
+        size: blanket.size, url: p.url, caption: p.caption || p.name, label: `Image ${i + 1}`,
+      }));
+      await askQty(from, session, order);
+    }
     return null;
+  }
+
+  // Reply to the "how many copies?" question (state asking_qty)
+  if (order.state === 'asking_qty' && (order.qtyPending || []).length > 0) {
+    const qtys = parseQtyReply(msg, order.qtyPending.length);
+    if (qtys) {
+      clearTimers(from); // cancel the 5-min timeout
+      order.qtyPending.forEach((it, i) => {
+        addFile(order, { size: it.size, qty: qtys[i], sourceUrl: it.url || null, isUnknown: false, isMoreOf: null },
+          it.caption || it.label, '');
+      });
+      order.qtyPending = [];
+      await proceedToSummary(from, session, order);
+      return null;
+    }
+    return `Just the number of copies please 🙂 — e.g. *all 1*, or list them in order like *2, 1, 3*.`;
   }
 
   // Handle "Are you done sending?" reply
@@ -2164,15 +2275,27 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
 
   if (d.action === 'send_bill') {
     clearTimers(from);
-    if (d.files?.length > 0) _applyGPTFiles(d.files, order);
+    // DOUBLE-COUNT FIX: files parsed on receipt are the source of truth. Only let the AI
+    // supply files when something is still waiting for a size (pending/unknown) or when
+    // nothing was parsed at all. Never re-add files already counted on receipt.
+    const hasPending = order.pendingImages.length > 0 || order.unknownFiles.length > 0;
+    if (d.files?.length > 0 && (hasPending || order.files.length === 0)) {
+      _applyGPTFiles(d.files, order);
+    }
     if (d.pressing) order.pressing = d.pressing;
     // FIX: Never bill without actual file attachment
-    if (order.files.length > 0) {
+    if (order.files.length > 0 || (order.qtyPending || []).length > 0) {
       // If any images still have no size, ask for those deterministically — don't bill incomplete
       if (order.pendingImages.length > 0 || order.unknownFiles.length > 0) {
         order.state = 'asking_image_info';
         session.unansweredCount = 0;
         return buildImageQuestion(session);
+      }
+      // Size known but copies missing → ask once, 5-min timeout assumes 1
+      if ((order.qtyPending || []).length > 0) {
+        session.unansweredCount = 0;
+        await askQty(from, session, order);
+        return null;
       }
       session.unansweredCount = 0;
       await sendBill(from, session, order);
@@ -3454,8 +3577,8 @@ function sw(i){
   [lq,lp,lw,lr,la][i]();
 }
 
-var stateBadge={awaiting_payment:'b-amber',processing:'b-blue',confirming:'b-amber',ready:'b-green',idle:'b-red',receiving:'b-blue',asked_done:'b-blue',asking_image_info:'b-blue',asking_pressing:'b-blue'};
-var stateLabel={awaiting_payment:'Awaiting Payment',processing:'Printing',confirming:'Confirming',ready:'Ready',idle:'Idle',receiving:'Receiving',asked_done:'Done?',asking_image_info:'Asking Details',asking_pressing:'Pressing?'};
+var stateBadge={awaiting_payment:'b-amber',processing:'b-blue',confirming:'b-amber',ready:'b-green',idle:'b-red',receiving:'b-blue',asked_done:'b-blue',asking_image_info:'b-blue',asking_pressing:'b-blue',asking_qty:'b-blue'};
+var stateLabel={awaiting_payment:'Awaiting Payment',processing:'Printing',confirming:'Confirming',ready:'Ready',idle:'Idle',receiving:'Receiving',asked_done:'Done?',asking_image_info:'Asking Details',asking_pressing:'Pressing?',asking_qty:'Asking Copies'};
 
 function lq(){
   api('/api/stats').then(function(st){
