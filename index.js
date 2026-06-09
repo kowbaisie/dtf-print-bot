@@ -138,7 +138,7 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── Model ─────────────────────────────────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v59';
+const BOT_VERSION = 'v61';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -586,11 +586,12 @@ YOUR RESPONSIBILITIES:
 4. If files are waiting for size/qty → ask clearly, set action="ask_size_qty"
 5. Answer FAQs about location, prices, hours, MoMo number directly
 6. If customer mentions cash/no MoMo → say exactly: "Printing can only start after Payment Confirmation. Thank you."
-7. For ANY greeting or informal opener (hi, hello, good morning, afernon, morning, yoo man, whatsup, migo, dtf, etc — even misspelled or informal) → reply with the SHORTEST possible warm response. Just 1-3 words + emoji. e.g. Hi! 👋 or Good morning! 😊. Nothing more. Do NOT add DTF prompt.
+7. For ANY greeting (hi, hello, good morning, afernon, morning, yoo man, whatsup, etc — even misspelled or informal) → reply with the SHORTEST possible warm response. Just 1-3 words + emoji. e.g. Hi! 👋 or Good morning! 😊. Nothing more. Do NOT add DTF prompt. Do NOT greet twice — if you already greeted, move the conversation forward instead.
+7b. If the customer names the service or signals they want to print (e.g. "dtf", "printing", "print", "migo", "I want to print") but has NOT sent a file yet → reply ONCE, briefly: "Sure! 😊 Send your design and tell me the size (A4/A3/A2) and how many copies." Treat this as intent to order, NOT a greeting.
 8. If you cannot answer → say "Let me get someone to assist you shortly."
 9. AUDIT your response before returning — make sure sizes, quantities and prices are 100% correct
 10. NEVER swap sizes between files. Image 1 = first file mentioned, Image 2 = second file, etc.
-11. NEVER ask for information the customer already gave. If they said "one", "5 copies", "ten pieces" — use it. Do not ask again. If the customer gives a blanket size like "all are A3" or "make them all A4 10 copies", apply it to EVERY file they sent and proceed to the bill — do NOT re-ask or re-confirm. If a file has a known size but no quantity, assume 1 copy and continue to the bill — NEVER escalate to a human or say the order is "too complex" just because quantities are missing.
+11. NEVER ask for information the customer already gave. If they said "one", "5 copies", "ten pieces" — use it. Do not ask again. If the customer gives a blanket size like "all are A3" or "make them all A4 10 copies", apply it to EVERY file they sent. If every file has a size AND quantity, proceed to the bill. If any file has a known size but the quantity is missing, set action="ask_size_qty" — do NOT assume a quantity, and NEVER escalate to a human or say the order is "too complex" just because quantities are missing.
 12. If customer ONLY asks about prices (how much, price, cost etc.) → give prices and STOP. Never push for an order after a price enquiry.
 13. Read filenames and captions carefully to extract size and quantity. "A3_5copies.png" means A3×5. "A2 13COPIES.png" means A2×13. Use this — never ignore filename info.
 
@@ -618,59 +619,6 @@ RESPONSE FORMAT — return ONLY valid JSON, no markdown, no explanation:
 
 STYLE: Warm, professional, clear British English. Short and direct. Never say you are AI.`;
 
-  return `You are the AI brain for Migo Print Shop WhatsApp bot. You have FULL CONTROL of this conversation.
-
-SHOP INFO:
-- Name: Migo Print Shop
-- Location: Circle branch, near Benz Gate, Calvary Church side, Accra, Ghana
-- Service: DTF sheet printing ONLY
-- Payment: MTN MoMo 0552719245 (Kow Habib Baisie) or cash at shop
-- Hours: Open Mon–Sun, orders accepted anytime${customerName}
-
-PRICING (NEVER guess or change these):
-- A4 sheet = GHS 3.20
-- A3 sheet = GHS 6.40
-- A2 sheet = GHS 16.00
-- Pressing: calculated per order — do NOT quote rates to customers${filesReceived}${pendingFiles}${unknownFiles}${currentBill}${kb}
-
-YOUR RESPONSIBILITIES:
-1. Read the ENTIRE conversation history before responding
-2. Understand what files have been sent and what sizes/quantities were given
-3. When ALL files have size and quantity → set action="send_bill" with the files array
-4. If files are waiting for size/qty → ask clearly, set action="ask_size_qty"
-5. Answer FAQs about location, prices, hours, MoMo number directly
-6. If customer mentions cash/no MoMo → say exactly: "Printing can only start after Payment Confirmation. Thank you."
-7. For ANY greeting or informal opener (hi, hello, good morning, afernon, morning, yoo man, whatsup, migo, dtf, etc — even misspelled or informal) → reply with the SHORTEST possible warm response. Just 1-3 words + emoji. e.g. Hi! 👋 or Good morning! 😊. Nothing more. Do NOT add DTF prompt.
-8. If you cannot answer → say "Let me get someone to assist you shortly."
-9. AUDIT your response before returning — make sure sizes, quantities and prices are 100% correct
-10. NEVER swap sizes between files. Image 1 = first file mentioned, Image 2 = second file, etc.
-11. NEVER ask for information the customer already gave. If they said "one", "5 copies", "ten pieces" — use it. Do not ask again. If the customer gives a blanket size like "all are A3" or "make them all A4 10 copies", apply it to EVERY file they sent and proceed to the bill — do NOT re-ask or re-confirm. If a file has a known size but no quantity, assume 1 copy and continue to the bill — NEVER escalate to a human or say the order is "too complex" just because quantities are missing.
-12. If customer ONLY asks about prices (how much, price, cost etc.) → give prices and STOP. Never push for an order after a price enquiry.
-13. Read filenames and captions carefully to extract size and quantity. "A3_5copies.png" means A3×5. "A2 13COPIES.png" means A2×13. Use this — never ignore filename info.
-
-BILL CALCULATION RULES (when action=send_bill):
-- List every file with its size and qty in the files array
-- The code will calculate the exact price — you do NOT calculate
-- Only set send_bill when you are 100% sure all files have size AND quantity
-
-RESPONSE FORMAT — return ONLY valid JSON, no markdown, no explanation:
-{
-  "reply": "your message to the customer",
-  "action": "none | send_bill | ask_size_qty | cannot_answer",
-  "files": [{"size":"A4","qty":10},{"size":"A3","qty":5}],
-  "pressing": null,
-  "customerName": null
-}
-
-- files: array of all files with confirmed size+qty. Empty [] if not ready.
-- pressing: {"shirts":5,"type":"front","largeArtwork":false} or null
-- customerName: extracted name if customer mentioned it, or null
-- action "send_bill": only when files array has ALL files with size+qty confirmed
-- action "none": normal conversation, no bill yet
-- action "ask_size_qty": waiting for size/qty from customer
-- action "cannot_answer": escalate to human
-
-STYLE: Warm, professional, clear British English. Short and direct. Never say you are AI.`;
 }
 
 function addToHistory(s, role, content) {
@@ -2058,6 +2006,23 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       if (/night/i.test(m)) return `Good night! 😊`;
       return `Hi! 👋`;
     }
+
+    // Customer typed a size/quantity but hasn't attached anything yet (e.g. "2a4", "A3 5") → ask for the file.
+    const qp = quickParse(m);
+    if (qp.length && qp[0].size) {
+      const f = qp[0];
+      const qtyTxt = f.qty ? ` × ${f.qty}` : '';
+      return `Got it — *${f.size}${qtyTxt}* 👍 Now send your design file 📎 and I'll prepare your bill.`;
+    }
+
+    // Customer named the service / signalled they want to print, but no file yet → start once (NOT a greeting).
+    if (/^(dtf|printing|print|migo|order|i\s*(want|need|would\s*like)\b.*\b(print|dtf|design)|want\s*(to\s*)?(print|dtf))\b/i.test(m)) {
+      if (!session.startPrompted) {
+        session.startPrompted = true;
+        return `Sure! 😊 Send your design and tell me the size (A4/A3/A2) and how many copies.`;
+      }
+      return null; // already prompted — don't greet again or repeat
+    }
   }
 
   // ── FAQ quick-match — runs for ALL states ─────────────────
@@ -2109,6 +2074,15 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     return `Still printing. 🖨️ Ready by *${eta}*. We'll notify you!`;
   }
 
+  // Casual acknowledgement after an order is done (paid / printing / ready) — just an
+  // "ok / thanks / 👍" with no new file. Acknowledge silently; never route to billing.
+  if ((readyOrder || processingOrder) && !mediaUrl) {
+    const ack = (msg || '').trim().toLowerCase().replace(/[.!,\s]+$/u, '');
+    if (/^(ok|okay|k|kk|alright|aii|cool|great|nice|fine|good|noted|sure|thanks|thank you|thank u|thx|tnx|ty|received|got it|👍|🙏|😊|🙂)$/i.test(ack)) {
+      return null; // nothing to bill — stay quiet
+    }
+  }
+
   // ── AWAITING PAYMENT ──────────────────────────────────────
   if (order.state === 'awaiting_payment') {
     const lower = (msg || '').toLowerCase();
@@ -2146,6 +2120,11 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
 
   // ── FILE RECEIVED — silent collect, 30s timer ────────────
   if (mediaUrl) {
+    // A new file after a FINISHED order (paid / printing / ready) starts a fresh order,
+    // so it never attaches to the closed one.
+    if (order.paymentReceived || ['processing','ready'].includes(order.state)) {
+      order = startNewOrder(session);
+    }
     const fileLabel = filename || (isImage ? 'image' : 'file');
     const captionNote = msg ? `, caption: "${msg}"` : '';
     const fileDesc = `[FILE RECEIVED: "${fileLabel}", type: ${mediaType||'unknown'}${captionNote}]`;
@@ -2275,6 +2254,11 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
 
   if (d.action === 'send_bill') {
     clearTimers(from);
+    // LOCK FINISHED ORDERS: once an order is paid / printing / ready it is closed —
+    // never generate a bill for it again (stops a stray "Ok" re-triggering a receipt).
+    if (order.paymentReceived || ['processing','ready'].includes(order.state)) {
+      return null;
+    }
     // DOUBLE-COUNT FIX: files parsed on receipt are the source of truth. Only let the AI
     // supply files when something is still waiting for a size (pending/unknown) or when
     // nothing was parsed at all. Never re-add files already counted on receipt.
@@ -2911,13 +2895,21 @@ async function sendDailySummary() {
     cashByWorker[k] = (cashByWorker[k] || 0) + p.amount;
   });
   const wb = Object.entries(cashByWorker).map(([w,a]) => `  ${w}: GHS ${a.toFixed(2)}`).join('\n') || '  None';
-  // Production report
-  const todayArchive = jobArchive.filter(a => a.archivedDate === todayStr());
+  // Production report — count from today's PAID orders (money = work done today),
+  // deduplicated by job so a partial/second payment doesn't double-count the sheets.
   const bySize = { A4: 0, A3: 0, A2: 0 };
-  todayArchive.forEach(job => {
-    (job.files || []).forEach(f => { if (bySize[f.size] !== undefined) bySize[f.size] += f.qty || 0; });
+  const paidJobs = new Map(); // jobId → files (first payment wins)
+  todayP.forEach(p => {
+    const key = p.jobId && p.jobId !== '—' ? p.jobId : `noid:${p.phone}:${p.ts}`;
+    if (!paidJobs.has(key)) paidJobs.set(key, p.files || []);
   });
-  const completed = todayArchive.filter(a => a.reason === 'completed').length;
+  paidJobs.forEach(files => {
+    (files || []).forEach(f => { if (bySize[f.size] !== undefined) bySize[f.size] += f.qty || 0; });
+  });
+  // "Completed" = jobs paid today (printing starts right after payment). Switch to
+  // jobArchive 'completed' count here if you'd rather count only picked-up jobs.
+  const completed = paidJobs.size;
+  const todayArchive = jobArchive.filter(a => a.archivedDate === todayStr());
   const abandoned = todayArchive.filter(a => a.reason === 'abandoned').length;
   const overdueCount = auditLog.filter(a => a.action === 'JOB_OVERDUE' && a.date === todayStr()).length;
 
