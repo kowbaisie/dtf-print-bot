@@ -173,7 +173,9 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── Model ─────────────────────────────────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v63';
+const BOT_VERSION = 'v64';
+const SILENCE_MS  = parseInt(process.env.RECEIVE_SILENCE_MS, 10) || 60000;
+const ASK_DONE_MS = parseInt(process.env.ASK_DONE_MS, 10) || 60000;
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -2027,6 +2029,42 @@ function _applyGPTFiles(gptFiles, order) {
   order.unknownFiles = [];
 }
 
+function armSilence(from, session, order) {
+  order.state = 'receiving';
+  setTimer(from, 'checkin', SILENCE_MS, async () => {
+    if (order.state !== 'receiving') return;
+    order.state = 'asked_done';
+    await sendMsg(from, 'Are you done sending? \u{1F44D}');
+    setTimer(from, 'nodone', ASK_DONE_MS, async () => {
+      if (order.state === 'asked_done') await proceedToSummary(from, session, order);
+    });
+  });
+}
+
+function applyCaptionToLastFile(order, text) {
+  const lf = order._lastNamedFile;
+  if (lf) {
+    const merged = mergeNameCaption(lf.filename, text);
+    removeNamedContribution(order, lf.name);
+    if (merged.size && merged.qty != null) order.files.push({ size: merged.size, qty: merged.qty, source: lf.filename, notes: '', sourceUrl: lf.url || null, _name: lf.name });
+    else if (merged.size) { order.qtyPending = order.qtyPending || []; order.qtyPending.push({ size: merged.size, url: lf.url || null, caption: text, label: lf.filename, _name: lf.name }); }
+    else order.unknownFiles.push({ name: lf.filename, url: lf.url || null, _name: lf.name });
+    return;
+  }
+  if (order.pendingImages.length === 1 && !order.unknownFiles.length) {
+    const sq = parseSizeQty(text); const img = order.pendingImages[0];
+    if (sq.size && sq.qty != null) { order.pendingImages = []; addFile(order, { size: sq.size, qty: sq.qty, sourceUrl: img.url, isUnknown: false, isMoreOf: null }, text, ''); }
+    else if (sq.size) { order.pendingImages = []; order.qtyPending = order.qtyPending || []; order.qtyPending.push({ size: sq.size, url: img.url, caption: text, label: 'Image 1' }); }
+  }
+}
+
+function isDoneText(msg) {
+  const t = (msg || '').trim().toLowerCase();
+  if (!t) return false;
+  if (/\b(bill|invoice)\b|send.*(bill|invoice)|that.?s? ?all|all done|i.?m done|am done|finish(ed)?|go ahead|proceed/i.test(t)) return true;
+  return /^(yes|yep|yeah|yh|ok|okay|done|sure)\b/i.test(t) || isYes(t);
+}
+
 async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage) {
   const msg     = (body || '').trim();
   logMsg(from, 'in', msg || '[media]');
@@ -2249,15 +2287,8 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
         }
         addToHistory(session, 'user', `${fileDesc} -> ${isResend ? 'corrected ' : ''}${merged.size || '?'}x${merged.qty != null ? merged.qty : '?'}`);
       }
-      order.state = 'receiving';
-      setTimer(from, 'checkin', 30000, async () => {
-        if (order.state !== 'receiving') return;
-        order.state = 'asked_done';
-        await sendMsg(from, `Are you done sending? 👍`);
-        setTimer(from, 'nodone', 60000, async () => {
-          if (order.state === 'asked_done') await proceedToSummary(from, session, order);
-        });
-      });
+      order._lastNamedFile = { name: fnNorm, filename, url: mediaUrl };
+      armSilence(from, session, order);
       return null;
     }
 
@@ -2290,23 +2321,9 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       }
     }
 
-    order.state = 'receiving';
-
-    // 30s timer — fires after customer stops sending files
-    // Resets every time a new file arrives
-    setTimer(from, 'checkin', 30000, async () => {
-      if (order.state !== 'receiving') return;
-      order.state = 'asked_done';
-      await sendMsg(from, `Are you done sending? 👍`);
-      // If no reply in 60s, assume yes and proceed
-      setTimer(from, 'nodone', 60000, async () => {
-        if (order.state === 'asked_done') {
-          await proceedToSummary(from, session, order);
-        }
-      });
-    });
-
-    return null; // Silent — no reply while collecting files
+    order._lastNamedFile = null;
+    armSilence(from, session, order);
+    return null; // Silent - no reply while collecting files
   }
 
   // ── TEXT MESSAGE ─────────────────────────────────────────
@@ -2356,23 +2373,24 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     return `Just the number of copies please 🙂 — e.g. *all 1*, or list them in order like *2, 1, 3*.`;
   }
 
-  // Handle "Are you done sending?" reply
+  if (!mediaUrl && order.state === 'receiving' &&
+      (order.files.length || order.pendingImages.length || order.unknownFiles.length || (order.qtyPending || []).length)) {
+    if (isNo(msg)) { armSilence(from, session, order); return null; }
+    if (isDoneText(msg)) { clearTimers(from); await proceedToSummary(from, session, order); return null; }
+    const sq = parseSizeQty(msg);
+    if (sq.size || sq.qty != null) { applyCaptionToLastFile(order, msg); armSilence(from, session, order); return null; }
+    const faq = (typeof tryFAQ === 'function') ? tryFAQ(msg) : null;
+    armSilence(from, session, order);
+    return faq || null;
+  }
+
   if (order.state === 'asked_done') {
     clearTimers(from);
-    if (isNo(msg)) {
-      // Customer still sending — go back to receiving
-      order.state = 'receiving';
-      setTimer(from, 'checkin', 30000, async () => {
-        if (order.state !== 'receiving') return;
-        order.state = 'asked_done';
-        await sendMsg(from, `Are you done sending? 👍`);
-        setTimer(from, 'nodone', 60000, async () => {
-          if (order.state === 'asked_done') await proceedToSummary(from, session, order);
-        });
-      });
-      return null;
+    if (isNo(msg)) { armSilence(from, session, order); return null; }
+    const sqd = parseSizeQty(msg);
+    if (!isDoneText(msg) && (sqd.size || sqd.qty != null)) {
+      applyCaptionToLastFile(order, msg); armSilence(from, session, order); return null;
     }
-    // Yes or any text → proceed
     await proceedToSummary(from, session, order);
     return null;
   }
