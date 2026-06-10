@@ -159,11 +159,19 @@ function orderFormLink(phone, order) {
 // One row per design the customer sent (sized files keep their values; unsized start blank).
 function ensureFormDesigns(order) {
   const rows = [];
-  (order.files || []).forEach(f => rows.push({ label: `Design ${rows.length + 1}`, size: f.size, qty: f.qty || 1, url: f.sourceUrl || null }));
-  (order.pendingImages || []).forEach(p => rows.push({ label: `Design ${rows.length + 1}`, size: null, qty: null, url: p.url || null }));
-  (order.unknownFiles || []).forEach(p => rows.push({ label: `Design ${rows.length + 1}`, size: null, qty: null, url: p.url || null }));
-  (order.qtyPending || []).forEach(p => rows.push({ label: `Design ${rows.length + 1}`, size: p.size || null, qty: null, url: p.url || null }));
-  if (!rows.length) rows.push({ label: 'Design 1', size: null, qty: null, url: null });
+  const push = (size, qty, url) => rows.push({ label: `Design ${rows.length + 1}`, size: size || null, qty: (qty != null ? qty : null), url: url || null });
+  const seq = order._designs || [];
+  if (seq.length) {
+    // Prefill each design from its FILENAME (the clear part); the customer adjusts on the form.
+    seq.forEach(d => { const fp = parseSizeQty(d.filename || ''); push(fp.size, fp.qty, d.url); });
+    (order.pendingImages || []).forEach(p => push(null, null, p.url));
+  } else {
+    (order.files || []).forEach(f => push(f.size, f.qty || 1, f.sourceUrl));
+    (order.pendingImages || []).forEach(p => push(null, null, p.url));
+    (order.unknownFiles || []).forEach(p => push(null, null, p.url));
+    (order.qtyPending || []).forEach(p => push(p.size, null, p.url));
+  }
+  if (!rows.length) push(null, null, null);
   order.formDesigns = rows;
   return rows;
 }
@@ -173,7 +181,7 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── Model ─────────────────────────────────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v64';
+const BOT_VERSION = 'v70';
 const SILENCE_MS  = parseInt(process.env.RECEIVE_SILENCE_MS, 10) || 60000;
 const ASK_DONE_MS = parseInt(process.env.ASK_DONE_MS, 10) || 60000;
 const BOT_START   = Date.now();
@@ -1801,6 +1809,23 @@ async function proceedToSummary(phone, session, order) {
     order.state = 'receiving'; return;
   }
 
+  // 2+ files where a caption was involved → too ambiguous to attribute captions in chat.
+  // Send the PREFILLED tap-to-choose form (single source of truth) instead of guessing.
+  const _designCount = order.files.length + (order.qtyPending || []).length + order.unknownFiles.length + order.pendingImages.length;
+  if (_designCount >= 2 && order._captionSeen) {
+    order.state = 'asking_image_info';
+    ensureFormDesigns(order);
+    const link = orderFormLink(phone, order);
+    await sendMsg(phone, [
+      `\u{1F4CB} You've sent *${order.formDesigns.length} designs* with captions.`,
+      `To make sure each one is exactly right, tap here to set the size & copies \u{1F447}`,
+      link,
+      ``,
+      `_I've pre-filled them from your file names \u2014 just adjust anything and confirm._`,
+    ].join('\n'));
+    return;
+  }
+
   // Files with no size/qty — single design asks in text; multi-design gets the tap-to-choose link.
   if (order.pendingImages.length > 0 || order.unknownFiles.length > 0) {
     order.state = 'asking_image_info';
@@ -2041,14 +2066,29 @@ function armSilence(from, session, order) {
   });
 }
 
-function applyCaptionToLastFile(order, text) {
-  const lf = order._lastNamedFile;
-  if (lf) {
-    const merged = mergeNameCaption(lf.filename, text);
-    removeNamedContribution(order, lf.name);
-    if (merged.size && merged.qty != null) order.files.push({ size: merged.size, qty: merged.qty, source: lf.filename, notes: '', sourceUrl: lf.url || null, _name: lf.name });
-    else if (merged.size) { order.qtyPending = order.qtyPending || []; order.qtyPending.push({ size: merged.size, url: lf.url || null, caption: text, label: lf.filename, _name: lf.name }); }
-    else order.unknownFiles.push({ name: lf.filename, url: lf.url || null, _name: lf.name });
+// Track every named file in ARRIVAL ORDER so a separate caption text can be matched to the
+// right file. `captioned` = a caption has already been applied to this design.
+function upsertDesign(order, name, filename, url, captioned) {
+  order._designs = order._designs || [];
+  let d = order._designs.find(x => x.name === name);
+  if (!d) { d = { name, filename, url: url || null, captioned: !!captioned }; order._designs.push(d); }
+  else { d.filename = filename; if (url) d.url = url; if (captioned) d.captioned = true; }
+  return d;
+}
+
+// A caption that arrives as a SEPARATE text (the gateway often splits a document's caption off)
+// is applied to the FIRST file still awaiting a caption, in the order files were sent — so with
+// two files, the first caption corrects the first file and the second corrects the second.
+function applyLooseCaption(order, text) {
+  const seq = order._designs || [];
+  const d = seq.find(x => !x.captioned) || seq[seq.length - 1];
+  if (d) {
+    const merged = mergeNameCaption(d.filename, text);
+    removeNamedContribution(order, d.name);
+    if (merged.size && merged.qty != null) order.files.push({ size: merged.size, qty: merged.qty, source: d.filename, notes: '', sourceUrl: d.url || null, _name: d.name });
+    else if (merged.size) { order.qtyPending = order.qtyPending || []; order.qtyPending.push({ size: merged.size, url: d.url || null, caption: text, label: d.filename, _name: d.name }); }
+    else order.unknownFiles.push({ name: d.filename, url: d.url || null, _name: d.name });
+    d.captioned = true;
     return;
   }
   if (order.pendingImages.length === 1 && !order.unknownFiles.length) {
@@ -2287,7 +2327,8 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
         }
         addToHistory(session, 'user', `${fileDesc} -> ${isResend ? 'corrected ' : ''}${merged.size || '?'}x${merged.qty != null ? merged.qty : '?'}`);
       }
-      order._lastNamedFile = { name: fnNorm, filename, url: mediaUrl };
+      upsertDesign(order, fnNorm, filename, mediaUrl, hasCaption);
+      if (hasCaption) order._captionSeen = true;
       armSilence(from, session, order);
       return null;
     }
@@ -2321,7 +2362,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       }
     }
 
-    order._lastNamedFile = null;
+    // inline (unnamed) photo: a loose caption still maps to named files first, else this image
     armSilence(from, session, order);
     return null; // Silent - no reply while collecting files
   }
@@ -2378,7 +2419,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     if (isNo(msg)) { armSilence(from, session, order); return null; }
     if (isDoneText(msg)) { clearTimers(from); await proceedToSummary(from, session, order); return null; }
     const sq = parseSizeQty(msg);
-    if (sq.size || sq.qty != null) { applyCaptionToLastFile(order, msg); armSilence(from, session, order); return null; }
+    if (sq.size || sq.qty != null) { order._captionSeen = true; applyLooseCaption(order, msg); armSilence(from, session, order); return null; }
     const faq = (typeof tryFAQ === 'function') ? tryFAQ(msg) : null;
     armSilence(from, session, order);
     return faq || null;
@@ -2389,7 +2430,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     if (isNo(msg)) { armSilence(from, session, order); return null; }
     const sqd = parseSizeQty(msg);
     if (!isDoneText(msg) && (sqd.size || sqd.qty != null)) {
-      applyCaptionToLastFile(order, msg); armSilence(from, session, order); return null;
+      order._captionSeen = true; applyLooseCaption(order, msg); armSilence(from, session, order); return null;
     }
     await proceedToSummary(from, session, order);
     return null;
@@ -3296,17 +3337,17 @@ function orderFormPage(order, token, mode) {
 <title>${shop} — Your Order</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{--brand:#F77F00;--brand2:#E36A00;--bg:#f4f4f6;--card:#fff;--ink:#17171c;--mut:#73737d;--line:#ececed;--ok:#16a34a}
+:root{--brand:#4E9E25;--brand2:#3B7D17;--bg:#f4f4f6;--card:#fff;--ink:#17171c;--mut:#73737d;--line:#ececed;--ok:#16a34a}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 body{margin:0;font-family:'Space Grotesk',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink);padding-bottom:120px}
 .wrap{max-width:560px;margin:0 auto;padding:18px 16px}
 .head{display:flex;align-items:center;gap:12px;padding:6px 2px 16px}
-.logo{width:46px;height:46px;border-radius:13px;background:linear-gradient(135deg,var(--brand),var(--brand2));display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 6px 16px rgba(247,127,0,.32)}
+.logo{width:46px;height:46px;border-radius:13px;background:linear-gradient(135deg,var(--brand),var(--brand2));display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 6px 16px rgba(78,158,37,.32)}
 .brand{font-weight:700;font-size:19px;letter-spacing:-.3px}
 .loc{color:var(--mut);font-size:12.5px;margin-top:1px}
 .sub{font-size:14px;color:var(--mut);margin:2px 2px 14px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,.03)}
-.allbar{background:linear-gradient(135deg,#fff7ef,#fff);border:1px dashed #f0c79a}
+.allbar{background:linear-gradient(135deg,#f1f8e1,#fff);border:1px dashed #c5e1a5}
 .allbar .t{font-weight:600;font-size:13px;margin-bottom:10px;color:var(--brand2)}
 .row{display:flex;align-items:center;gap:12px}
 .thumb{width:52px;height:52px;border-radius:11px;background:#f1f1f4;display:flex;align-items:center;justify-content:center;font-size:22px;overflow:hidden;flex:0 0 auto}
@@ -3316,16 +3357,16 @@ body{margin:0;font-family:'Space Grotesk',system-ui,-apple-system,Segoe UI,Robot
 .sz{flex:1;border:1.5px solid var(--line);border-radius:12px;padding:10px 4px;text-align:center;cursor:pointer;background:#fff;transition:.12s;user-select:none}
 .sz b{display:block;font-size:15px;font-weight:700}
 .sz span{display:block;font-size:11px;color:var(--mut);margin-top:2px}
-.sz.on{border-color:var(--brand);background:#fff6ec;box-shadow:0 0 0 3px rgba(247,127,0,.12)}
+.sz.on{border-color:var(--brand);background:#f1f8e1;box-shadow:0 0 0 3px rgba(78,158,37,.12)}
 .sz.on b{color:var(--brand2)}
-.qty{display:flex;align-items:center;gap:0;margin-top:12px;justify-content:flex-end}
-.qty .lab{margin-right:auto;font-size:13px;color:var(--mut)}
-.stp{width:38px;height:38px;border:1.5px solid var(--line);background:#fff;border-radius:11px;font-size:20px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center}
-.qn{min-width:46px;text-align:center;font-size:16px;font-weight:700}
+.qty{display:flex;align-items:center;gap:6px;margin-top:12px;justify-content:flex-end}
+.qty .lab{font-size:13px;color:var(--mut);margin-right:6px}
+.stp{width:44px;height:44px;border:1.5px solid var(--line);background:#fff;border-radius:12px;font-size:26px;font-weight:800;color:#000;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.qn{min-width:30px;text-align:center;font-size:24px;font-weight:800;color:#000}
 .foot{position:fixed;left:0;right:0;bottom:0;background:#fff;border-top:1px solid var(--line);padding:12px 16px calc(12px + env(safe-area-inset-bottom));box-shadow:0 -6px 18px rgba(0,0,0,.05)}
 .foot .in{max-width:560px;margin:0 auto;display:flex;align-items:center;gap:12px}
 .tot{flex:1}.tot .l{font-size:11.5px;color:var(--mut)}.tot .v{font-size:22px;font-weight:700;letter-spacing:-.5px}
-.btn{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;border:0;border-radius:13px;padding:14px 22px;font-size:15px;font-weight:700;font-family:inherit;cursor:pointer;box-shadow:0 6px 16px rgba(247,127,0,.32)}
+.btn{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;border:0;border-radius:13px;padding:14px 22px;font-size:15px;font-weight:700;font-family:inherit;cursor:pointer;box-shadow:0 6px 16px rgba(78,158,37,.32)}
 .btn:disabled{opacity:.55}
 .note{text-align:center;color:var(--mut);font-size:12px;margin-top:14px;padding:0 8px}
 .msg{background:#fff;border:1px solid var(--line);border-radius:16px;padding:26px 18px;text-align:center;margin-top:30px}
@@ -3365,9 +3406,9 @@ function row(d,i){
 function draw(){
   var L=document.getElementById('list');L.innerHTML=D.designs.map(row).join('');
   if(D.designs.length>1){
-    document.getElementById('all').innerHTML='<div class="card allbar"><div class="t">⚡ All the same? Apply to every design</div>'+
+    document.getElementById('all').innerHTML='<div class="card allbar"><div class="t">⚡ All one size? Apply this to all the designs</div>'+
       '<div class="sizes">'+['A4','A3','A2'].map(function(z){return '<div class="sz" id="A'+z+'" onclick="allPick(\\''+z+'\\')"><b>'+z+'</b><span>'+money(P[z])+'</span></div>';}).join('')+'</div>'+
-      '<div class="qty"><span class="lab">Copies each</span><div class="stp" onclick="allBump(-1)">−</div><div class="qn" id="aq">1</div><div class="stp" onclick="allBump(1)">+</div></div>'+
+      '<div class="qty"><span class="lab">Quantity</span><div class="stp" onclick="allBump(-1)">−</div><div class="qn" id="aq">1</div><div class="stp" onclick="allBump(1)">+</div></div>'+
       '<div style="margin-top:12px"><button class="btn" style="width:100%" onclick="applyAll()">Apply to all designs</button></div></div>';
   }
   upd();
