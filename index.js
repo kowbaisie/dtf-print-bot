@@ -133,12 +133,47 @@ const WA_API_SEND = 'https://www.wasenderapi.com/api/send-message';
 const PRICES = { A4: 3.20, A3: 6.40, A2: 16.00 };
 const A4_EQ  = { A4: 1,    A3: 2,    A2: 4     };
 
+// ── Customer order-form (tap-to-choose) ───────────────────────
+const BASE_URL = process.env.BASE_URL || process.env.PUBLIC_URL || 'https://dtf-print-bot.onrender.com';
+function orderSig(payload) {
+  return crypto.createHmac('sha256', 'migo-order-' + (process.env.ADMIN_DASHBOARD_PASSWORD || 'migo'))
+    .update(payload).digest('hex').slice(0, 16);
+}
+function makeOrderToken(phone, ref) {
+  const payload = Buffer.from(`${phone}:${ref}`).toString('base64url');
+  return payload + '.' + orderSig(payload);
+}
+function parseOrderToken(token) {
+  if (!token || !token.includes('.')) return null;
+  const [payload, sig] = token.split('.');
+  if (!payload || !sig || orderSig(payload) !== sig) return null;   // tamper / invalid
+  try {
+    const [phone, ref] = Buffer.from(payload, 'base64url').toString('utf8').split(':');
+    if (!phone || !ref) return null;
+    return { phone, ref: parseInt(ref, 10) };
+  } catch (_) { return null; }
+}
+function orderFormLink(phone, order) {
+  return `${BASE_URL}/order/${makeOrderToken(phone, order.ref)}`;
+}
+// One row per design the customer sent (sized files keep their values; unsized start blank).
+function ensureFormDesigns(order) {
+  const rows = [];
+  (order.files || []).forEach(f => rows.push({ label: `Design ${rows.length + 1}`, size: f.size, qty: f.qty || 1, url: f.sourceUrl || null }));
+  (order.pendingImages || []).forEach(p => rows.push({ label: `Design ${rows.length + 1}`, size: null, qty: null, url: p.url || null }));
+  (order.unknownFiles || []).forEach(p => rows.push({ label: `Design ${rows.length + 1}`, size: null, qty: null, url: p.url || null }));
+  (order.qtyPending || []).forEach(p => rows.push({ label: `Design ${rows.length + 1}`, size: p.size || null, qty: null, url: p.url || null }));
+  if (!rows.length) rows.push({ label: 'Design 1', size: null, qty: null, url: null });
+  order.formDesigns = rows;
+  return rows;
+}
+
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 
 // ── Model ─────────────────────────────────────────────────────
 const MODEL = 'claude-opus-4-8';
 
-const BOT_VERSION = 'v61';
+const BOT_VERSION = 'v63';
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -1358,6 +1393,34 @@ function quickParse(text) {
   return results.length > 0 ? results : [{ size: null, qty: null, isUnknown: true, isMoreOf: null }];
 }
 
+// Deterministic, EXPLICIT-ONLY reader: returns {size, qty} where each is null unless the
+// text actually states it. Unlike quickParse it never defaults a lone size to qty 1 — that
+// distinction is what lets us merge a filename and a caption field-by-field.
+function parseSizeQty(text) {
+  const t = String(text || '').toLowerCase();
+  const sm = t.match(/\ba\s?([234])\b/);
+  const size = sm ? 'A' + sm[1] : null;
+  let qty = null;
+  const cm = t.match(/(\d+)\s*(?:copies|copys|copy|cop|pcs|pc|pieces|piece|prints?|sheets?)\b/);
+  if (cm) qty = parseInt(cm[1], 10);
+  if (qty == null) { const xm = t.match(/[x×]\s*(\d+)/) || t.match(/(\d+)\s*[x×]/); if (xm) qty = parseInt(xm[1], 10); }
+  if (qty == null) {
+    const stripped = t.replace(/\ba\s?[234]\b/g, ' ');
+    const nm = stripped.match(/\b(\d+)\b/);
+    if (nm) qty = parseInt(nm[1], 10);
+  }
+  if (qty != null && (qty < 1 || qty > 999)) qty = null;
+  return { size, qty };
+}
+
+// Merge a filename and a caption field-by-field. The CAPTION wins each field it specifies;
+// anything the caption leaves out falls back to the filename.
+function mergeNameCaption(filename, caption) {
+  const f = parseSizeQty(filename);
+  const c = parseSizeQty(caption);
+  return { size: c.size || f.size || null, qty: (c.qty != null ? c.qty : (f.qty != null ? f.qty : null)) };
+}
+
 // Detect a blanket instruction like "all are A3", "make them all A4 2 copies", "everything A2"
 function parseBlanketSize(msg) {
   if (!msg) return null;
@@ -1456,6 +1519,15 @@ function addFile(order, info, source, notes) {
   const ex = order.files.find(f => f.size === size);
   if (ex) ex.qty += qty;
   else order.files.push({ size, qty, source: source || 'file', notes: notes || '' });
+}
+
+// Remove every contribution a given named file made to the order (wherever it landed),
+// so a re-send of the same filename REPLACES it instead of adding on top.
+function removeNamedContribution(order, nameKey) {
+  if (!nameKey) return;
+  order.files        = (order.files || []).filter(f => f._name !== nameKey);
+  order.qtyPending   = (order.qtyPending || []).filter(q => q._name !== nameKey);
+  order.unknownFiles = (order.unknownFiles || []).filter(u => u._name !== nameKey);
 }
 
 function calcBill(files) {
@@ -1632,13 +1704,31 @@ function parseQtyReply(msg, count) {
   return null;
 }
 
+// Ask the customer for size/copies. For multi-design / messy orders, send the tap-to-choose
+// link (the safe path). For a single design, keep the simple typed question.
+async function sendSizeQtyAsk(phone, session, order, fallbackText) {
+  ensureFormDesigns(order);
+  if ((order.formDesigns || []).length >= 2) {
+    const link = orderFormLink(phone, order);
+    await sendMsg(phone, [
+      `📋 You've sent *${order.formDesigns.length} designs*.`,
+      `Tap here to set the size & copies for each — quick and easy 👇`,
+      link,
+      ``,
+      `_Or just reply here, e.g. *all A3 2*._`,
+    ].join('\n'));
+  } else {
+    await sendMsg(phone, fallbackText);
+  }
+}
+
 // Ask once for all missing quantities, then wait 5 minutes.
 // On timeout: assume 1 copy each (flagged) and bill.
 async function askQty(phone, session, order) {
   if (!order) order = getActiveOrder(session);
   if (!(order.qtyPending || []).length) { await proceedToSummary(phone, session, order); return; }
   order.state = 'asking_qty';
-  await sendMsg(phone, buildQtyQuestion(order));
+  await sendSizeQtyAsk(phone, session, order, buildQtyQuestion(order));
   setTimer(phone, 'qty_timeout', 300000, async () => {
     if (order.state !== 'asking_qty' || !(order.qtyPending || []).length) return;
     order.qtyPending.forEach((it) => {
@@ -1709,10 +1799,10 @@ async function proceedToSummary(phone, session, order) {
     order.state = 'receiving'; return;
   }
 
-  // Files with no size/qty — ask deterministically, listing each image (Image 1, Image 2, …)
+  // Files with no size/qty — single design asks in text; multi-design gets the tap-to-choose link.
   if (order.pendingImages.length > 0 || order.unknownFiles.length > 0) {
     order.state = 'asking_image_info';
-    await sendMsg(phone, buildImageQuestion(session));
+    await sendSizeQtyAsk(phone, session, order, buildImageQuestion(session));
     return;
   }
 
@@ -1991,7 +2081,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
   // ── Instant greeting reply — no GPT delay ────────────────
   // Catches any opening message that looks like a greeting
   // including misspelled ones like "Afernon", "Godd monrin"
-  if (msg && order.state === 'idle' && order.files.length === 0 && !getPendingOrder(session)) {
+  if (msg && !mediaUrl && order.state === 'idle' && order.files.length === 0 && !getPendingOrder(session)) {
     const m = msg.trim().toLowerCase();
     const isSimpleGreeting =
       /^(hi+|hey+|hello+|helo|hy|holla|howdy|yo+|sup)[\s!.,\w]*$/i.test(m) ||
@@ -2129,13 +2219,46 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     const captionNote = msg ? `, caption: "${msg}"` : '';
     const fileDesc = `[FILE RECEIVED: "${fileLabel}", type: ${mediaType||'unknown'}${captionNote}]`;
 
-    // Skip re-sent customer-named files (same specific filename) — count once.
-    // Only applies to meaningful custom names (size/copy keywords); generic names are never deduped.
     const fnNorm = (filename || '').trim().toLowerCase();
-    if (fnNorm && /a[234]|cop|pcs|piece|print/i.test(fnNorm)) {
-      order._seenNames = order._seenNames || [];
-      if (order._seenNames.includes(fnNorm)) return null; // duplicate of a file already in this order
-      order._seenNames.push(fnNorm);
+
+    // -- NAMED FILE (a file with a real filename, e.g. a document) --------------
+    // Deterministic merge of filename + caption, field-by-field, caption winning each
+    // field it specifies. Re-sending the SAME filename is a CORRECTION: it replaces that
+    // design in place and the LATEST caption always wins -- never double-charged, however
+    // many times it is re-sent. (Inline photos have no filename, so they fall through to
+    // the pending-image flow below and each counts as a new design.)
+    const isGeneric = !fnNorm || /^(image|file|photo|img|picture|untitled)(\.\w+)?$/.test(fnNorm);
+    if (!isGeneric) {
+      const merged     = mergeNameCaption(filename, msg);
+      const isResend   = (order.files || []).some(f => f._name === fnNorm)
+                      || (order.qtyPending || []).some(q => q._name === fnNorm)
+                      || (order.unknownFiles || []).some(u => u._name === fnNorm);
+      const hasCaption = !!(msg && msg.trim());
+      trackFile(from, mediaUrl, filename, mediaType || (isImage ? 'image/jpeg' : 'application/pdf'), msg, session);
+      // A bare re-send (same filename, no new caption) carries no new info -> leave it unchanged.
+      // Otherwise replace this design in place with the latest merge (correction / latest-wins).
+      if (!(isResend && !hasCaption)) {
+        removeNamedContribution(order, fnNorm);          // wipe prior contribution -> replace, never add
+        if (merged.size && merged.qty != null) {
+          order.files.push({ size: merged.size, qty: merged.qty, source: filename, notes: '', sourceUrl: mediaUrl, _name: fnNorm });
+        } else if (merged.size) {                        // size known, copies missing -> ask later
+          order.qtyPending = order.qtyPending || [];
+          order.qtyPending.push({ size: merged.size, url: mediaUrl, caption: msg, label: filename, _name: fnNorm });
+        } else {                                         // no size at all -> needs sizing
+          order.unknownFiles.push({ name: filename, url: mediaUrl, _name: fnNorm });
+        }
+        addToHistory(session, 'user', `${fileDesc} -> ${isResend ? 'corrected ' : ''}${merged.size || '?'}x${merged.qty != null ? merged.qty : '?'}`);
+      }
+      order.state = 'receiving';
+      setTimer(from, 'checkin', 30000, async () => {
+        if (order.state !== 'receiving') return;
+        order.state = 'asked_done';
+        await sendMsg(from, `Are you done sending? 👍`);
+        setTimer(from, 'nodone', 60000, async () => {
+          if (order.state === 'asked_done') await proceedToSummary(from, session, order);
+        });
+      });
+      return null;
     }
 
     if (isImage) {
@@ -2218,8 +2341,13 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     if (qtys) {
       clearTimers(from); // cancel the 5-min timeout
       order.qtyPending.forEach((it, i) => {
-        addFile(order, { size: it.size, qty: qtys[i], sourceUrl: it.url || null, isUnknown: false, isMoreOf: null },
-          it.caption || it.label, '');
+        if (it._name) {
+          removeNamedContribution(order, it._name);
+          order.files.push({ size: it.size, qty: qtys[i], source: it.label || 'file', notes: '', sourceUrl: it.url || null, _name: it._name });
+        } else {
+          addFile(order, { size: it.size, qty: qtys[i], sourceUrl: it.url || null, isUnknown: false, isMoreOf: null },
+            it.caption || it.label, '');
+        }
       });
       order.qtyPending = [];
       await proceedToSummary(from, session, order);
@@ -3139,6 +3267,169 @@ app.post('/momo', async (req, res) => {
   if (text) { const r = await handleMomoEvent(parseMomoSMS(text), 'sms'); return res.json(r); }
   if (amount && phone) { const r = await processPayment(toWaId(phone), amount, 'momo', 'direct'); return res.json(r); }
   res.json({ status: 'ignored' });
+});
+
+// ── Customer order form (tap to choose sizes & copies) ────────
+function orderFormPage(order, token, mode) {
+  const shop = 'Migo Print Shop';
+  const loc  = 'Circle · Near Benz Gate · Accra';
+  const shell = (inner) => `<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>${shop} — Your Order</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--brand:#F77F00;--brand2:#E36A00;--bg:#f4f4f6;--card:#fff;--ink:#17171c;--mut:#73737d;--line:#ececed;--ok:#16a34a}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;font-family:'Space Grotesk',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink);padding-bottom:120px}
+.wrap{max-width:560px;margin:0 auto;padding:18px 16px}
+.head{display:flex;align-items:center;gap:12px;padding:6px 2px 16px}
+.logo{width:46px;height:46px;border-radius:13px;background:linear-gradient(135deg,var(--brand),var(--brand2));display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 6px 16px rgba(247,127,0,.32)}
+.brand{font-weight:700;font-size:19px;letter-spacing:-.3px}
+.loc{color:var(--mut);font-size:12.5px;margin-top:1px}
+.sub{font-size:14px;color:var(--mut);margin:2px 2px 14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,.03)}
+.allbar{background:linear-gradient(135deg,#fff7ef,#fff);border:1px dashed #f0c79a}
+.allbar .t{font-weight:600;font-size:13px;margin-bottom:10px;color:var(--brand2)}
+.row{display:flex;align-items:center;gap:12px}
+.thumb{width:52px;height:52px;border-radius:11px;background:#f1f1f4;display:flex;align-items:center;justify-content:center;font-size:22px;overflow:hidden;flex:0 0 auto}
+.thumb img{width:100%;height:100%;object-fit:cover}
+.dlabel{font-weight:600;font-size:14.5px}
+.sizes{display:flex;gap:8px;margin-top:12px}
+.sz{flex:1;border:1.5px solid var(--line);border-radius:12px;padding:10px 4px;text-align:center;cursor:pointer;background:#fff;transition:.12s;user-select:none}
+.sz b{display:block;font-size:15px;font-weight:700}
+.sz span{display:block;font-size:11px;color:var(--mut);margin-top:2px}
+.sz.on{border-color:var(--brand);background:#fff6ec;box-shadow:0 0 0 3px rgba(247,127,0,.12)}
+.sz.on b{color:var(--brand2)}
+.qty{display:flex;align-items:center;gap:0;margin-top:12px;justify-content:flex-end}
+.qty .lab{margin-right:auto;font-size:13px;color:var(--mut)}
+.stp{width:38px;height:38px;border:1.5px solid var(--line);background:#fff;border-radius:11px;font-size:20px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.qn{min-width:46px;text-align:center;font-size:16px;font-weight:700}
+.foot{position:fixed;left:0;right:0;bottom:0;background:#fff;border-top:1px solid var(--line);padding:12px 16px calc(12px + env(safe-area-inset-bottom));box-shadow:0 -6px 18px rgba(0,0,0,.05)}
+.foot .in{max-width:560px;margin:0 auto;display:flex;align-items:center;gap:12px}
+.tot{flex:1}.tot .l{font-size:11.5px;color:var(--mut)}.tot .v{font-size:22px;font-weight:700;letter-spacing:-.5px}
+.btn{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;border:0;border-radius:13px;padding:14px 22px;font-size:15px;font-weight:700;font-family:inherit;cursor:pointer;box-shadow:0 6px 16px rgba(247,127,0,.32)}
+.btn:disabled{opacity:.55}
+.note{text-align:center;color:var(--mut);font-size:12px;margin-top:14px;padding:0 8px}
+.msg{background:#fff;border:1px solid var(--line);border-radius:16px;padding:26px 18px;text-align:center;margin-top:30px}
+.msg .big{font-size:40px}.msg h2{margin:10px 0 6px;font-size:19px}.msg p{color:var(--mut);font-size:14px;margin:0}
+.tick{color:var(--ok)}
+</style></head><body><div class="wrap">
+<div class="head"><div class="logo">🖨️</div><div><div class="brand">${shop}</div><div class="loc">${loc}</div></div></div>
+${inner}
+</div></body></html>`;
+
+  if (mode === 'invalid')
+    return shell(`<div class="msg"><div class="big">⚠️</div><h2>Link not valid</h2><p>This order link is invalid or has expired. Please head back to WhatsApp and we'll sort you out.</p></div>`);
+  if (mode === 'done')
+    return shell(`<div class="msg"><div class="big tick">✅</div><h2>Order already confirmed</h2><p>Check your WhatsApp chat for your bill and payment details. Thank you! 🙏</p></div>`);
+
+  const designs = (order.formDesigns || []).map(d => ({ label: d.label, size: d.size || null, qty: d.qty || 1, url: d.url || null }));
+  const data = { token, designs, prices: PRICES };
+  const inner = `
+<div class="sub">Tap a size and set how many copies for each design. You only pay after you approve. 👍</div>
+<div id="all"></div>
+<div id="list"></div>
+<div class="note">Printing starts after payment confirmation. 🙏</div>
+<div class="foot"><div class="in"><div class="tot"><div class="l">TOTAL</div><div class="v" id="tot">GHS 0.00</div></div>
+<button class="btn" id="go">Confirm Order</button></div></div>
+<script>
+var D=${JSON.stringify(data)};
+var P=D.prices, S=D.designs.map(function(d){return {size:d.size,qty:d.qty||1};});
+function money(n){return 'GHS '+n.toFixed(2);}
+function total(){var t=0;S.forEach(function(s){if(s.size)t+=P[s.size]*s.qty;});return t;}
+function szHTML(idx,cur){var o=['A4','A3','A2'].map(function(z){var on=cur===z?' on':'';return '<div class="sz'+on+'" onclick="pick('+idx+',\\''+z+'\\')"><b>'+z+'</b><span>'+money(P[z])+'</span></div>';});return o.join('');}
+function row(d,i){
+  var th=d.url?'<div class="thumb"><img src="'+d.url+'" onerror="this.parentNode.innerHTML=\\'🖼️\\'"></div>':'<div class="thumb">🖼️</div>';
+  return '<div class="card"><div class="row">'+th+'<div class="dlabel">'+d.label+'</div></div>'+
+    '<div class="sizes">'+szHTML(i,S[i].size)+'</div>'+
+    '<div class="qty"><span class="lab">Copies</span><div class="stp" onclick="bump('+i+',-1)">−</div><div class="qn" id="q'+i+'">'+S[i].qty+'</div><div class="stp" onclick="bump('+i+',1)">+</div></div></div>';
+}
+function draw(){
+  var L=document.getElementById('list');L.innerHTML=D.designs.map(row).join('');
+  if(D.designs.length>1){
+    document.getElementById('all').innerHTML='<div class="card allbar"><div class="t">⚡ All the same? Apply to every design</div>'+
+      '<div class="sizes">'+['A4','A3','A2'].map(function(z){return '<div class="sz" id="A'+z+'" onclick="allPick(\\''+z+'\\')"><b>'+z+'</b><span>'+money(P[z])+'</span></div>';}).join('')+'</div>'+
+      '<div class="qty"><span class="lab">Copies each</span><div class="stp" onclick="allBump(-1)">−</div><div class="qn" id="aq">1</div><div class="stp" onclick="allBump(1)">+</div></div>'+
+      '<div style="margin-top:12px"><button class="btn" style="width:100%" onclick="applyAll()">Apply to all designs</button></div></div>';
+  }
+  upd();
+}
+var allSize=null,allQty=1;
+function allPick(z){allSize=z;['A4','A3','A2'].forEach(function(x){document.getElementById('A'+x).className='sz'+(x===z?' on':'');});}
+function allBump(d){allQty=Math.max(1,Math.min(999,allQty+d));document.getElementById('aq').textContent=allQty;}
+function applyAll(){if(!allSize){alert('Pick a size to apply.');return;}S.forEach(function(s){s.size=allSize;s.qty=allQty;});draw();}
+function pick(i,z){S[i].size=z;draw();}
+function bump(i,d){S[i].qty=Math.max(1,Math.min(999,S[i].qty+d));document.getElementById('q'+i).textContent=S[i].qty;upd();}
+function upd(){
+  D.designs.forEach(function(d,i){
+    var cards=document.getElementById('list').children[i];
+    if(!cards)return;var sz=cards.querySelectorAll('.sz');['A4','A3','A2'].forEach(function(z,k){sz[k].className='sz'+(S[i].size===z?' on':'');});
+  });
+  document.getElementById('tot').textContent=money(total());
+}
+function submit(){
+  for(var i=0;i<S.length;i++){if(!S[i].size){alert('Please choose a size for '+D.designs[i].label+'.');return;}}
+  var b=document.getElementById('go');b.disabled=true;b.textContent='Confirming…';
+  fetch('/order/'+D.token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:S})})
+   .then(function(r){return r.json();})
+   .then(function(j){
+     if(j.ok){document.querySelector('.wrap').innerHTML='<div class="msg"><div class="big tick">✅</div><h2>Order confirmed!</h2><p>'+(j.msg||'Check WhatsApp for your bill.')+'</p></div>';document.querySelector('.foot').style.display='none';}
+     else{b.disabled=false;b.textContent='Confirm Order';alert(j.msg||'Something went wrong. Please try again.');}
+   }).catch(function(){b.disabled=false;b.textContent='Confirm Order';alert('Network error — please try again.');});
+}
+document.getElementById('go').onclick=submit;
+draw();
+</script>`;
+  return shell(inner);
+}
+
+function resolveOrderFromToken(token) {
+  const info = parseOrderToken(token);
+  if (!info) return null;
+  const session = sessions.get(info.phone);
+  if (!session) return null;
+  const order = session.orders.find(o => o.ref === info.ref);
+  if (!order) return null;
+  return { phone: info.phone, session, order };
+}
+
+app.get('/order/:token', (req, res) => {
+  const r = resolveOrderFromToken(req.params.token);
+  res.set('Content-Type', 'text/html');
+  if (!r) return res.status(404).send(orderFormPage(null, null, 'invalid'));
+  if (r.order.paymentReceived || ['processing', 'ready'].includes(r.order.state)) {
+    return res.send(orderFormPage(r.order, req.params.token, 'done'));
+  }
+  ensureFormDesigns(r.order);
+  res.send(orderFormPage(r.order, req.params.token, 'open'));
+});
+
+app.post('/order/:token', async (req, res) => {
+  const r = resolveOrderFromToken(req.params.token);
+  if (!r) return res.json({ ok: false, msg: 'This order link is invalid or expired.' });
+  const { order, session, phone } = r;
+  if (order.paymentReceived || ['processing', 'ready'].includes(order.state))
+    return res.json({ ok: false, msg: 'This order is already confirmed.' });
+
+  const items = Array.isArray(req.body.items) ? req.body.items : [];
+  const clean = items
+    .map(it => ({ size: String(it.size || '').toUpperCase(), qty: parseInt(it.qty, 10) }))
+    .filter(it => ['A4', 'A3', 'A2'].includes(it.size) && it.qty >= 1 && it.qty <= 999);
+  if (!clean.length) return res.json({ ok: false, msg: 'Please choose a size and at least 1 copy for each design.' });
+
+  // The form is the single source of truth — rebuild the order from it.
+  order.files = [];
+  order.pendingImages = [];
+  order.unknownFiles = [];
+  order.qtyPending = [];
+  order.assumedQtyCount = 0;
+  clean.forEach((it, i) => addFile(order, { size: it.size, qty: it.qty, isUnknown: false, isMoreOf: null }, `order form ${i + 1}`, ''));
+  order.formDesigns = clean.map((it, i) => ({ label: `Design ${i + 1}`, size: it.size, qty: it.qty }));
+
+  clearTimers(phone);
+  await sendBill(phone, session, order);
+  audit('ORDER_FORM_SUBMITTED', phone, clean.map(c => `${c.size}×${c.qty}`).join(', '));
+  res.json({ ok: true, msg: 'Order confirmed! Check WhatsApp for your bill. 🙏' });
 });
 
 // ── Receipt page ──────────────────────────────────────────────
