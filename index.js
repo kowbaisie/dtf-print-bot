@@ -180,8 +180,12 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 
 // ── Model ─────────────────────────────────────────────────────
 const MODEL = 'claude-opus-4-8';
+// AI batch reader (reads ALL filenames+captions at once). Flip off with USE_AI_BATCH_READER=0.
+const AI_BATCH_READER = process.env.USE_AI_BATCH_READER !== '0';
+let _batchLLM = async (user, system) => gptText(await askGPT([{ role:'user', content:user }], system, 600, 15000));
+function __setBatchLLM(fn){ _batchLLM = fn; }
 
-const BOT_VERSION = 'v70';
+const BOT_VERSION = 'v72';
 const SILENCE_MS  = parseInt(process.env.RECEIVE_SILENCE_MS, 10) || 60000;
 const ASK_DONE_MS = parseInt(process.env.ASK_DONE_MS, 10) || 60000;
 const BOT_START   = Date.now();
@@ -1679,8 +1683,10 @@ function buildQtyQuestion(order) {
   const n = items.length;
   if (n === 0) return `How many copies?`;
   if (n === 1) {
+    const nm = String(items[0].label || '').replace(/\.[a-z0-9]+$/i, '').trim();
+    const who = nm ? `*${nm}* (${items[0].size})` : `your *${items[0].size}* file`;
     return [
-      `How many copies of your *${items[0].size}* file? 🙂`,
+      `How many copies of ${who}? 🙂`,
       `(No reply in 5 min → I'll assume *1 copy* and send your bill.)`,
     ].join('\n');
   }
@@ -1718,7 +1724,8 @@ function parseQtyReply(msg, count) {
 // link (the safe path). For a single design, keep the simple typed question.
 async function sendSizeQtyAsk(phone, session, order, fallbackText) {
   ensureFormDesigns(order);
-  if ((order.formDesigns || []).length >= 2) {
+  const _wantLink = order._aiResolved ? order._aiAmbiguous : order._captionSeen;
+  if (_wantLink && (order.formDesigns || []).length >= 2) {
     const link = orderFormLink(phone, order);
     await sendMsg(phone, [
       `📋 You've sent *${order.formDesigns.length} designs*.`,
@@ -1800,19 +1807,93 @@ function startReceiveTimer(phone, session) {
   });
 }
 
+// ── AI BATCH READER ───────────────────────────────────────────
+// Reads the WHOLE batch (every filename + caption + loose note, in arrival
+// order) in ONE Opus call and returns a clean design list. Claude reads INTENT
+// only; deterministic code still does all pricing & confirmation.
+async function aiReadBatch(order) {
+  const batch = (order._batch || []);
+  if (!batch.some(b => b.kind === 'file')) return null;
+  const lines = []; let n = 0;
+  batch.forEach(b => {
+    if (b.kind === 'file') {
+      n++;
+      lines.push(`${n}. FILE: "${b.filename || '(no name)'}"` + (b.caption ? ` (caption: "${b.caption}")` : ''));
+    } else if (b.kind === 'text' && b.text) {
+      lines.push(`   note: "${b.text}"`);
+    }
+  });
+  const system = [
+    'You read what a print-shop customer sent and output ONLY JSON. No prose, no markdown.',
+    'Each FILE is one design. Using the filename, its caption, and any notes (read together, in order),',
+    'determine the paper size (one of A4, A3, A2) and the quantity (number of copies) for each design.',
+    'Conventions: "1pc"/"1 copy"/"x1"/"1 piece"/"1pcs" means qty 1. "A2", "A 2", "a2" all mean size A2.',
+    'A lone size with no number means the quantity is unknown (null). If the SAME filename appears more',
+    'than once it is a correction: use the latest and count it ONCE.',
+    'If a size cannot be determined set size to null. If a quantity cannot be determined set qty to null.',
+    'need = "qty" if only quantity missing, "size" if only size missing, "both" if both missing, else null.',
+    'Set ambiguous to true ONLY when notes/captions cannot be confidently matched to specific files.',
+    'If everything is clear from the filenames alone, ambiguous MUST be false.',
+    'Output EXACTLY this shape:',
+    '{"designs":[{"i":1,"file":"<filename>","size":"A2"|null,"qty":<integer>|null,"need":null|"qty"|"size"|"both"}],"ambiguous":false}',
+  ].join('\n');
+  const user = 'Items the customer sent, in order:\n' + lines.join('\n');
+  let txt;
+  try { txt = await _batchLLM(user, system); } catch (e) { return null; }
+  if (!txt) return null;
+  txt = String(txt).replace(/```json|```/g, '').trim();
+  let parsed = null;
+  try { parsed = JSON.parse(txt); }
+  catch { const m = txt.match(/\{[\s\S]*\}/); if (m) { try { parsed = JSON.parse(m[0]); } catch {} } }
+  if (!parsed || !Array.isArray(parsed.designs) || !parsed.designs.length) return null;
+  const designs = parsed.designs.map((d, i) => {
+    const size = ['A4','A3','A2'].includes(String(d.size || '').toUpperCase()) ? String(d.size).toUpperCase() : null;
+    let qty = parseInt(d.qty, 10); if (!(qty >= 1 && qty <= 999)) qty = null;
+    const file = String(d.file || `Design ${i + 1}`);
+    const need = (!size && !qty) ? 'both' : (!size ? 'size' : (!qty ? 'qty' : null));
+    return { i: i + 1, file, size, qty, need };
+  });
+  return { designs, ambiguous: !!parsed.ambiguous };
+}
+
+// Rebuild the order deterministically from the AI's design list (single source of truth).
+function applyAiDesigns(order, ai) {
+  order.files = []; order.qtyPending = []; order.unknownFiles = []; order.pendingImages = [];
+  order.assumedQtyCount = 0; order._designs = [];
+  ai.designs.forEach(d => {
+    const key = (d.file || '').toLowerCase();
+    if (d.size && d.qty) order.files.push({ size: d.size, qty: d.qty, source: d.file, notes: '', _name: key });
+    else if (d.size)     order.qtyPending.push({ size: d.size, label: d.file, caption: '', _name: key });
+    else                 order.unknownFiles.push({ name: d.file, _name: key });
+    order._designs.push({ name: key, filename: d.file, url: null, captioned: false });
+  });
+  order._aiResolved = true;
+  order._aiAmbiguous = !!ai.ambiguous;
+  order._aiDone = true;
+}
+
 async function proceedToSummary(phone, session, order) {
   if (!order) order = getActiveOrder(session);
 
   // No files at all
-  if (!order.files.length && !order.unknownFiles.length && !order.pendingImages.length) {
+  if (!order.files.length && !order.unknownFiles.length && !order.pendingImages.length && !(order.qtyPending || []).length) {
     await sendMsg(phone, `I could not detect any files. Please send your files and I will calculate the cost.`);
     order.state = 'receiving'; return;
   }
 
-  // 2+ files where a caption was involved → too ambiguous to attribute captions in chat.
-  // Send the PREFILLED tap-to-choose form (single source of truth) instead of guessing.
+  // AI BATCH READER: read the whole batch at once, rebuild deterministically. Falls back
+  // to the existing arrays if the reader is off or the call fails.
+  if (AI_BATCH_READER && !order._aiDone && (order._batch || []).some(b => b.kind === 'file')) {
+    const ai = await aiReadBatch(order);
+    if (ai) applyAiDesigns(order, ai);
+    else order._aiDone = true; // don't keep retrying a failed read for this batch
+  }
+
+  // Ambiguous (captions/notes can't be safely attributed) → PREFILLED tap-to-choose form.
+  // When the AI reader is off, fall back to the old caption-seen signal.
   const _designCount = order.files.length + (order.qtyPending || []).length + order.unknownFiles.length + order.pendingImages.length;
-  if (_designCount >= 2 && order._captionSeen) {
+  const _wantPlanB = order._aiResolved ? order._aiAmbiguous : order._captionSeen;
+  if (_designCount >= 2 && _wantPlanB) {
     order.state = 'asking_image_info';
     ensureFormDesigns(order);
     const link = orderFormLink(phone, order);
@@ -2293,6 +2374,9 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     if (order.paymentReceived || ['processing','ready'].includes(order.state)) {
       order = startNewOrder(session);
     }
+    order._batch = order._batch || [];
+    order._batch.push({ kind: 'file', filename: filename || '', caption: (msg || '').trim(), url: mediaUrl });
+    order._aiDone = false;               // a new file arrived -> the batch must be re-read
     const fileLabel = filename || (isImage ? 'image' : 'file');
     const captionNote = msg ? `, caption: "${msg}"` : '';
     const fileDesc = `[FILE RECEIVED: "${fileLabel}", type: ${mediaType||'unknown'}${captionNote}]`;
@@ -2419,7 +2503,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     if (isNo(msg)) { armSilence(from, session, order); return null; }
     if (isDoneText(msg)) { clearTimers(from); await proceedToSummary(from, session, order); return null; }
     const sq = parseSizeQty(msg);
-    if (sq.size || sq.qty != null) { order._captionSeen = true; applyLooseCaption(order, msg); armSilence(from, session, order); return null; }
+    if (sq.size || sq.qty != null) { order._captionSeen = true; (order._batch=order._batch||[]).push({kind:'text',text:msg}); order._aiDone=false; applyLooseCaption(order, msg); armSilence(from, session, order); return null; }
     const faq = (typeof tryFAQ === 'function') ? tryFAQ(msg) : null;
     armSilence(from, session, order);
     return faq || null;
@@ -2430,7 +2514,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     if (isNo(msg)) { armSilence(from, session, order); return null; }
     const sqd = parseSizeQty(msg);
     if (!isDoneText(msg) && (sqd.size || sqd.qty != null)) {
-      order._captionSeen = true; applyLooseCaption(order, msg); armSilence(from, session, order); return null;
+      order._captionSeen = true; (order._batch=order._batch||[]).push({kind:'text',text:msg}); order._aiDone=false; applyLooseCaption(order, msg); armSilence(from, session, order); return null;
     }
     await proceedToSummary(from, session, order);
     return null;
@@ -3429,12 +3513,19 @@ function upd(){
 function submit(){
   for(var i=0;i<S.length;i++){if(!S[i].size){alert('Please choose a size for '+D.designs[i].label+'.');return;}}
   var b=document.getElementById('go');b.disabled=true;b.textContent='Confirming…';
-  fetch('/order/'+D.token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:S})})
+  var ctrl=('AbortController' in window)?new AbortController():null;
+  var to=setTimeout(function(){ if(ctrl)ctrl.abort(); },25000);
+  fetch('/order/'+D.token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:S}),signal:ctrl?ctrl.signal:undefined})
    .then(function(r){return r.json();})
    .then(function(j){
+     clearTimeout(to);
      if(j.ok){document.querySelector('.wrap').innerHTML='<div class="msg"><div class="big tick">✅</div><h2>Order confirmed!</h2><p>'+(j.msg||'Check WhatsApp for your bill.')+'</p></div>';document.querySelector('.foot').style.display='none';}
      else{b.disabled=false;b.textContent='Confirm Order';alert(j.msg||'Something went wrong. Please try again.');}
-   }).catch(function(){b.disabled=false;b.textContent='Confirm Order';alert('Network error — please try again.');});
+   }).catch(function(){
+     clearTimeout(to);
+     b.disabled=false;b.textContent='Confirm Order';
+     alert('Hmm, the connection is slow. Please check your WhatsApp — if your bill is not there in a minute, tap Confirm Order again. 🙏');
+   });
 }
 document.getElementById('go').onclick=submit;
 draw();
@@ -3467,7 +3558,7 @@ app.post('/order/:token', async (req, res) => {
   const r = resolveOrderFromToken(req.params.token);
   if (!r) return res.json({ ok: false, msg: 'This order link is invalid or expired.' });
   const { order, session, phone } = r;
-  if (order.paymentReceived || ['processing', 'ready'].includes(order.state))
+  if (order.paymentReceived || ['confirming', 'processing', 'ready'].includes(order.state))
     return res.json({ ok: false, msg: 'This order is already confirmed.' });
 
   const items = Array.isArray(req.body.items) ? req.body.items : [];
@@ -3486,9 +3577,17 @@ app.post('/order/:token', async (req, res) => {
   order.formDesigns = clean.map((it, i) => ({ label: `Design ${i + 1}`, size: it.size, qty: it.qty }));
 
   clearTimers(phone);
-  await sendBill(phone, session, order);
+  // Lock immediately (blocks a double-tap), REPLY INSTANTLY, then send the WhatsApp bill
+  // in the BACKGROUND. The page no longer waits on the 6s send-queue or a Render cold
+  // start — that delay is what used to surface to the customer as a false "Network error".
+  order.state = 'confirming';
   audit('ORDER_FORM_SUBMITTED', phone, clean.map(c => `${c.size}×${c.qty}`).join(', '));
   res.json({ ok: true, msg: 'Order confirmed! Check WhatsApp for your bill. 🙏' });
+  sendBill(phone, session, order).catch(err => {
+    console.error('background sendBill failed:', err && err.message);
+    // if the bill never went out, unlock so the customer can retry from the link
+    if (order.state === 'confirming' && !order.paymentReceived) order.state = 'receiving';
+  });
 });
 
 // ── Receipt page ──────────────────────────────────────────────
