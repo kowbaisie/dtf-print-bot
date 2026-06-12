@@ -7,26 +7,6 @@
 //
 // VERSION HISTORY
 //
-// v74 (Jun 2026) — Ready-flow, SMS, reception screen
-//   • Item 6: daily ready-list — every "ready" broadcasts the day's list to
-//     the owner; 🟢 within ETA / 🔴 over; time measured payment→ready; resets
-//     each day. Dashboard view at GET /api/ready-log. Central markJobReady().
-//   • Item 7: Arkesel SMS to the customer on ready (pickup code + directions).
-//     Env: ARKESEL_API_KEY, SMS_SENDER_ID (default MIGO), SHOP_DIRECTIONS.
-//     SMS no-ops safely if ARKESEL_API_KEY is unset.
-//   • Item 8: reception TV queue screen at GET /display (pickup code +
-//     position + due time, auto-refresh).
-//   • Item 11a: Plan B form "Copies" → "Quantity".
-//   • Item 11b: removed the intro blurb at the top of the Plan B form.
-//   • Item 2 (manual) + 11a (worker-fill): admin/worker command
-//     `planb <last4>` (or `W01 planb <last4>`) pushes a chat to Plan B and
-//     returns the link so a worker can fill it on the customer's behalf.
-//   • Item 10: rating flow verified intact (no change).
-//   • Pending for v75 (deeper order/payment surgery): items 1/9/A (all photos
-//     & captioned files → Plan B), 2-auto (frustration auto-switch),
-//     3 (auto-acknowledge "I've paid" text), 5 (edit-after-receipt re-bill).
-//
-//
 // v29 (Jun 2026) — Bill sending hardened
 //   • Replaced ━ box-drawing characters with plain dashes throughout
 //     WasenderAPI was likely rejecting messages with Unicode box chars
@@ -142,13 +122,6 @@ const WASENDER_SID   = process.env.WASENDER_SESSION || 'Migo Print Bot';
 const WEBHOOK_SECRET = process.env.WASENDER_WEBHOOK_SECRET;
 const DESKTOP_KEY    = process.env.DESKTOP_AGENT_KEY || 'migo-agent-2025';
 
-// ── Arkesel SMS (customer pickup SMS) ─────────────────────────
-const ARKESEL_KEY     = process.env.ARKESEL_API_KEY || '';
-const SMS_SENDER_ID   = (process.env.SMS_SENDER_ID || 'MIGO').slice(0, 11); // max 11 chars
-const SMS_ENABLED     = !!ARKESEL_KEY;
-const SHOP_DIRECTIONS = process.env.SHOP_DIRECTIONS ||
-  'Migo Print Shop, Circle - Near Benz Gate, closer to Calvary Church, Accra. Maps: https://maps.google.com/?q=Migo+Print+Shop+Circle+Accra';
-
 // Phone numbers — stored as plain digits for WasenderAPI
 const OWNER_NUMBER = process.env.OWNER_PHONE || '233272006161'; // 0272006161
 const SHOP_NUMBER  = '233552719245';                             // 0552719245
@@ -198,14 +171,20 @@ function orderShortLink(phone, order) {
 // One row per design the customer sent (sized files keep their values; unsized start blank).
 function ensureFormDesigns(order) {
   const rows = [];
-  const push = (size, qty, url, name) => {
+  const push = (size, qty, url, name, labelOverride) => {
     const clean = String(name || '').replace(/\.[a-z0-9]+$/i, '').trim();
-    rows.push({ label: clean || `Design ${rows.length + 1}`, name: name || '', size: size || null, qty: (qty != null ? qty : null), url: url || null });
+    rows.push({ label: labelOverride || clean || `Design ${rows.length + 1}`, name: name || '', size: size || null, qty: (qty != null ? qty : null), url: url || null });
   };
+  const cleanName = (n) => String(n || '').replace(/\.[a-z0-9]+$/i, '').trim() || 'Design';
   const seq = order._designs || [];
   if (seq.length) {
-    // Prefill each design from its FILENAME (the clear part); the customer adjusts on the form.
-    seq.forEach(d => { const fp = parseSizeQty(d.filename || ''); push(fp.size, fp.qty, d.url, d.filename); });
+    // Prefill each design from its FILENAME; a multi-page PDF is listed page-by-page to adjust.
+    seq.forEach(d => {
+      const fp = parseSizeQty(d.filename || '');
+      const pages = (d.pageCount && d.pageCount > 1) ? d.pageCount : 1;
+      if (pages > 1) for (let pg = 1; pg <= pages; pg++) push(fp.size, fp.qty, d.url, d.filename, `${cleanName(d.filename)} \u2014 Page ${pg}`);
+      else push(fp.size, fp.qty, d.url, d.filename);
+    });
     (order.pendingImages || []).forEach(p => push(null, null, p.url, p.name));
   } else {
     (order.files || []).forEach(f => push(f.size, f.qty || 1, f.sourceUrl, f.source));
@@ -227,9 +206,16 @@ const AI_BATCH_READER = process.env.USE_AI_BATCH_READER !== '0';
 let _batchLLM = async (user, system) => gptText(await askGPT([{ role:'user', content:user }], system, 600, 15000));
 function __setBatchLLM(fn){ _batchLLM = fn; }
 
-const BOT_VERSION = 'v74';
+const BOT_VERSION = 'v76';
 const SILENCE_MS  = parseInt(process.env.RECEIVE_SILENCE_MS, 10) || 60000;
 const ASK_DONE_MS = parseInt(process.env.ASK_DONE_MS, 10) || 60000;
+const HUMAN_PAUSE_MS = parseInt(process.env.HUMAN_PAUSE_MS, 10) || 1800000; // 30 min — human-typing pause
+
+// Bot-sent message log — lets the webhook tell a HUMAN-typed outbound from the bot's own echo.
+const _botSentLog = [];
+function _normTxt(x){ return String(x||'').replace(/\s+/g,' ').trim().toLowerCase(); }
+function recordBotSent(body){ const t=_normTxt(body); if(!t) return; _botSentLog.push({t,ts:Date.now()}); if(_botSentLog.length>300) _botSentLog.splice(0,_botSentLog.length-300); }
+function botSentRecently(body){ const t=_normTxt(body); const cut=Date.now()-180000; for(let i=_botSentLog.length-1;i>=0;i--){ if(_botSentLog[i].ts<cut) break; if(_botSentLog[i].t===t) return true; } return false; }
 const BOT_START   = Date.now();
 
 // ── Shop hours ────────────────────────────────────────────────
@@ -316,7 +302,6 @@ let   testMode     = false; // when true, only OWNER_PHONE receives replies
 
 const paymentLedger = [];
 const ratingsLog    = [];
-const readyLog      = [];   // {date, jobId, code, phone, tookMs, onTime, ts} — resets each day
 const auditLog      = [];
 const messageLog    = new Map();
 // ── Random fallback phrases ───────────────────────────────────
@@ -597,6 +582,7 @@ async function sendMsg(to, body) {
   const waId    = to.includes('@') ? to : toWaId(to);
   const toPhone = waId.replace('@s.whatsapp.net', '').replace('@c.us', '');
   logMsg(waId, 'out', body);
+  recordBotSent(body);
   return enqueueSend(waId, toPhone, body);
 }
 
@@ -604,45 +590,8 @@ async function alertOwner(body) {
   const waId    = toWaId(OWNER_NUMBER);
   const toPhone = waId.replace('@s.whatsapp.net', '').replace('@c.us', '');
   logMsg(waId, 'out', body);
+  recordBotSent(body);
   return enqueueSend(waId, toPhone, body);
-}
-
-// ── Arkesel SMS — customer pickup SMS (never throws) ─────────
-// Normalise a WhatsApp id / local number to Ghana MSISDN (233XXXXXXXXX).
-function toMsisdn(phone) {
-  let d = String(phone || '').replace(/@.*/, '').replace(/[^\d]/g, '');
-  if (d.startsWith('233')) return d;
-  if (d.startsWith('0'))   return '233' + d.slice(1);
-  if (d.length === 9)      return '233' + d;            // 552719245 → 233552719245
-  return d;
-}
-async function sendSMS(phone, message) {
-  if (!SMS_ENABLED) { audit('SMS_SKIP', phone, 'ARKESEL_API_KEY not set'); return { ok: false, skipped: true }; }
-  const to = toMsisdn(phone);
-  const payload = JSON.stringify({ sender: SMS_SENDER_ID, message: String(message), recipients: [to] });
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = (r) => { if (!done) { done = true; resolve(r); } };
-    try {
-      const req = https.request({
-        hostname: 'sms.arkesel.com', path: '/api/v2/sms/send', method: 'POST',
-        headers: { 'api-key': ARKESEL_KEY, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
-        timeout: 12000,
-      }, (res) => {
-        let buf = '';
-        res.on('data', c => buf += c);
-        res.on('end', () => {
-          const ok = res.statusCode >= 200 && res.statusCode < 300;
-          audit(ok ? 'SMS_SENT' : 'SMS_FAIL', phone, `${res.statusCode} ${String(buf).slice(0, 120)}`, !ok);
-          if (!ok) alertOwner(`⚠️ SMS to ...${last4(phone)} failed (${res.statusCode}).`).catch(()=>{});
-          finish({ ok, status: res.statusCode, body: buf });
-        });
-      });
-      req.on('timeout', () => { req.destroy(); audit('SMS_FAIL', phone, 'timeout', true); finish({ ok: false, error: 'timeout' }); });
-      req.on('error', (e) => { audit('SMS_FAIL', phone, e.message, true); alertOwner(`⚠️ SMS to ...${last4(phone)} error: ${e.message}`).catch(()=>{}); finish({ ok: false, error: e.message }); });
-      req.write(payload); req.end();
-    } catch (e) { audit('SMS_FAIL', phone, e.message, true); finish({ ok: false, error: e.message }); }
-  });
 }
 
 // ── Claude — all calls use MODEL ─────────────────────────────
@@ -941,7 +890,23 @@ function getPendingOrder(session) {
 
 // Check if bot should be silent (human handling)
 function isBotSilenced(session) {
-  return session.paused === true;
+  if (session.paused !== true) return false;
+  const until = session.pauseUntil || (session.pausedAt ? session.pausedAt + HUMAN_PAUSE_MS : 0);
+  if (until && Date.now() > until) {   // pause window elapsed — bot resumes on its own
+    session.paused = false; session.pausedAt = null; session.pauseUntil = null; session.silenceNoticeSent = false;
+    return false;
+  }
+  return true;
+}
+
+// A human at the shop typed directly in the chat → hand this conversation to the human.
+function humanTakeover(session, phone) {
+  session.paused = true;
+  session.pausedAt = Date.now();
+  session.pauseUntil = Date.now() + HUMAN_PAUSE_MS;
+  session.silenceNoticeSent = false;
+  session.servedBy = 'human';
+  try { clearTimers(phone); } catch (_) {}
 }
 
 // Silence bot and alert owner
@@ -1219,6 +1184,8 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
 
     if ((matchedOrder.totalBill || 0) - matchedOrder.paymentReceived <= 0.01) {
       const overpaid = matchedOrder.paymentReceived - (matchedOrder.totalBill || 0);
+      const _billAmt = matchedOrder.totalBill || 0;
+      if (overpaid > 0.01) alertOwner([`\u{1F4B0} *OVERPAYMENT \u2014 collect change*`, ``, `\u{1F4F1} ${displayPhone(matchedKey)}`, `\u{1F9FE} Bill: GHS ${_billAmt.toFixed(2)}`, `\u{1F4B5} Paid: GHS ${matchedOrder.paymentReceived.toFixed(2)}`, `\u2795 Extra: *GHS ${overpaid.toFixed(2)}*`].join('\n')).catch(() => {});
 
       matchedOrder.confirmedFiles = [...(matchedOrder.confirmedFiles||[]), ...matchedOrder.files];
       matchedOrder.files = []; matchedOrder.paymentReceived = 0; matchedOrder.totalBill = null;
@@ -1226,8 +1193,6 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
       const jobId = generateJobId(matchedKey);
       matchedOrder.jobId = jobId;
       matchedOrder.readyTime = new Date(Date.now() + (getReadyHours(matchedOrder.a4eq || 0) || 24) * 3600000);
-      matchedOrder.paidAt = Date.now();
-      matchedOrder.etaA4eq = matchedOrder.a4eq || 0;
       matchedOrder.overdueReminders = 0;
 
       // Start next order for this customer (ready for new files)
@@ -1349,15 +1314,20 @@ function smartMatchPayment(amount, txId, reference) {
       if (order) return { match: 'txid', key, session: s, order };
     }
   }
-  const candidates = [];
+  const awaiting = [];
   for (const [key, s] of sessions.entries()) {
     const order = s.orders?.find(o => o.state === 'awaiting_payment');
     if (!order) continue;
     const balance = Math.max(0, (order.totalBill || 0) - (order.paymentReceived || 0));
-    if (amount > 0 && amount <= balance * 1.5 + 0.01)
-      candidates.push({ key, session: s, order, balance });
+    awaiting.push({ key, session: s, order, balance });
   }
-  if (candidates.length === 0) return { match: 'none' };
+  if (awaiting.length === 0) return { match: 'none' };
+  // Single order awaiting → it's this payment. Match even if the amount is MORE than the
+  // bill (overpayment); processPayment handles over/under pay and alerts the owner.
+  if (awaiting.length === 1) return { match: 'amount', ...awaiting[0] };
+  // Multiple: prefer orders whose balance is near the amount, then disambiguate by reference.
+  const within = awaiting.filter(c => amount > 0 && amount <= c.balance * 1.5 + 0.01);
+  const candidates = within.length ? within : awaiting;
   if (candidates.length === 1) return { match: 'amount', ...candidates[0] };
   const ref = (reference || '').replace(/[\s\-]/g, '').toUpperCase();
   if (ref && ref !== '0') {
@@ -1746,67 +1716,6 @@ function buildReadyMsg(jobId) {
   ].join('\n');
 }
 
-// ── Ready notifications + daily ready-list (item 6) ───────────
-function fmtDuration(ms) {
-  if (ms == null || ms < 0 || !isFinite(ms)) return '--';
-  const mins = Math.round(ms / 60000);
-  const h = Math.floor(mins / 60), m = mins % 60;
-  if (h && m) return h + 'h ' + m + 'm';
-  if (h)      return h + 'h';
-  return m + 'm';
-}
-function pruneReadyLog() {
-  const today = todayStr();
-  for (let i = readyLog.length - 1; i >= 0; i--) if (readyLog[i].date !== today) readyLog.splice(i, 1);
-}
-function buildReadyListMsg() {
-  pruneReadyLog();
-  const today = readyLog.filter(r => r.date === todayStr());
-  if (!today.length) return null;
-  const lines = today.map(r => (r.onTime ? '🟢' : '🔴') + ' Ready sent to ' + r.code + '  ' + fmtDuration(r.tookMs));
-  return ['📋 *READY TODAY (' + today.length + ')*', ''].concat(lines).join('\n');
-}
-function buildReadySMS(jobId) {
-  return 'Migo Print: your order is READY for pickup. PICKUP CODE: ' + jobId + '. ' +
-         'Show this code to collect (no code = no release). ' + SHOP_DIRECTIONS;
-}
-// Central "mark ready": WhatsApp + SMS to customer, log to daily list, broadcast list, schedule rating.
-async function markJobReady(waId, session, jobIdArg) {
-  if (!session) return { ok: false };
-  const ord = (session.orders || []).find(o => o.jobId && o.jobId === jobIdArg)
-           || (session.orders || []).find(o => o.state === 'processing')
-           || null;
-  const jobId = jobIdArg || ord?.jobId || (typeof sessJobId === 'function' ? sessJobId(session) : null) || session.jobId || '--';
-
-  session.state = 'ready';
-  if (ord) { ord.state = 'ready'; ord.readyAt = Date.now(); }
-  clearTimers(waId);
-
-  const paidAt = ord?.paidAt || null;
-  const tookMs = paidAt ? (Date.now() - paidAt) : null;
-  const etaMs  = ord?.readyTime ? new Date(ord.readyTime).getTime() : null;
-  const onTime = etaMs ? (Date.now() <= etaMs) : true;
-
-  await sendMsg(waId, buildReadyMsg(jobId)).catch(() => {});
-  sendSMS(waId, buildReadySMS(jobId)).catch(() => {});
-
-  pruneReadyLog();
-  readyLog.push({ date: todayStr(), ts: nowStr(), jobId, code: jobId, phone: displayPhone(waId), tookMs, onTime });
-  audit('READY', waId, jobId + ' · ' + fmtDuration(tookMs) + ' · ' + (onTime ? 'on-time' : 'LATE'), !onTime);
-
-  const listMsg = buildReadyListMsg();
-  if (listMsg) alertOwner(listMsg).catch(() => {});
-
-  setTimer(waId, 'rating', 1800000, async () => {
-    if (!session.ratingAsked) {
-      session.ratingAsked = true;
-      await sendMsg(waId, ['⭐ How was your experience at Migo Print Shop?', '',
-        '5 — Excellent  |  4 — Good  |  3 — Okay  |  2 — Poor  |  1 — Very poor'].join('\n'));
-    }
-  });
-  return { ok: true, jobId, tookMs, onTime };
-}
-
 function buildImageQuestion(session) {
   const order = getActiveOrder(session);
   const pend = [...(order.pendingImages || []), ...(order.unknownFiles || [])];
@@ -2008,18 +1917,34 @@ function applyAiDesigns(order, ai) {
   order.files = []; order.qtyPending = []; order.unknownFiles = []; order.pendingImages = [];
   order.assumedQtyCount = 0; order._designs = [];
   const batchFiles = (order._batch || []).filter(b => b.kind === 'file');
-  const urlFor = (file) => { const b = batchFiles.find(x => (x.filename || '') === file); return b ? (b.url || null) : null; };
+  const metaFor = (file) => { const b = batchFiles.find(x => (x.filename || '') === file); return b ? { url: b.url || null, pageCount: b.pageCount || 0 } : { url: null, pageCount: 0 }; };
   ai.designs.forEach(d => {
     const key = (d.file || '').toLowerCase();
-    const url = urlFor(d.file);
-    if (d.size && d.qty) order.files.push({ size: d.size, qty: d.qty, source: d.file, notes: '', sourceUrl: url, _name: key });
-    else if (d.size)     order.qtyPending.push({ size: d.size, label: d.file, caption: '', url, _name: key });
-    else                 order.unknownFiles.push({ name: d.file, url, _name: key });
-    order._designs.push({ name: key, filename: d.file, url, captioned: false });
+    const m = metaFor(d.file);
+    if (d.size && d.qty) order.files.push({ size: d.size, qty: d.qty, source: d.file, notes: '', sourceUrl: m.url, _name: key });
+    else if (d.size)     order.qtyPending.push({ size: d.size, label: d.file, caption: '', url: m.url, _name: key });
+    else                 order.unknownFiles.push({ name: d.file, url: m.url, _name: key });
+    order._designs.push({ name: key, filename: d.file, url: m.url, pageCount: m.pageCount, captioned: false });
   });
   order._aiResolved = true;
   order._aiAmbiguous = !!ai.ambiguous;
   order._aiDone = true;
+}
+
+// Routing overrides (always go to Plan B, even for a single file):
+//  #1 a caption-less photo with no size anywhere; #6 a PDF that is multi-page or captioned.
+function planBReason(order) {
+  const batch = (order._batch || []).filter(b => b.kind === 'file');
+  for (const b of batch) {
+    const fn = b.filename || '';
+    const isImg = b.isImage || /\.(png|jpe?g|webp|gif)$/i.test(fn) || /^image\//i.test(b.mime || '');
+    const isPdf = /\.pdf$/i.test(fn) || /pdf/i.test(b.mime || '');
+    const hasCaption = !!(b.caption && b.caption.trim());
+    const sz = parseSizeQty(`${fn} ${b.caption || ''}`).size;
+    if (isImg && !hasCaption && !sz) return 'photo';                 // #1 caption-less photo
+    if (isPdf && ((b.pageCount || 0) > 1 || hasCaption)) return 'pdf'; // #6 multi-page / captioned PDF
+  }
+  return null;
 }
 
 async function proceedToSummary(phone, session, order) {
@@ -2043,7 +1968,8 @@ async function proceedToSummary(phone, session, order) {
   // When the AI reader is off, fall back to the old caption-seen signal.
   const _designCount = order.files.length + (order.qtyPending || []).length + order.unknownFiles.length + order.pendingImages.length;
   const _wantPlanB = order._aiResolved ? order._aiAmbiguous : order._captionSeen;
-  if (_designCount >= 2 && _wantPlanB) {
+  const _forcePlanB = planBReason(order);   // #1 photo / #6 multi-page or captioned PDF
+  if ((_designCount >= 2 && _wantPlanB) || _forcePlanB) {
     order.state = 'asking_image_info';
     ensureFormDesigns(order);
     const link = orderShortLink(phone, order);
@@ -2327,6 +2253,21 @@ function applyLooseCaption(order, text) {
   }
 }
 
+// #4 — phrases that mean "tell me my total" for the order in progress.
+function isBillRequest(msg) {
+  const t = (msg || '').trim().toLowerCase();
+  if (!t) return false;
+  if (/^(cost|price|total)\??$/.test(t)) return true;
+  return /\b(how much|how much is it|how much do i pay|what do i pay|what.?s? (the|my) (cost|price|total)|my cost|the cost|calculate( for me| this| it)?|work out the cost|bill me|my bill)\b/i.test(t);
+}
+function hasWaitingFiles(order) {
+  return (((order.files && order.files.length) || 0)
+    + ((order.qtyPending && order.qtyPending.length) || 0)
+    + ((order.unknownFiles && order.unknownFiles.length) || 0)
+    + ((order.pendingImages && order.pendingImages.length) || 0)
+    + ((order._batch || []).filter(b => b.kind === 'file').length)) > 0;
+}
+
 function isDoneText(msg) {
   const t = (msg || '').trim().toLowerCase();
   if (!t) return false;
@@ -2334,7 +2275,7 @@ function isDoneText(msg) {
   return /^(yes|yep|yeah|yh|ok|okay|done|sure)\b/i.test(t) || isYes(t);
 }
 
-async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage) {
+async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage, pageCount) {
   const msg     = (body || '').trim();
   logMsg(from, 'in', msg || '[media]');
 
@@ -2471,6 +2412,26 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     return `Still printing. 🖨️ Ready by *${eta}*. We'll notify you!`;
   }
 
+  // ── #3 Status / pickup question with nothing to answer → refer to a human, ONCE ──
+  if (isReadyCheck(msg || '') && !mediaUrl) {
+    const hasAnswerable = session.orders.some(o => ['ready','processing','awaiting_payment'].includes(o.state)) || hasWaitingFiles(order);
+    if (!hasAnswerable) {
+      if (!(session.referredHuman && Date.now() - session.referredHuman < HUMAN_PAUSE_MS)) {
+        session.referredHuman = Date.now();
+        return `For order status or collection, please call or message us on *0272006161* and we'll help you right away. 🙏`;
+      }
+      return null; // already referred recently — stay quiet, don't go round in circles
+    }
+  }
+
+  // ── #4 Bill on request ("how much / my cost / calculate / price") when files are waiting ──
+  if (isBillRequest(msg) && !mediaUrl && hasWaitingFiles(order)
+      && !['awaiting_payment','processing','ready','confirming'].includes(order.state)) {
+    clearTimers(from);
+    await proceedToSummary(from, session, order);
+    return null;
+  }
+
   // Casual acknowledgement after an order is done (paid / printing / ready) — just an
   // "ok / thanks / 👍" with no new file. Acknowledge silently; never route to billing.
   if ((readyOrder || processingOrder) && !mediaUrl) {
@@ -2505,10 +2466,14 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
     if (mediaUrl && isImage) {
       const ocr = await extractReceiptFromImage(mediaUrl);
       if (ocr?.amount) {
-        if (ocr.txId) { order.pendingTxId = ocr.txId; order.pendingTxAmount = ocr.amount; }
+        if (ocr.txId) order.confirmedTxId = ocr.txId;
+        // Opus read the receipt — confirm the payment directly (over/under pay handled).
+        const pr = await processPayment(from, ocr.amount, 'momo', `receipt-ocr${ocr.txId ? ` TxID:${ocr.txId}` : ''}`);
+        if (pr.status === 'confirmed' || pr.status === 'partial') return null; // customer already messaged
+        order.pendingTxId = ocr.txId || order.pendingTxId; order.pendingTxAmount = ocr.amount;
         return ocr.txId
-          ? `Got it! TxID *${ocr.txId}* — GHS ${ocr.amount.toFixed(2)}. Confirming now. 🙏`
-          : `Got it! GHS ${ocr.amount.toFixed(2)} noted. Please reply with your Transaction ID to confirm faster.`;
+          ? `Got it! TxID *${ocr.txId}* — GHS ${ocr.amount.toFixed(2)}. We'll confirm shortly. 🙏`
+          : `Got it! GHS ${ocr.amount.toFixed(2)} noted. Please reply with your Transaction ID. 🙏`;
       }
     }
     const d0 = await gptDecide(msg, session);
@@ -2523,7 +2488,7 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage)
       order = startNewOrder(session);
     }
     order._batch = order._batch || [];
-    order._batch.push({ kind: 'file', filename: filename || '', caption: (msg || '').trim(), url: mediaUrl });
+    order._batch.push({ kind: 'file', filename: filename || '', caption: (msg || '').trim(), url: mediaUrl, mime: mediaType || '', isImage: !!isImage, pageCount: pageCount || 0 });
     order._aiDone = false;               // a new file arrived -> the batch must be re-read
     const fileLabel = filename || (isImage ? 'image' : 'file');
     const captionNote = msg ? `, caption: "${msg}"` : '';
@@ -2805,27 +2770,6 @@ async function handleAdmin(from, msg) {
     found.session.paused = false;
     audit('RESUME', found.key, `By ${workerName}`, false, workerId);
     return `✅ Bot resumed for ...${args[0]}.`;
-  }
-
-  // Push a chat to Plan B mid-conversation (item 2 manual + item 11a worker-fill).
-  // Sends the tap-to-order link to the customer AND returns it so a worker can fill it for them.
-  if (cmd === 'planb') {
-    const found = findByLast4(args[0]);
-    if (!found) return `❌ No session for ...${args[0]}`;
-    const order = getActiveOrder(found.session) || getPendingOrder(found.session);
-    if (!order) return `❌ No open order for ...${args[0]}`;
-    ensureFormDesigns(order);
-    const link = orderShortLink(found.key, order);
-    found.session.planBForced = true;
-    clearTimers(found.key);
-    await sendMsg(found.key, [
-      `📋 Let's make this easy — tap below to set the size & quantity for each design:`,
-      link,
-      ``,
-      `You only pay after you confirm. 🙏`,
-    ].join('\n'));
-    audit('PLANB_FORCED', found.key, `By ${workerName}`, false, workerId);
-    return `✅ Plan B sent to ...${args[0]}.\nFill it for them here:\n${link}`;
   }
 
   // Cash — any worker approves directly, no two-step
@@ -3505,6 +3449,7 @@ app.post('/webhook', async (req, res) => {
   const mediaType = msgContent.imageMessage?.mimetype
                  || msgContent.documentMessage?.mimetype || '';
   const filename  = msgContent.documentMessage?.fileName || '';
+  const pageCount = msgContent.documentMessage?.pageCount || msgContent.documentMessage?.pageCount || 0;
 
   const isImage   = mediaType.startsWith('image/') ||
                     ['image/jpeg','image/png','image/webp'].includes(mediaType);
@@ -3513,6 +3458,25 @@ app.post('/webhook', async (req, res) => {
 
   // Skip if no sender extracted
   if (!from) return;
+
+  // ── #2 Human takeover — an OUTBOUND message the bot did NOT send pauses the bot ──
+  const _shop9 = SHOP_NUMBER.replace(/\D/g,'').slice(-9);
+  const _fromMe = keyObj.fromMe === true
+    || (senderPn && senderPn.replace(/\D/g,'').includes(_shop9))
+    || (cleanedPn && cleanedPn.replace(/\D/g,'').includes(_shop9));
+  if (_fromMe) {
+    const outText = (msgContent.conversation || msgContent.extendedTextMessage?.text
+                  || msgContent.imageMessage?.caption || msgContent.documentMessage?.caption || '').trim();
+    const rjid = keyObj.cleanedRemoteJid || keyObj.remoteJid || keyObj.cleanedRecipientPn || keyObj.recipientPn || '';
+    const custPn = String(rjid).replace(/@.*/, '').replace(/\D/g, '');
+    const cust = custPn ? custPn + '@s.whatsapp.net' : '';
+    if (cust && !custPn.includes(_shop9) && outText && !botSentRecently(outText)) {
+      humanTakeover(getSession(cust), cust);
+      console.log(`🙋 Human typed to ${cust.slice(0,18)} — bot paused ${Math.round(HUMAN_PAUSE_MS/60000)} min`);
+    }
+    return; // never treat our own/human outbound as an incoming customer message
+  }
+
   // Skip messages from the bot itself
   if (from.includes(SHOP_NUMBER) || from.includes('status@broadcast') || from.includes('@newsletter')) return;
   // Skip if no content
@@ -3560,7 +3524,7 @@ app.post('/webhook', async (req, res) => {
   // We don't know order size yet, so we flag it after bill is calculated
 
   try {
-    const reply = await handleMessage(from, cleanBody, mediaUrl, mediaType, filename, isImage);
+    const reply = await handleMessage(from, cleanBody, mediaUrl, mediaType, filename, isImage, pageCount);
     if (reply) await sendMsg(from, reply);
   } catch (err) {
     console.error('❌ Webhook error:', err.message);
@@ -3575,7 +3539,9 @@ app.post('/webhook', async (req, res) => {
 
 // ── MoMo endpoint ─────────────────────────────────────────────
 app.post('/momo', async (req, res) => {
-  const { text, amount, phone } = req.body;
+  const b = req.body || {};
+  const text = b.text || b.key || b.msg || b.message || b.sms || (typeof b === 'string' ? b : '');
+  const { amount, phone } = b;
   if (text) { const r = await handleMomoEvent(parseMomoSMS(text), 'sms'); return res.json(r); }
   if (amount && phone) { const r = await processPayment(toWaId(phone), amount, 'momo', 'direct'); return res.json(r); }
   res.json({ status: 'ignored' });
@@ -3639,6 +3605,7 @@ ${inner}
   const designs = (order.formDesigns || []).map(d => ({ label: d.label, name: d.name || '', size: d.size || null, qty: d.qty || 1, url: d.url || null, isImage: /\.(png|jpe?g|webp|gif)$/i.test(d.name || '') }));
   const data = { token, designs, prices: PRICES };
   const inner = `
+<div class="sub">Tap a size and set how many copies for each design. You only pay after you approve. 👍</div>
 <div id="all"></div>
 <div id="list"></div>
 <div class="note">Printing starts after payment confirmation. 🙏</div>
@@ -3656,7 +3623,7 @@ function row(d,i){
   else { var ext=((d.name||'').split('.').pop()||'').toUpperCase(); if(!ext||ext.length>4)ext='FILE'; th='<div class="thumb file">'+ext+'</div>'; }
   return '<div class="card"><div class="row">'+th+'<div class="dlabel">'+d.label+'</div></div>'+
     '<div class="sizes">'+szHTML(i,S[i].size)+'</div>'+
-    '<div class="qty"><span class="lab">Quantity</span><div class="stp" onclick="bump('+i+',-1)">−</div><div class="qn" id="q'+i+'">'+S[i].qty+'</div><div class="stp" onclick="bump('+i+',1)">+</div></div></div>';
+    '<div class="qty"><span class="lab">Copies</span><div class="stp" onclick="bump('+i+',-1)">−</div><div class="qn" id="q'+i+'">'+S[i].qty+'</div><div class="stp" onclick="bump('+i+',1)">+</div></div></div>';
 }
 function draw(){
   var L=document.getElementById('list');L.innerHTML=D.designs.map(row).join('');
@@ -3726,70 +3693,6 @@ app.get('/c/:code', (req, res) => {
     return res.send(orderFormPage(order, token, 'done'));
   ensureFormDesigns(order);
   res.send(orderFormPage(order, token, 'open'));
-});
-
-// ── Reception TV queue display (item 8) ───────────────────────
-// Public, auto-refreshing. Customers see their pickup code, queue position
-// and due time — so they stop asking "is my job done yet?".
-app.get('/display', (req, res) => {
-  const now = Date.now();
-  const queue = [];
-  for (const [, s] of sessions.entries()) {
-    for (const o of (s.orders || [])) {
-      if (o.state === 'processing' && o.jobId) {
-        queue.push({ code: o.jobId, due: o.readyTime ? new Date(o.readyTime) : null, paidAt: o.paidAt || 0 });
-      }
-    }
-  }
-  queue.sort((a, b) => (a.paidAt || 0) - (b.paidAt || 0));
-  pruneReadyLog();
-  const readyToday = readyLog.filter(r => r.date === todayStr()).slice(-12).reverse();
-
-  const dueStr = (d) => {
-    if (!d) return '—';
-    const t = d.getTime();
-    if (now > t) return 'Due now';
-    return d.toLocaleString('en-GH', { timeZone: 'Africa/Accra', hour12: true, hour: '2-digit', minute: '2-digit' });
-  };
-  const queueRows = queue.length
-    ? queue.map((q, i) => `<tr><td class="pos">${i + 1}</td><td class="code">${q.code}</td><td class="due">${dueStr(q.due)}</td></tr>`).join('')
-    : `<tr><td colspan="3" class="empty">No jobs in production right now.</td></tr>`;
-  const readyRows = readyToday.length
-    ? readyToday.map(r => `<span class="chip">${r.code}</span>`).join('')
-    : `<span class="empty">—</span>`;
-
-  res.set('Content-Type', 'text/html');
-  res.send(`<!doctype html><html lang="en"><head>
-<meta charset="utf-8"><meta http-equiv="refresh" content="20">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Migo Print Shop — Order Queue</title>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Space Grotesk',system-ui,sans-serif;background:#0c1411;color:#f3f7f2;padding:3vh 4vw;min-height:100vh}
-.head{display:flex;align-items:center;gap:18px;border-bottom:2px solid #1f3a23;padding-bottom:2.2vh;margin-bottom:3vh}
-.logo{width:64px;height:64px;border-radius:16px;background:linear-gradient(135deg,#4E9E25,#3B7D17);display:flex;align-items:center;justify-content:center;font-size:34px}
-.brand{font-size:3.2vw;font-weight:700;letter-spacing:-.5px}
-.tag{color:#8fbf76;font-size:1.3vw;margin-top:2px}
-h2{font-size:1.9vw;color:#9fe07a;margin:0 0 1.6vh;text-transform:uppercase;letter-spacing:1px}
-table{width:100%;border-collapse:collapse;font-size:2.6vw}
-th{text-align:left;color:#6f8c66;font-size:1.2vw;text-transform:uppercase;letter-spacing:1px;padding:0 .6em 1vh}
-td{padding:1.4vh .6em;border-bottom:1px solid #18261a}
-.pos{color:#4E9E25;font-weight:700;width:1.5em}
-.code{font-weight:700;letter-spacing:1px}
-.due{text-align:right;color:#cfe8c0}
-.empty{color:#5d6f58;font-size:1.6vw}
-.ready{margin-top:4vh}
-.chips{display:flex;flex-wrap:wrap;gap:12px;margin-top:1vh}
-.chip{background:#16351b;border:1px solid #2f6e16;color:#bdf0a3;font-weight:700;font-size:2vw;padding:.5em .8em;border-radius:12px;letter-spacing:1px}
-.foot{margin-top:5vh;color:#5d6f58;font-size:1.1vw;text-align:center}
-</style></head><body>
-<div class="head"><div class="logo">🖨️</div><div><div class="brand">Migo Print Shop</div><div class="tag">Circle · Near Benz Gate · Live order queue</div></div></div>
-<h2>In production</h2>
-<table><thead><tr><th>#</th><th>Pickup code</th><th>Due</th></tr></thead><tbody>${queueRows}</tbody></table>
-<div class="ready"><h2>✅ Ready for pickup</h2><div class="chips">${readyRows}</div></div>
-<div class="foot">Show your pickup code to collect · No pickup code = no job released · Updates automatically</div>
-</body></html>`);
 });
 
 // Thumbnail proxy — the bot downloads the customer's file and streams it, so image
@@ -3918,7 +3821,16 @@ app.get('/mark-ready/:phone', async (req, res) => {
   if (!s) for (const [key, sess] of sessions.entries())
     if (sess.jobId === raw.toUpperCase()) { s = sess; break; }
   if (!s) return res.json({ status: 'error', message: 'Not found' });
-  await markJobReady(waId, s);
+  s.state = 'ready'; clearTimers(waId);
+  const readyMsg2 = buildReadyMsg(s.jobId);
+  await sendMsg(waId, readyMsg2);
+  setTimer(waId, 'rating', 1800000, async () => {
+    if (!s.ratingAsked) {
+      s.ratingAsked = true;
+      await sendMsg(waId, [`⭐ How was your experience at Migo Print Shop?`, ``,
+        `5 — Excellent  |  4 — Good  |  3 — Okay  |  2 — Poor  |  1 — Very poor`].join('\n'));
+    }
+  });
   res.json({ status: 'ready' });
 });
 
@@ -4943,14 +4855,6 @@ loadFacts();
     res.json({ ok: true, ratings: ratingsLog.slice(-100) });
   });
 
-  // Today's ready-list (item 6) — dashboard view for workers + admin
-  app.get('/api/ready-log', authMiddleware, (req, res) => {
-    pruneReadyLog();
-    const today = readyLog.filter(r => r.date === todayStr());
-    res.json({ ok: true, date: todayStr(), count: today.length,
-      jobs: today.map(r => ({ code: r.code, took: fmtDuration(r.tookMs), onTime: r.onTime, ts: r.ts })) });
-  });
-
   // Workers
   app.get('/api/workers', authMiddleware, (req, res) => {
     const list = [...workers.entries()].map(([id,w])=>({id,name:w.name,addedAt:w.addedAt,addedBy:w.addedBy}));
@@ -5045,7 +4949,8 @@ loadFacts();
     const waId = toWaId(phone);
     const s = sessions.get(waId);
     if (!s) return res.json({ ok: false, error: 'No session' });
-    markJobReady(waId, s).catch(()=>{});
+    s.state = 'ready'; clearTimers(waId);
+    sendMsg(waId, buildReadyMsg(s.jobId)).catch(()=>{});
     audit('MARKED_READY', waId, `Via dashboard`);
     res.json({ ok: true });
   });
