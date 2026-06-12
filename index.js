@@ -156,20 +156,35 @@ function parseOrderToken(token) {
 function orderFormLink(phone, order) {
   return `${BASE_URL}/order/${makeOrderToken(phone, order.ref)}`;
 }
+// Short, clean confirmation links: BASE_URL/c/<code> → opens the same form.
+const shortIndex = new Map();   // shortCode -> { phone, ref }
+function genShortCode() {
+  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let c; do { c = Array.from({ length: 6 }, () => A[Math.floor(Math.random() * A.length)]).join(''); } while (shortIndex.has(c));
+  return c;
+}
+function orderShortLink(phone, order) {
+  if (!order.shortCode) order.shortCode = genShortCode();
+  shortIndex.set(order.shortCode, { phone, ref: order.ref });
+  return `${BASE_URL}/c/${order.shortCode}`;
+}
 // One row per design the customer sent (sized files keep their values; unsized start blank).
 function ensureFormDesigns(order) {
   const rows = [];
-  const push = (size, qty, url) => rows.push({ label: `Design ${rows.length + 1}`, size: size || null, qty: (qty != null ? qty : null), url: url || null });
+  const push = (size, qty, url, name) => {
+    const clean = String(name || '').replace(/\.[a-z0-9]+$/i, '').trim();
+    rows.push({ label: clean || `Design ${rows.length + 1}`, name: name || '', size: size || null, qty: (qty != null ? qty : null), url: url || null });
+  };
   const seq = order._designs || [];
   if (seq.length) {
     // Prefill each design from its FILENAME (the clear part); the customer adjusts on the form.
-    seq.forEach(d => { const fp = parseSizeQty(d.filename || ''); push(fp.size, fp.qty, d.url); });
-    (order.pendingImages || []).forEach(p => push(null, null, p.url));
+    seq.forEach(d => { const fp = parseSizeQty(d.filename || ''); push(fp.size, fp.qty, d.url, d.filename); });
+    (order.pendingImages || []).forEach(p => push(null, null, p.url, p.name));
   } else {
-    (order.files || []).forEach(f => push(f.size, f.qty || 1, f.sourceUrl));
-    (order.pendingImages || []).forEach(p => push(null, null, p.url));
-    (order.unknownFiles || []).forEach(p => push(null, null, p.url));
-    (order.qtyPending || []).forEach(p => push(p.size, null, p.url));
+    (order.files || []).forEach(f => push(f.size, f.qty || 1, f.sourceUrl, f.source));
+    (order.pendingImages || []).forEach(p => push(null, null, p.url, p.name));
+    (order.unknownFiles || []).forEach(p => push(null, null, p.url, p.name));
+    (order.qtyPending || []).forEach(p => push(p.size, null, p.url, p.label));
   }
   if (!rows.length) push(null, null, null);
   order.formDesigns = rows;
@@ -185,7 +200,7 @@ const AI_BATCH_READER = process.env.USE_AI_BATCH_READER !== '0';
 let _batchLLM = async (user, system) => gptText(await askGPT([{ role:'user', content:user }], system, 600, 15000));
 function __setBatchLLM(fn){ _batchLLM = fn; }
 
-const BOT_VERSION = 'v72';
+const BOT_VERSION = 'v73';
 const SILENCE_MS  = parseInt(process.env.RECEIVE_SILENCE_MS, 10) || 60000;
 const ASK_DONE_MS = parseInt(process.env.ASK_DONE_MS, 10) || 60000;
 const BOT_START   = Date.now();
@@ -416,7 +431,10 @@ function loadState() {
     if (!fs.existsSync(DATA_FILE)) { console.log('💾 No saved state — starting fresh.'); return; }
     const s = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     if (Array.isArray(s.sessions)) for (const [k, v] of s.sessions) {
-      if (v && v.orders) for (const o of v.orders) if (o && o.readyTime) o.readyTime = new Date(o.readyTime);
+      if (v && v.orders) for (const o of v.orders) {
+        if (o && o.readyTime) o.readyTime = new Date(o.readyTime);
+        if (o && o.shortCode) shortIndex.set(o.shortCode, { phone: k, ref: o.ref });
+      }
       sessions.set(k, v);
     }
     if (Array.isArray(s.workers))           for (const [k, v] of s.workers) workers.set(k, v);
@@ -1726,7 +1744,7 @@ async function sendSizeQtyAsk(phone, session, order, fallbackText) {
   ensureFormDesigns(order);
   const _wantLink = order._aiResolved ? order._aiAmbiguous : order._captionSeen;
   if (_wantLink && (order.formDesigns || []).length >= 2) {
-    const link = orderFormLink(phone, order);
+    const link = orderShortLink(phone, order);
     await sendMsg(phone, [
       `📋 You've sent *${order.formDesigns.length} designs*.`,
       `Tap here to set the size & copies for each — quick and easy 👇`,
@@ -1860,12 +1878,15 @@ async function aiReadBatch(order) {
 function applyAiDesigns(order, ai) {
   order.files = []; order.qtyPending = []; order.unknownFiles = []; order.pendingImages = [];
   order.assumedQtyCount = 0; order._designs = [];
+  const batchFiles = (order._batch || []).filter(b => b.kind === 'file');
+  const urlFor = (file) => { const b = batchFiles.find(x => (x.filename || '') === file); return b ? (b.url || null) : null; };
   ai.designs.forEach(d => {
     const key = (d.file || '').toLowerCase();
-    if (d.size && d.qty) order.files.push({ size: d.size, qty: d.qty, source: d.file, notes: '', _name: key });
-    else if (d.size)     order.qtyPending.push({ size: d.size, label: d.file, caption: '', _name: key });
-    else                 order.unknownFiles.push({ name: d.file, _name: key });
-    order._designs.push({ name: key, filename: d.file, url: null, captioned: false });
+    const url = urlFor(d.file);
+    if (d.size && d.qty) order.files.push({ size: d.size, qty: d.qty, source: d.file, notes: '', sourceUrl: url, _name: key });
+    else if (d.size)     order.qtyPending.push({ size: d.size, label: d.file, caption: '', url, _name: key });
+    else                 order.unknownFiles.push({ name: d.file, url, _name: key });
+    order._designs.push({ name: key, filename: d.file, url, captioned: false });
   });
   order._aiResolved = true;
   order._aiAmbiguous = !!ai.ambiguous;
@@ -1896,13 +1917,11 @@ async function proceedToSummary(phone, session, order) {
   if (_designCount >= 2 && _wantPlanB) {
     order.state = 'asking_image_info';
     ensureFormDesigns(order);
-    const link = orderFormLink(phone, order);
+    const link = orderShortLink(phone, order);
     await sendMsg(phone, [
-      `\u{1F4CB} You've sent *${order.formDesigns.length} designs* with captions.`,
+      `\u{1F4CB} You've sent *${order.formDesigns.length} designs* with instructions.`,
       `To make sure each one is exactly right, tap here to set the size & copies \u{1F447}`,
       link,
-      ``,
-      `_I've pre-filled them from your file names \u2014 just adjust anything and confirm._`,
     ].join('\n'));
     return;
   }
@@ -3434,7 +3453,8 @@ body{margin:0;font-family:'Space Grotesk',system-ui,-apple-system,Segoe UI,Robot
 .allbar{background:linear-gradient(135deg,#f1f8e1,#fff);border:1px dashed #c5e1a5}
 .allbar .t{font-weight:600;font-size:13px;margin-bottom:10px;color:var(--brand2)}
 .row{display:flex;align-items:center;gap:12px}
-.thumb{width:52px;height:52px;border-radius:11px;background:#f1f1f4;display:flex;align-items:center;justify-content:center;font-size:22px;overflow:hidden;flex:0 0 auto}
+.thumb{position:relative;width:52px;height:52px;border-radius:11px;background:#f1f1f4;display:flex;align-items:center;justify-content:center;font-size:22px;overflow:hidden;flex:0 0 auto}
+.thumb.file{font-size:13px;font-weight:800;color:#3b7d17;background:#eef7e0;letter-spacing:.5px}
 .thumb img{width:100%;height:100%;object-fit:cover}
 .dlabel{font-weight:600;font-size:14.5px}
 .sizes{display:flex;gap:8px;margin-top:12px}
@@ -3466,7 +3486,7 @@ ${inner}
   if (mode === 'done')
     return shell(`<div class="msg"><div class="big tick">✅</div><h2>Order already confirmed</h2><p>Check your WhatsApp chat for your bill and payment details. Thank you! 🙏</p></div>`);
 
-  const designs = (order.formDesigns || []).map(d => ({ label: d.label, size: d.size || null, qty: d.qty || 1, url: d.url || null }));
+  const designs = (order.formDesigns || []).map(d => ({ label: d.label, name: d.name || '', size: d.size || null, qty: d.qty || 1, url: d.url || null, isImage: /\.(png|jpe?g|webp|gif)$/i.test(d.name || '') }));
   const data = { token, designs, prices: PRICES };
   const inner = `
 <div class="sub">Tap a size and set how many copies for each design. You only pay after you approve. 👍</div>
@@ -3482,7 +3502,9 @@ function money(n){return 'GHS '+n.toFixed(2);}
 function total(){var t=0;S.forEach(function(s){if(s.size)t+=P[s.size]*s.qty;});return t;}
 function szHTML(idx,cur){var o=['A4','A3','A2'].map(function(z){var on=cur===z?' on':'';return '<div class="sz'+on+'" onclick="pick('+idx+',\\''+z+'\\')"><b>'+z+'</b><span>'+money(P[z])+'</span></div>';});return o.join('');}
 function row(d,i){
-  var th=d.url?'<div class="thumb"><img src="'+d.url+'" onerror="this.parentNode.innerHTML=\\'🖼️\\'"></div>':'<div class="thumb">🖼️</div>';
+  var th;
+  if(d.isImage){ th='<div class="thumb">🖼️<img src="/thumb/'+D.token+'/'+i+'" onerror="this.remove()" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover"></div>'; }
+  else { var ext=((d.name||'').split('.').pop()||'').toUpperCase(); if(!ext||ext.length>4)ext='FILE'; th='<div class="thumb file">'+ext+'</div>'; }
   return '<div class="card"><div class="row">'+th+'<div class="dlabel">'+d.label+'</div></div>'+
     '<div class="sizes">'+szHTML(i,S[i].size)+'</div>'+
     '<div class="qty"><span class="lab">Copies</span><div class="stp" onclick="bump('+i+',-1)">−</div><div class="qn" id="q'+i+'">'+S[i].qty+'</div><div class="stp" onclick="bump('+i+',1)">+</div></div></div>';
@@ -3542,6 +3564,36 @@ function resolveOrderFromToken(token) {
   if (!order) return null;
   return { phone: info.phone, session, order };
 }
+
+app.get('/c/:code', (req, res) => {
+  res.set('Content-Type', 'text/html');
+  const ref = shortIndex.get(req.params.code);
+  if (!ref) return res.status(404).send(orderFormPage(null, null, 'invalid'));
+  const session = sessions.get(ref.phone);
+  const order = session && session.orders.find(o => o.ref === ref.ref);
+  if (!order) return res.status(404).send(orderFormPage(null, null, 'invalid'));
+  const token = makeOrderToken(ref.phone, order.ref);
+  if (order.paymentReceived || ['processing', 'ready'].includes(order.state))
+    return res.send(orderFormPage(order, token, 'done'));
+  ensureFormDesigns(order);
+  res.send(orderFormPage(order, token, 'open'));
+});
+
+// Thumbnail proxy — the bot downloads the customer's file and streams it, so image
+// previews load in the browser even when the raw WhatsApp media URL won't.
+app.get('/thumb/:token/:idx', async (req, res) => {
+  const r = resolveOrderFromToken(req.params.token);
+  if (!r) return res.status(404).end();
+  ensureFormDesigns(r.order);
+  const d = (r.order.formDesigns || [])[parseInt(req.params.idx, 10)];
+  if (!d || !d.url || !/\.(png|jpe?g|webp|gif)$/i.test(d.name || '')) return res.status(404).end();
+  try {
+    const { buffer, mime } = await downloadBuffer(d.url);
+    res.set('Content-Type', mime && mime.startsWith('image/') ? mime : 'image/jpeg');
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.end(buffer);
+  } catch (e) { res.status(404).end(); }
+});
 
 app.get('/order/:token', (req, res) => {
   const r = resolveOrderFromToken(req.params.token);
