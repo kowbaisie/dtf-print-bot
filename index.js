@@ -206,7 +206,7 @@ const AI_BATCH_READER = process.env.USE_AI_BATCH_READER !== '0';
 let _batchLLM = async (user, system) => gptText(await askGPT([{ role:'user', content:user }], system, 600, 15000));
 function __setBatchLLM(fn){ _batchLLM = fn; }
 
-const BOT_VERSION = 'v76';
+const BOT_VERSION = 'v78';
 const SILENCE_MS  = parseInt(process.env.RECEIVE_SILENCE_MS, 10) || 60000;
 const ASK_DONE_MS = parseInt(process.env.ASK_DONE_MS, 10) || 60000;
 const HUMAN_PAUSE_MS = parseInt(process.env.HUMAN_PAUSE_MS, 10) || 1800000; // 30 min — human-typing pause
@@ -714,8 +714,8 @@ async function gptDecide(msg, session, extraContext) {
   if (extraContext) addToHistory(session, 'user', extraContext);
 
   try {
-    const system = buildMasterSystem(session);
-    const r = await askGPT(session.chatHistory, system, 600, 20000);
+    const system = buildMasterSystem(session) + '\n\nSTRICT STYLE: Reply in ONE short, friendly sentence. NEVER invent or guess prices, sizes, quantities, dates, Job IDs, or any order detail — state only what is explicitly known. Do not re-greet or re-confirm things already said. If unsure, or the question is not about their order, set action "cannot_answer" and reply: "Please call us on 0272006161 and we will help you right away."';
+    const r = await askGPT(session.chatHistory, system, 200, 20000);
     const raw = gptText(r).replace(/```json|```/g, '').trim();
 
     let decision;
@@ -1262,6 +1262,7 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
         acknowledged: false,
       });
 
+      saveStateNow(); // confirmation is final — persist processing state + Job ID right away
       return { status: 'confirmed', jobId, readyBy: readyAt, ledgerEntry };
     } else {
       const remaining = (matchedOrder.totalBill || 0) - matchedOrder.paymentReceived;
@@ -1271,6 +1272,7 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
         `Please send the balance to:`,
         `🟡 MoMo: *0552719245*`, `👤 *Kow Habib Baisie*`,
       ].join('\n'));
+      saveStateNow(); // record the part-payment so the balance survives a restart
       return { status: 'partial', paid, balance: Math.max(0, remaining), ledgerEntry };
     }
   } catch (err) {
@@ -1416,7 +1418,10 @@ function downloadBuffer(url) {
   });
 }
 
+let _ocrImpl = null;
+function __setReceiptOCR(fn){ _ocrImpl = fn; }   // test seam
 async function extractReceiptFromImage(mediaUrl) {
+  if (_ocrImpl) { try { return await _ocrImpl(mediaUrl); } catch(_) { return null; } }
   try {
     const { buffer, mime } = await downloadBuffer(mediaUrl);
     const base64 = buffer.toString('base64');
@@ -1627,6 +1632,30 @@ function isNo(msg) {
 }
 function isMomoReceipt(msg) {
   return /paid|i paid|i have paid|done paying|payment done|settled|money sent|momo sent|transferred|receipt|sent the money/i.test(msg);
+}
+
+// Strong MoMo-receipt detector — keywords lifted from real receipts (MTN / Telecel / AIRTEL).
+// Used to ACKNOWLEDGE a customer's payment proof (never to confirm — the /momo SMS does that).
+function looksLikeReceiptText(msg) {
+  const t = (msg || '').toLowerCase();
+  if (!t) return false;
+  const money = /ghs\s*[\d,]+\.?\d*|gh[c\u20b5]\s*[\d,]+/i.test(t);
+  const kw = /(payment (received|made|confirmed)|\bconfirmed\b|sent to|0552719245|kow habib baisie|transaction id|trans\.? ?id|mobile money|telecel cash|\bairtel\b|reference\s*:|current balance|available balance|transaction fee|fee charged|funds transfer|money sent|\bmomo\b)/i.test(t);
+  const claim = /\b(i have paid|i paid|i've paid|i just paid|payment done|done paying|paid already|made (the )?payment|sent the money|i have sent|i've sent|transferred (the )?money|momo sent)\b/i.test(t);
+  return claim || (money && kw) || /sent to 0552719245/i.test(t);
+}
+
+// Acknowledge a payment receipt ONCE — capture any TxID, stop the reminder nags, stay quiet after.
+function receiptAck(session, from, txId) {
+  const awaiting = session.orders.find(o => o.state === 'awaiting_payment');
+  if (txId && awaiting) awaiting.pendingTxId = txId;
+  try { clearTimers(from); } catch (_) {}        // stop "please send your receipt" reminders
+  audit('RECEIPT_ACK', from, `txId:${txId || '\u2014'}`);
+  saveState();
+  const nowTs = Date.now();
+  if (session.receiptAckAt && nowTs - session.receiptAckAt < 1800000) return null; // already thanked
+  session.receiptAckAt = nowTs;
+  return `\u{1F64F} Thank you for your payment receipt. We're confirming it and will update you shortly.`;
 }
 
 function buildSummary(order) {
@@ -1936,13 +1965,14 @@ function applyAiDesigns(order, ai) {
 function planBReason(order) {
   const batch = (order._batch || []).filter(b => b.kind === 'file');
   for (const b of batch) {
-    const fn = b.filename || '';
+    const fn = (b.filename || '').trim();
     const isImg = b.isImage || /\.(png|jpe?g|webp|gif)$/i.test(fn) || /^image\//i.test(b.mime || '');
     const isPdf = /\.pdf$/i.test(fn) || /pdf/i.test(b.mime || '');
     const hasCaption = !!(b.caption && b.caption.trim());
-    const sz = parseSizeQty(`${fn} ${b.caption || ''}`).size;
-    if (isImg && !hasCaption && !sz) return 'photo';                 // #1 caption-less photo
-    if (isPdf && ((b.pageCount || 0) > 1 || hasCaption)) return 'pdf'; // #6 multi-page / captioned PDF
+    const genericName = !fn || /^(image|file|photo|img|picture|untitled)(\.[a-z0-9]+)?$/i.test(fn) || /^img[-_ ]?\d+/i.test(fn);
+    if (hasCaption) return 'caption';                 // ANY file with a caption -> Plan B
+    if (isImg && genericName) return 'photo';         // a picture with NO real filename -> Plan B
+    if (isPdf && (b.pageCount || 0) > 1) return 'pdf'; // multi-page PDF -> Plan B
   }
   return null;
 }
@@ -2018,7 +2048,7 @@ async function sendBill(phone, session, order) {
   order.billSentAt = Date.now();
   audit('BILL_SENT', phone, `Order #${order.ref} — GHS ${order.totalBill?.toFixed(2)}`);
 
-  // Build bill string NOW before setTimeout
+  // Build bill string NOW before setTimeout (this also sets order.totalBill)
   let billMsg;
   try {
     billMsg = buildBill(order);
@@ -2027,6 +2057,9 @@ async function sendBill(phone, session, order) {
     await alertOwner(`⚠️ buildBill crashed for ${displayPhone(phone)}: ${e.message}`).catch(()=>{});
     return;
   }
+  saveStateNow(); // CRITICAL: persist the awaiting-payment order — WITH its computed total — the
+                  // instant the bill is sent, so a restart before payment can't lose it (the MoMo
+                  // SMS would then have nothing to match against).
 
   // Send bill after short delay (feels natural, avoids WhatsApp rate limits)
   setTimeout(async () => {
@@ -2363,6 +2396,22 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage,
     }
   }
 
+  // ── PAYMENT RECEIPT (text or image) → acknowledge ONLY; never confirm, never treat as a design.
+  //    Runs whenever the customer has ANY unpaid order (not just the active one), and BEFORE the
+  //    FAQ matcher so a receipt that mentions "momo" isn't answered with the MoMo number.
+  //    The shop's forwarded /momo SMS stays the ONLY thing that confirms an order.
+  if (session.orders.some(o => o.state === 'awaiting_payment')) {
+    if (mediaUrl && isImage) {
+      const ocr = await extractReceiptFromImage(mediaUrl).catch(() => null);
+      if (ocr && ocr.amount && (ocr.txId || ocr.reference || ocr.senderName)) {
+        return receiptAck(session, from, ocr.txId || null);
+      }
+    } else if (!mediaUrl && looksLikeReceiptText(msg)) {
+      const m = (msg || '').match(/\b(\d{8,})\b/);
+      return receiptAck(session, from, m ? m[1] : null);
+    }
+  }
+
   // ── FAQ quick-match — runs for ALL states ─────────────────
   if (msg) {
     const faqAnswer = tryFAQ(msg);
@@ -2464,17 +2513,8 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage,
       return `Got it! TxID *${txIdTyped[1]}* noted. We'll confirm shortly. 🙏`;
     }
     if (mediaUrl && isImage) {
-      const ocr = await extractReceiptFromImage(mediaUrl);
-      if (ocr?.amount) {
-        if (ocr.txId) order.confirmedTxId = ocr.txId;
-        // Opus read the receipt — confirm the payment directly (over/under pay handled).
-        const pr = await processPayment(from, ocr.amount, 'momo', `receipt-ocr${ocr.txId ? ` TxID:${ocr.txId}` : ''}`);
-        if (pr.status === 'confirmed' || pr.status === 'partial') return null; // customer already messaged
-        order.pendingTxId = ocr.txId || order.pendingTxId; order.pendingTxAmount = ocr.amount;
-        return ocr.txId
-          ? `Got it! TxID *${ocr.txId}* — GHS ${ocr.amount.toFixed(2)}. We'll confirm shortly. 🙏`
-          : `Got it! GHS ${ocr.amount.toFixed(2)} noted. Please reply with your Transaction ID. 🙏`;
-      }
+      const ocr = await extractReceiptFromImage(mediaUrl).catch(() => null);
+      if (ocr?.amount) return receiptAck(session, from, ocr.txId || null); // acknowledge only — /momo confirms
     }
     const d0 = await gptDecide(msg, session);
     return d0.reply || null;
@@ -3526,6 +3566,7 @@ app.post('/webhook', async (req, res) => {
   try {
     const reply = await handleMessage(from, cleanBody, mediaUrl, mediaType, filename, isImage, pageCount);
     if (reply) await sendMsg(from, reply);
+    saveState(); // persist any state change from this message (files received, order created, etc.)
   } catch (err) {
     console.error('❌ Webhook error:', err.message);
     await alertOwner([
