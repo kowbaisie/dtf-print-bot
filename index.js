@@ -206,7 +206,7 @@ const AI_BATCH_READER = process.env.USE_AI_BATCH_READER !== '0';
 let _batchLLM = async (user, system) => gptText(await askGPT([{ role:'user', content:user }], system, 600, 15000));
 function __setBatchLLM(fn){ _batchLLM = fn; }
 
-const BOT_VERSION = 'v78';
+const BOT_VERSION = 'v79';
 const SILENCE_MS  = parseInt(process.env.RECEIVE_SILENCE_MS, 10) || 60000;
 const ASK_DONE_MS = parseInt(process.env.ASK_DONE_MS, 10) || 60000;
 const HUMAN_PAUSE_MS = parseInt(process.env.HUMAN_PAUSE_MS, 10) || 1800000; // 30 min — human-typing pause
@@ -578,9 +578,14 @@ function enqueueSend(waId, toPhone, body) {
   return Promise.resolve();
 }
 
+const _lastSentByPhone = new Map();
 async function sendMsg(to, body) {
   const waId    = to.includes('@') ? to : toWaId(to);
   const toPhone = waId.replace('@s.whatsapp.net', '').replace('@c.us', '');
+  // Don't send the exact same line twice in a row within 5 min (prevents the bot repeating itself).
+  const prev = _lastSentByPhone.get(waId);
+  if (prev && prev.text === body && Date.now() - prev.ts < 300000) return Promise.resolve();
+  _lastSentByPhone.set(waId, { text: body, ts: Date.now() });
   logMsg(waId, 'out', body);
   recordBotSent(body);
   return enqueueSend(waId, toPhone, body);
@@ -1645,6 +1650,13 @@ function looksLikeReceiptText(msg) {
   return claim || (money && kw) || /sent to 0552719245/i.test(t);
 }
 
+// Detect a request to reprint / repeat a previous order — handled by a human, not the bot.
+function isReprintRequest(msg) {
+  const t = (msg || '').toLowerCase();
+  if (!t) return false;
+  return /\b(re-?print|print (it )?again|reprint (the|my)|same (order|one|design|thing|print)s? again|same as (the )?(last|previous|above|before)|repeat (the |my )?(last|previous|same )?order|do the same again|another copy of (the )?(last|same|previous)|print the same)\b/i.test(t);
+}
+
 // Acknowledge a payment receipt ONCE — capture any TxID, stop the reminder nags, stay quiet after.
 function receiptAck(session, from, txId) {
   const awaiting = session.orders.find(o => o.state === 'awaiting_payment');
@@ -2371,6 +2383,8 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage,
       /^(afern|afternon|afternn|aftenon)\w*/i.test(m);
 
     if (isSimpleGreeting) {
+      if (session.greeted) return null;   // already greeted this chat — don't greet again
+      session.greeted = true;
       if (/morning|^morn/i.test(m)) return `Good morning! 😊`;
       if (/afternoon|^aftern|^afern/i.test(m)) return `Good afternoon! 😊`;
       if (/evening|^evenin|nite/i.test(m)) return `Good evening! 😊`;
@@ -2396,16 +2410,24 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage,
     }
   }
 
+  // ── REPRINT / "same order again" → one referral to a human, no contradictory follow-ups ──
+  if (msg && !mediaUrl && isReprintRequest(msg)) {
+    if (session.reprintReferredAt && Date.now() - session.reprintReferredAt < 1800000) return null;
+    session.reprintReferredAt = Date.now();
+    return `To reprint a previous order, please call or message us on *0272006161* and we'll sort it out for you. 🙏`;
+  }
+
   // ── PAYMENT RECEIPT (text or image) → acknowledge ONLY; never confirm, never treat as a design.
   //    Runs whenever the customer has ANY unpaid order (not just the active one), and BEFORE the
   //    FAQ matcher so a receipt that mentions "momo" isn't answered with the MoMo number.
   //    The shop's forwarded /momo SMS stays the ONLY thing that confirms an order.
   if (session.orders.some(o => o.state === 'awaiting_payment')) {
     if (mediaUrl && isImage) {
-      const ocr = await extractReceiptFromImage(mediaUrl).catch(() => null);
-      if (ocr && ocr.amount && (ocr.txId || ocr.reference || ocr.senderName)) {
-        return receiptAck(session, from, ocr.txId || null);
-      }
+      // While awaiting payment, an incoming image IS the payment receipt — acknowledge it and
+      // stop the reminders. We do NOT rely on OCR (it fails in production) and we NEVER ask its
+      // size or treat it as a design. Capture a TxID from any caption for the /momo match.
+      const m2 = (msg || '').match(/\b(\d{8,})\b/);
+      return receiptAck(session, from, m2 ? m2[1] : null);
     } else if (!mediaUrl && looksLikeReceiptText(msg)) {
       const m = (msg || '').match(/\b(\d{8,})\b/);
       return receiptAck(session, from, m ? m[1] : null);
