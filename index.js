@@ -1,12 +1,51 @@
 // ============================================================
 // MIGO DTF PRINT SHOP — WhatsApp Order Management Bot
-// Version : v51
+// Version : v81
 // Date    : June 2026
 // Owner   : Kow Habib Baisie — Migo Print Shop, Circle, Accra
 // ============================================================
 //
 // VERSION HISTORY
 //
+// v81 (Jun 2026) — Receipt-to-SMS matching + short staff commands
+//   RECEIPT MATCHING
+//   • Every real "Payment received" SMS is logged (TxID, amount, sender). When a customer
+//     sends a receipt while awaiting payment, the bot reads its Transaction ID (OCR-first on
+//     images, digits on text) and searches that log: a match → confirm; no match yet → hold
+//     the TxID so the real SMS auto-confirms on arrival; no TxID visible → ask ONCE to resend
+//     the receipt clearly showing the Transaction ID. A receipt alone never confirms.
+//   • Each real credit is consumed once — one payment can't satisfy two orders.
+//   SHORT STAFF COMMANDS (sender-gated to owner/shop; workers: cash only)
+//   • bo/boff, breset, to, bc, cp, rd, m, bill, os, cash (in-chat), wadd/wid/wname/wphone/
+//     wdel/ws, help. Typed in a customer chat, the last-4 is implicit. Legacy `admin …`
+//     still works but now requires a staff sender (a customer can no longer type `admin h`).
+//   • Worker cash inside the customer chat: `cash 25 W03 1914` (amount, worker ID, PIN).
+//
+// ───────────── earlier history ─────────────
+// v80 (Jun 2026) — Payment safety + conversation lockdown + one-tap admin
+//   PAYMENTS
+//   • MoMo SMS now direction-aware: only "money received" credits can confirm an
+//     order. Outgoing/sent SMS (e.g. owner paying a supplier from the shop SIM) are
+//     ignored — fixes the GHS 2,500 debit that landed in a customer's chat.
+//   • Unrecognised SMS formats are NOT auto-confirmed — owner gets a one-tap review.
+//   • smartMatchPayment rewritten: removed the 1.5x cap that dropped real overpayments;
+//     auto-confirms only on an unambiguous match, else owner picks with one tap. No
+//     more amount-coincidence confirming the wrong (e.g. in-person) order.
+//   CONVERSATION LOCKDOWN
+//   • The model NEVER free-texts a customer. All replies come from a fixed phrase bank.
+//     Anything unhandled → "Please, I will get back to you shortly. 🙏" once, then silence,
+//     plus a one-tap owner alert. Removed the "I dey come" random filler.
+//   • Complaint detection → P-COMPLAINT (the only customer line with 0272006161) + alert.
+//   • Bot only speaks in chats it started. The instant a human types, it goes silent and
+//     stays silent until you tap "Hand to bot" (sticky hand-off, no auto-expiry).
+//   OWNER ALERTS & ONE-TAP ADMIN
+//   • Every alert carries name + phone + a prefilled wa.me chat link, and tappable action
+//     buttons (take over / message / confirm payment / mark ready / set bill) — no typing,
+//     no remembering "override". Secure HMAC links, stable across restarts. Alerts deduped.
+//   • New /actions Action Centre page lists every chat that needs a decision.
+//   • Customers never get 0272006161 except on a complaint or a 1–3★ rating.
+//
+// ───────────── earlier history ─────────────
 // v29 (Jun 2026) — Bill sending hardened
 //   • Replaced ━ box-drawing characters with plain dashes throughout
 //     WasenderAPI was likely rejecting messages with Unicode box chars
@@ -168,6 +207,80 @@ function orderShortLink(phone, order) {
   shortIndex.set(order.shortCode, { phone, ref: order.ref });
   return `${BASE_URL}/c/${order.shortCode}`;
 }
+// ── v80: one-tap admin action links (HMAC-signed, stable across restarts) ──
+function signAction(action, last4) {
+  return crypto.createHmac('sha256', 'migo-action-' + (process.env.ADMIN_DASHBOARD_PASSWORD || 'migo'))
+    .update(`${action}:${last4}`).digest('hex').slice(0, 16);
+}
+function verifyAction(action, last4, token) {
+  return token && signAction(action, last4) === token;
+}
+function actionLink(action, phoneOrLast4) {
+  const l4 = String(phoneOrLast4 || '').replace(/\D/g, '').slice(-4);
+  return `${BASE_URL}/a/${action}/${l4}?t=${signAction(action, l4)}`;
+}
+// Prefilled WhatsApp click-to-chat link — opens the customer's chat with "Hi {name}…" ready to send.
+function chatLink(phone, name) {
+  const d = String(phone || '').replace(/\D/g, '');
+  const num = d.startsWith('233') ? d : ('233' + d.replace(/^0/, ''));
+  const greet = `Hi ${name || ''}`.trim();
+  return `https://wa.me/${num}?text=${encodeURIComponent(greet)}`;
+}
+// ── v80: unified owner alert — name + phone + prefilled chat link + one-tap buttons + dedup ──
+const _alertDedup = new Map();
+const _processedMomoTx = new Set(); // v80: TxIDs already confirmed — blocks duplicate SMS
+const ACTION_LABELS = {
+  takeover: { emoji: '🤫', label: "I'll take over" },
+  handback: { emoji: '🤖', label: 'Hand to bot' },
+  message:  { emoji: '✍️', label: 'Message this customer' },
+  confirm:  { emoji: '✅', label: 'Confirm payment' },
+  ready:    { emoji: '📦', label: 'Mark ready & notify' },
+  billset:  { emoji: '💰', label: 'Set bill amount' },
+  status:   { emoji: 'ℹ️', label: 'Order status' },
+};
+async function ownerAlert({ title, phone = '', name = '', lines = [], actions = [], dedupKey = '', dedupMs = 1800000, instant = false }) {
+  if (dedupKey) {
+    const last = _alertDedup.get(dedupKey) || 0;
+    if (!instant && Date.now() - last < dedupMs) return; // deduped — don't flood
+    _alertDedup.set(dedupKey, Date.now());
+  }
+  const body = [`🔔 *${title}*`, ``];
+  if (name)  body.push(`👤 ${name}`);
+  if (phone) {
+    body.push(`📱 ${displayPhone(phone)}`);
+    body.push(`💬 Open chat 👉 ${chatLink(phone, name)}`);
+  }
+  if (lines.length) body.push('', ...lines);
+  if (actions.length && phone) {
+    body.push('', '*Tap to act:*');
+    for (const a of actions) {
+      const m = ACTION_LABELS[a] || { emoji: '•', label: a };
+      body.push(`${m.emoji} ${m.label} 👉 ${actionLink(a, phone)}`);
+    }
+  }
+  return alertOwner(body.join('\n'));
+}
+// ── v80: MoMo SMS direction — only "money received" credits may ever confirm an order ──
+// Real MTN Ghana formats:
+//   IN  : "Payment received for GHS X.XX from NAME ..."
+//   OUT : "Payment made for GHS X.XX to NAME ...", "Payment for GHSX to MTN BUNDLE ...",
+//         "You have sent/transferred ...", airtime, cash out, etc.
+function momoDirection(text) {
+  const t = String(text || '');
+  // Credit markers (money IN) — checked first; if this matches it's always 'received'.
+  if (/payment\s*received|you\s*have\s*received|received\s*ghs|money\s*received|credited\s*(with|your)/i.test(t)) return 'received';
+  // Debit / outgoing / non-payment markers (money OUT) — never a customer payment.
+  if (/payment\s*(made|of|for)?\s*(for\s*)?ghs[\d.,\s]*to\b/i.test(t)  // "Payment made/of/for GHS X to ..."
+    || /payment\s*made\b/i.test(t)                                    // "Payment made ..."
+    || /you\s*have\s*(sent|transferred|paid|made)/i.test(t)
+    || /\b(sent|transferred|transfer|reversal)\s*to\b/i.test(t)
+    || /has\s*been\s*(sent|debited)|debited/i.test(t)
+    || /cash\s*-?\s*out|withdraw/i.test(t)
+    || /airtime|data\s*bundle|\bbundle\b|to\s*mtn\b/i.test(t)
+  ) return 'sent';
+  return 'unknown';
+}
+
 // One row per design the customer sent (sized files keep their values; unsized start blank).
 function ensureFormDesigns(order) {
   const rows = [];
@@ -206,7 +319,8 @@ const AI_BATCH_READER = process.env.USE_AI_BATCH_READER !== '0';
 let _batchLLM = async (user, system) => gptText(await askGPT([{ role:'user', content:user }], system, 600, 15000));
 function __setBatchLLM(fn){ _batchLLM = fn; }
 
-const BOT_VERSION = 'v79';
+const BOT_VERSION = 'v81';
+const NOT_CMD = Symbol('not_a_command'); // v81: handleStaffCommand returns this when msg isn't a command
 const SILENCE_MS  = parseInt(process.env.RECEIVE_SILENCE_MS, 10) || 60000;
 const ASK_DONE_MS = parseInt(process.env.ASK_DONE_MS, 10) || 60000;
 const HUMAN_PAUSE_MS = parseInt(process.env.HUMAN_PAUSE_MS, 10) || 1800000; // 30 min — human-typing pause
@@ -337,6 +451,12 @@ const confirmedPaymentAcked = new Set();
 const overdueFlow = new Map();
 const workers    = new Map();
 const pinLockout = new Map();
+// v81: searchable log of real "Payment received" SMS — a customer receipt is matched against this.
+const receivedSms = []; // { txId, amount, sender, ts, consumed, matchedPhone }
+function findReceivedByTxId(txId) {
+  if (!txId) return null;
+  return receivedSms.find(r => r.txId === txId && !r.consumed) || null;
+}
 
 // ── Outbound send queue ───────────────────────────────────────
 // WasenderAPI account protection allows only 1 message every 5 seconds.
@@ -428,6 +548,7 @@ function saveStateNow() {
       confirmedPayments,
       auditLog:  auditLog.slice(-500),
       ratingsLog: ratingsLog.slice(-500),
+      receivedSms: receivedSms.slice(-500),
     };
     fs.writeFileSync(DATA_FILE, JSON.stringify(state));
   } catch (e) { console.error('💾 save error:', e.message); }
@@ -451,6 +572,7 @@ function loadState() {
       sessions.set(k, v);
     }
     if (Array.isArray(s.workers))           for (const [k, v] of s.workers) workers.set(k, v);
+    if (Array.isArray(s.receivedSms))       receivedSms.push(...s.receivedSms);
     if (Array.isArray(s.paymentLedger))     paymentLedger.push(...s.paymentLedger);
     if (Array.isArray(s.knowledgeBase))     knowledgeBase.push(...s.knowledgeBase);
     if (s.jobCounters)                      Object.assign(jobCounters, s.jobCounters);
@@ -895,9 +1017,11 @@ function getPendingOrder(session) {
 
 // Check if bot should be silent (human handling)
 function isBotSilenced(session) {
+  // v80: sticky hand-off — once a human is in the chat, the bot stays silent until invited back.
+  if (session.handsoff === true) return true;
   if (session.paused !== true) return false;
   const until = session.pauseUntil || (session.pausedAt ? session.pausedAt + HUMAN_PAUSE_MS : 0);
-  if (until && Date.now() > until) {   // pause window elapsed — bot resumes on its own
+  if (until && Date.now() > until) {   // timed pause window elapsed — bot resumes on its own
     session.paused = false; session.pausedAt = null; session.pauseUntil = null; session.silenceNoticeSent = false;
     return false;
   }
@@ -905,13 +1029,23 @@ function isBotSilenced(session) {
 }
 
 // A human at the shop typed directly in the chat → hand this conversation to the human.
+// v80: sticky — the bot will NOT speak again in this chat until you tap "Hand to bot".
 function humanTakeover(session, phone) {
+  if (session.handsoff === true) return; // already handed off — don't re-alert
+  session.handsoff = true;
   session.paused = true;
   session.pausedAt = Date.now();
-  session.pauseUntil = Date.now() + HUMAN_PAUSE_MS;
+  session.pauseUntil = null;
   session.silenceNoticeSent = false;
   session.servedBy = 'human';
   try { clearTimers(phone); } catch (_) {}
+  ownerAlert({
+    title: 'You took over this chat',
+    phone, name: session.customerName || '',
+    lines: ['The bot is now silent here and will stay quiet until you hand it back.'],
+    actions: ['handback'],
+    dedupKey: 'handsoff:' + phone, dedupMs: 3600000,
+  }).catch(() => {});
 }
 
 // Silence bot and alert owner
@@ -1300,7 +1434,7 @@ async function processPayment(phone, amount, type, confirmedBy = 'auto', workerI
 function parseMomoSMS(text) {
   const t = text || '';
   const amtMatch  = t.match(/GHS\s*([\d,]+\.?\d*)/i);
-  const amount    = amtMatch ? parseFloat(amtMatch[1].replace(',', '')) : null;
+  const amount    = amtMatch ? parseFloat(amtMatch[1].replace(/,/g, '')) : null;
   const txMatch   = t.match(/Transaction\s*I[Dd][:\s#]*(\d{6,})/i)
                  || t.match(/TxnI[Dd][:\s#]*(\d{6,})/i)
                  || t.match(/\bID[:\s]+(\d{8,})/i);
@@ -1309,12 +1443,14 @@ function parseMomoSMS(text) {
   const reference = refMatch ? refMatch[1].trim() : null;
   const nameMatch = t.match(/from\s+([A-Z][A-Z\s]+?)(?=\.\s|\s+Current|\s+Balance|\s+Ref|\s+Trans|\s+TxnI|\s+Transaction|\n|$)/i);
   const senderName= nameMatch ? nameMatch[1].trim() : null;
-  return { amount, txId, reference, senderName };
+  return { amount, txId, reference, senderName, direction: momoDirection(t) };
 }
 
-// ── Smart payment matcher ─────────────────────────────────────
+// ── Smart payment matcher (v80) ───────────────────────────────
+// Safety: amount alone is never trusted to pick between several orders. We auto-confirm
+// only when the match is UNAMBIGUOUS; anything else is handed to the owner for one tap.
 function smartMatchPayment(amount, txId, reference) {
-  // TxID match — check pending orders
+  // 1) TxID the customer typed — strongest signal
   if (txId) {
     for (const [key, s] of sessions.entries()) {
       const order = s.orders?.find(o => o.pendingTxId === txId);
@@ -1329,73 +1465,113 @@ function smartMatchPayment(amount, txId, reference) {
     awaiting.push({ key, session: s, order, balance });
   }
   if (awaiting.length === 0) return { match: 'none' };
-  // Single order awaiting → it's this payment. Match even if the amount is MORE than the
-  // bill (overpayment); processPayment handles over/under pay and alerts the owner.
-  if (awaiting.length === 1) return { match: 'amount', ...awaiting[0] };
-  // Multiple: prefer orders whose balance is near the amount, then disambiguate by reference.
-  const within = awaiting.filter(c => amount > 0 && amount <= c.balance * 1.5 + 0.01);
-  const candidates = within.length ? within : awaiting;
-  if (candidates.length === 1) return { match: 'amount', ...candidates[0] };
+
+  // 2) Reference carrying a phone tail or Job ID
   const ref = (reference || '').replace(/[\s\-]/g, '').toUpperCase();
   if (ref && ref !== '0') {
-    for (const { key, session: s, order, balance } of candidates) {
-      const p4 = key.replace(/\D/g, '').slice(-4);
-      const p9 = key.replace(/\D/g, '').slice(-9);
-      const jc = (order.jobId || '').replace(/[\s\-]/g, '').toUpperCase();
-      if (ref.includes(p4)||ref.includes(p9)||ref===jc||jc.includes(ref)||(ref.length>=4&&jc.includes(ref)))
-        return { match: 'reference', key, session: s, order, balance };
+    for (const c of awaiting) {
+      const p4 = c.key.replace(/\D/g, '').slice(-4);
+      const p9 = c.key.replace(/\D/g, '').slice(-9);
+      const jc = (c.order.jobId || '').replace(/[\s\-]/g, '').toUpperCase();
+      if (ref.includes(p4) || ref.includes(p9) || (jc && (ref === jc || jc.includes(ref))))
+        return { match: 'reference', ...c };
     }
   }
-  return { match: 'ambiguous', candidates };
+
+  // 3) Single awaiting order → it's this payment (over/under handled in processPayment)
+  if (awaiting.length === 1) return { match: 'amount', ...awaiting[0] };
+
+  // 4) Multiple awaiting — only auto-pick if EXACTLY ONE order's balance matches the amount
+  //    (exact, or this amount covers exactly one bill). No 1.5x guessing.
+  const exact = awaiting.filter(c => Math.abs(c.balance - amount) <= 0.01);
+  if (exact.length === 1) return { match: 'amount', ...exact[0] };
+  const covers = awaiting.filter(c => amount + 0.01 >= c.balance && c.balance > 0);
+  if (covers.length === 1) return { match: 'amount', ...covers[0] };
+
+  // 5) Genuinely ambiguous → owner decides with one tap. Never auto-attach, never spam customers.
+  return { match: 'ambiguous', candidates: awaiting };
 }
 
 // ── MoMo event handler ────────────────────────────────────────
 async function handleMomoEvent(parsed, source) {
-  const { amount, txId, reference, senderName } = parsed;
+  const { amount, txId, reference, senderName, direction } = parsed;
   if (!amount || amount <= 0) return { status: 'ignored', reason: 'no amount' };
+
+  // ── v80 SAFETY: only "money received" credits may ever confirm an order ──
+  // An outgoing transfer from the shop SIM (e.g. paying a supplier) must NEVER land in a
+  // customer's chat. Debit/sent SMS are dropped silently; unrecognised formats go to the
+  // owner for a manual one-tap decision rather than auto-confirming.
+  if (direction === 'sent') {
+    audit('MOMO_OUTGOING', 'sms', `GHS ${amount} debit ignored (${senderName || '—'})`);
+    return { status: 'ignored', reason: 'outgoing-debit' };
+  }
+  if (direction !== 'received') {
+    await ownerAlert({
+      title: 'Unrecognised MoMo SMS — review',
+      lines: [
+        `💰 GHS ${amount.toFixed(2)}`,
+        `🧾 TxID: ${txId || '—'}  •  Ref: ${reference || '—'}`,
+        ``,
+        `Not clearly a "money received" message, so it was NOT auto-confirmed.`,
+        `If this is a real payment, open the chat and tap Confirm payment.`,
+      ],
+      instant: true,
+    });
+    audit('MOMO_UNKNOWN_DIR', 'sms', `GHS ${amount} — not confirmed`, true);
+    return { status: 'review', reason: 'unknown-direction' };
+  }
+
+  // ── v80 CONFLICT GUARD: the Transaction ID is unique per payment. If we've already seen
+  //    this TxID, the SMS was forwarded/processed twice — ignore it so nothing double-confirms.
+  if (txId && _processedMomoTx.has(txId)) {
+    audit('MOMO_DUPLICATE', 'sms', `TxID ${txId} already processed — ignored`);
+    return { status: 'duplicate', txId };
+  }
+
   audit('MOMO_RECEIVED', 'sms', `GHS ${amount} | TxID:${txId||'—'} | Ref:${reference||'—'} | From:${senderName||'—'}`);
+  // v81: record this real credit so a customer's receipt (by TxID) can be matched against it.
+  const smsEntry = { txId: txId || null, amount, sender: senderName || null, ts: Date.now(), consumed: false, matchedPhone: null };
+  receivedSms.push(smsEntry);
+  if (receivedSms.length > 1000) receivedSms.splice(0, receivedSms.length - 1000);
   const result = smartMatchPayment(amount, txId, reference);
 
   if (result.match === 'none') {
-    await alertOwner([
-      `🔔 *UNMATCHED MOMO*`, ``,
-      `💰 GHS ${amount.toFixed(2)}`,
-      `👤 ${senderName || '—'}`,
-      `🔖 Ref: ${reference || '—'}`,
-      `🧾 TxID: ${txId || '—'}`, ``,
-      `No active order matched.`,
-      `Confirm manually: admin W01 cash <last4> ${amount.toFixed(2)}`,
-    ].join('\n'));
+    await ownerAlert({
+      title: 'Unmatched MoMo payment',
+      name: senderName || '',
+      lines: [
+        `💰 GHS ${amount.toFixed(2)}`,
+        `🔖 Ref: ${reference || '—'}  •  🧾 TxID: ${txId || '—'}`,
+        ``,
+        `No order is awaiting payment. If this belongs to a customer, open their chat and confirm.`,
+      ],
+      instant: true,
+    });
     audit('MOMO_UNMATCHED', 'sms', `GHS ${amount} from ${senderName || '—'}`, true);
     return { status: 'no_match' };
   }
 
   if (result.match === 'ambiguous') {
-    const list = result.candidates.map((c, i) =>
-      `${i+1}. ...${last4(c.key)} | Job:${sessJobId(c.session)||'—'} | GHS ${sessTotalBill(c.session)?.toFixed(2)||'—'}`
-    ).join('\n');
-    await alertOwner([
-      `⚠️ *AMBIGUOUS MOMO*`, ``,
-      `💰 GHS ${amount.toFixed(2)}`,
-      `👤 ${senderName || '—'}`,
-      `🔖 Ref: ${reference || '—'}`, ``,
-      `${result.candidates.length} matches:`, list, ``,
-      `Customers asked for TxID.`,
-    ].join('\n'));
-    for (const { key, session: s } of result.candidates) {
-      s.awaitingTxId = true;
-      await sendMsg(key, [
-        `We received GHS ${amount.toFixed(2)} but could not link it to your order.`, ``,
-        `Please reply with your *Transaction ID* from your MoMo receipt.`,
-        `_Example: "My TxID is 82052935078"_`,
-      ].join('\n'));
+    const lines = [`💰 GHS ${amount.toFixed(2)}  •  👤 ${senderName || '—'}`, ``, `${result.candidates.length} orders are awaiting payment — pick one:`];
+    for (const c of result.candidates) {
+      lines.push(
+        `• ${displayPhone(c.key)} — GHS ${(c.order.totalBill||0).toFixed(2)} (bal ${c.balance.toFixed(2)})`,
+        `   ✅ Confirm 👉 ${actionLink('confirm', c.key)}`,
+        `   💬 Chat 👉 ${chatLink(c.key)}`,
+      );
     }
+    await ownerAlert({ title: 'Which order is this payment for?', lines, instant: true });
     audit('MOMO_AMBIGUOUS', 'sms', `GHS ${amount} — ${result.candidates.length} candidates`, true);
     return { status: 'ambiguous' };
   }
 
   const { key, session: s } = result;
-  if (txId) s.confirmedTxId = txId;
+  if (txId) {
+    s.confirmedTxId = txId;
+    _processedMomoTx.add(txId);
+    if (_processedMomoTx.size > 3000) { const first = _processedMomoTx.values().next().value; _processedMomoTx.delete(first); }
+  }
+  smsEntry.consumed = true; smsEntry.matchedPhone = key; // v81: this credit is now used
   return processPayment(key, amount, 'momo', `auto-${result.match}${txId ? ` TxID:${txId}` : ''}`);
 }
 
@@ -1657,6 +1833,42 @@ function isReprintRequest(msg) {
   return /\b(re-?print|print (it )?again|reprint (the|my)|same (order|one|design|thing|print)s? again|same as (the )?(last|previous|above|before)|repeat (the |my )?(last|previous|same )?order|do the same again|another copy of (the )?(last|same|previous)|print the same)\b/i.test(t);
 }
 
+// ── v80: hold-and-alert — the bot's ONLY response to anything it can't handle deterministically.
+// Sends P-HOLD once per window, then stays silent, and pings the owner with a one-tap take-over.
+const P_HOLD = `Please, I will get back to you shortly. 🙏`;
+async function holdAndAlert(from, session, msg, title = 'Customer needs help') {
+  ownerAlert({
+    title,
+    phone: from, name: session.customerName || '',
+    lines: [`💬 "${(msg || '').slice(0, 120)}"`],
+    actions: ['takeover', 'message'],
+    dedupKey: 'help:' + from, dedupMs: 1800000,
+  }).catch(() => {});
+  const nowTs = Date.now();
+  if (session.heldAt && nowTs - session.heldAt < 1800000) return null; // already held this window — stay silent
+  session.heldAt = nowTs;
+  return P_HOLD;
+}
+// Complaint / low-rating — the ONLY customer-facing line that may carry the support number.
+const P_COMPLAINT = `I'm sorry about that. 🙏 Please call or message us directly on 0272006161 and we'll sort it out right away.`;
+async function complaintEscalate(from, session, msg) {
+  if (!session.handsoff) {
+    session.handsoff = true; session.paused = true; session.pausedAt = Date.now(); session.pauseUntil = null;
+    try { clearTimers(from); } catch (_) {}
+  }
+  ownerAlert({
+    title: 'Complaint — needs you',
+    phone: from, name: session.customerName || '',
+    lines: [`💬 "${(msg || '').slice(0, 150)}"`],
+    actions: ['handback', 'message'],
+    dedupKey: 'complaint:' + from, dedupMs: 600000, instant: true,
+  }).catch(() => {});
+  return P_COMPLAINT;
+}
+function isComplaint(msg) {
+  return /\b(refund|my money|cheated|scam|terrible|useless|rubbish|nonsense|disappointed|angry|complain(t|ing)?|wrong (order|print|size|colou?r)|bad (print|job|quality|colou?r)|poor (quality|service)|damaged|spoilt|messed up|not (good|happy|satisfied))\b/i.test(msg || '');
+}
+
 // Acknowledge a payment receipt ONCE — capture any TxID, stop the reminder nags, stay quiet after.
 function receiptAck(session, from, txId) {
   const awaiting = session.orders.find(o => o.state === 'awaiting_payment');
@@ -1668,6 +1880,45 @@ function receiptAck(session, from, txId) {
   if (session.receiptAckAt && nowTs - session.receiptAckAt < 1800000) return null; // already thanked
   session.receiptAckAt = nowTs;
   return `\u{1F64F} Thank you for your payment receipt. We're confirming it and will update you shortly.`;
+}
+
+// v81: a customer sent a receipt while awaiting payment. Compare its Transaction ID against
+// the shop's REAL "Payment received" SMS log. A receipt alone never confirms — it must match
+// real money. No TxID visible → ask once to resend the receipt clearly showing the TxID.
+async function handleReceipt(from, session, order, txId) {
+  if (!txId) {
+    if (order.askedTxId) {                          // already asked for this order — stay quiet
+      try { clearTimers(from); } catch (_) {}
+      return null;
+    }
+    order.askedTxId = true;
+    try { clearTimers(from); } catch (_) {}
+    audit('RECEIPT_NO_TXID', from, 'asked to resend with TxID');
+    saveState();
+    return `🧾 Thanks! But we couldn't see your *Transaction ID*. Please resend the full receipt clearly showing the *Transaction ID* so we can confirm. 🙏`;
+  }
+
+  // Have a TxID — search the real received-SMS log.
+  const hit = findReceivedByTxId(txId);
+  if (hit && Math.abs((hit.amount || 0) - 0) >= 0) {
+    hit.consumed = true; hit.matchedPhone = from;
+    _processedMomoTx.add(txId);
+    try { clearTimers(from); } catch (_) {}
+    audit('RECEIPT_MATCHED', from, `TxID:${txId} → GHS ${hit.amount}`);
+    await sendMsg(from, `✅ Found your payment (Txn *${txId}*). Confirming now…`).catch(() => {});
+    await processPayment(from, hit.amount, 'momo', `receipt-match TxID:${txId}`);
+    return null; // processPayment sends the confirmation
+  }
+
+  // TxID given but no matching SMS yet — store it so the real SMS auto-confirms on arrival.
+  order.pendingTxId = txId;
+  try { clearTimers(from); } catch (_) {}
+  audit('RECEIPT_PENDING', from, `TxID:${txId} held (no SMS yet)`);
+  saveState();
+  const nowTs = Date.now();
+  if (session.receiptAckAt && nowTs - session.receiptAckAt < 1800000) return null;
+  session.receiptAckAt = nowTs;
+  return `🙏 Got your Transaction ID *${txId}*. We'll confirm the moment the payment reflects on our side.`;
 }
 
 function buildSummary(order) {
@@ -2324,8 +2575,17 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage,
   const msg     = (body || '').trim();
   logMsg(from, 'in', msg || '[media]');
 
-  // Admin commands always work — even when bot is stopped or crashed
-  if (msg.toLowerCase().startsWith('admin ')) return handleAdmin(from, msg);
+  // ── v81: staff commands (sender-gated). Owner/shop run all; workers run cash only. ──
+  const _role = staffRole(from);
+  if (_role && msg) {
+    const cmdRes = await handleStaffCommand(from, msg, null, _role);
+    if (cmdRes !== NOT_CMD) return cmdRes;        // it was a command (reply or null)
+  }
+  // Legacy admin commands — now require a staff sender (closes the "customer types admin h" hole)
+  if (msg.toLowerCase().startsWith('admin ')) {
+    if (!_role) return null;
+    return handleAdmin(from, msg);
+  }
 
   // Overdue flow responses — workers reply YES/NO/TIME/REASON without 'admin' prefix
   const msgUpper = msg.toUpperCase().trim();
@@ -2417,21 +2677,28 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage,
     return `To reprint a previous order, please call or message us on *0272006161* and we'll sort it out for you. 🙏`;
   }
 
-  // ── PAYMENT RECEIPT (text or image) → acknowledge ONLY; never confirm, never treat as a design.
-  //    Runs whenever the customer has ANY unpaid order (not just the active one), and BEFORE the
-  //    FAQ matcher so a receipt that mentions "momo" isn't answered with the MoMo number.
-  //    The shop's forwarded /momo SMS stays the ONLY thing that confirms an order.
-  if (session.orders.some(o => o.state === 'awaiting_payment')) {
+  // ── PAYMENT RECEIPT (text or image) → match its Transaction ID against the shop's real
+  //    "Payment received" SMS log. A receipt NEVER confirms on its own (a screenshot can be
+  //    faked) — it only confirms when its TxID matches real money. No TxID → ask once to resend.
+  const awaitingOrder = session.orders.find(o => o.state === 'awaiting_payment');
+  if (awaitingOrder) {
     if (mediaUrl && isImage) {
-      // While awaiting payment, an incoming image IS the payment receipt — acknowledge it and
-      // stop the reminders. We do NOT rely on OCR (it fails in production) and we NEVER ask its
-      // size or treat it as a design. Capture a TxID from any caption for the /momo match.
-      const m2 = (msg || '').match(/\b(\d{8,})\b/);
-      return receiptAck(session, from, m2 ? m2[1] : null);
+      // OCR-first: try to read the Transaction ID off the image; fall back to any caption digits.
+      let txId = (msg || '').match(/\b(\d{8,})\b/)?.[1] || null;
+      if (!txId) {
+        const ocr = await extractReceiptFromImage(mediaUrl).catch(() => null);
+        if (ocr?.txId) txId = String(ocr.txId).replace(/\D/g, '');
+      }
+      return await handleReceipt(from, session, awaitingOrder, txId);
     } else if (!mediaUrl && looksLikeReceiptText(msg)) {
-      const m = (msg || '').match(/\b(\d{8,})\b/);
-      return receiptAck(session, from, m ? m[1] : null);
+      const txId = (msg || '').match(/\b(\d{8,})\b/)?.[1] || null;
+      return await handleReceipt(from, session, awaitingOrder, txId);
     }
+  }
+
+  // ── v80: Complaint → the only line that gives out 0272006161; escalate + hand off ──
+  if (msg && !mediaUrl && isComplaint(msg)) {
+    return await complaintEscalate(from, session, msg);
   }
 
   // ── FAQ quick-match — runs for ALL states ─────────────────
@@ -2472,6 +2739,27 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage,
   const readyOrder = session.orders.find(o => o.state === 'ready');
   if (readyOrder && isReadyCheck(msg || '')) {
     return `✅ Your order is ready!\n🔑 Pickup code: *${readyOrder.jobId}*\n📍 Near Benz Gate, Circle. No pickup code — no release.`;
+  }
+  // v80: rating reply after a ready order. 1–3 stars = complaint → P-COMPLAINT + alert you.
+  if (readyOrder && session.ratingAsked && !session.ratingGiven && /^[1-5]$/.test((msg || '').trim())) {
+    const n = parseInt(msg.trim(), 10);
+    ratingsLog.unshift({
+      ts: nowStr(), date: todayStr(), phone: displayPhone(from),
+      jobId: readyOrder.jobId || '—', score: n, sentiment: n >= 4 ? 'good' : 'low', comment: '',
+      files: [...(readyOrder.confirmedFiles || [])],
+    });
+    session.ratingGiven = true;
+    audit('RATING', from, `${n}/5 | Job:${readyOrder.jobId || '—'}`);
+    if (n <= 3) {
+      ownerAlert({
+        title: `Low rating (${n}★)`,
+        phone: from, name: session.customerName || '',
+        lines: [`🔖 Job: ${readyOrder.jobId || '—'}`],
+        actions: ['message'], dedupKey: 'lowrating:' + from, instant: true,
+      }).catch(() => {});
+      return P_COMPLAINT;
+    }
+    return n === 5 ? `🎉 Thank you so much! See you next time. 🙏` : `😊 Thank you! Glad you're happy.`;
   }
 
   // ── PROCESSING state ──────────────────────────────────────
@@ -2538,8 +2826,8 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage,
       const ocr = await extractReceiptFromImage(mediaUrl).catch(() => null);
       if (ocr?.amount) return receiptAck(session, from, ocr.txId || null); // acknowledge only — /momo confirms
     }
-    const d0 = await gptDecide(msg, session);
-    return d0.reply || null;
+    // v80 lockdown: no free-text AI. Anything else here → hold once + alert owner.
+    return await holdAndAlert(from, session, msg, 'Message while awaiting payment');
   }
 
   // ── FILE RECEIVED — silent collect, 30s timer ────────────
@@ -2735,67 +3023,167 @@ async function handleMessage(from, body, mediaUrl, mediaType, filename, isImage,
     }
   }
 
-  if (d.action === 'ask_size_qty') order.state = 'asking_image_info';
-
-  const reply = d.reply || null;
-
-  // Track unanswered messages + stuck detection
-  if (reply) {
-    session.unansweredCount = 0;
-  } else {
-    session.unansweredCount = (session.unansweredCount || 0) + 1;
-    if (session.unansweredCount >= 3) {
-      session.unansweredCount = 0;
-      // Alert owner + all workers
-      const workerAlerts = [...workers.values()].map(w => w.phone).filter(Boolean);
-      const alertMsg = [
-        `⚠️ *BOT NEEDS HELP*`,
-        `📱 Customer: ${displayPhone(from)}`,
-        `👤 Name: ${session.customerName || 'Unknown'}`,
-        `💬 Last message: "${(msg||'').slice(0,80)}"`,
-        `❓ Bot has not responded 3+ times — please assist.`,
-      ].join('\n');
-      await alertOwner(alertMsg).catch(()=>{});
-      for (const wp of workerAlerts) {
-        await sendMsg(wp, alertMsg).catch(()=>{});
-      }
-      return randomPhrase();
-    }
-    return randomPhrase();
+  if (d.action === 'ask_size_qty') {
+    order.state = 'asking_image_info';
+    return buildImageQuestion(session);
   }
 
-  return reply;
+  // v80 lockdown: the model never speaks to the customer. If it produced no actionable
+  // billing decision, hold once and alert the owner with a one-tap take-over. No improvised
+  // replies, no "I dey come" filler.
+  return await holdAndAlert(from, session, msg);
+}
 
-
-  // ── READY ────────────────────────────────────────────────────
-  if (session.state === 'ready') {
-    const n = parseInt(msg);
-    if (!isNaN(n) && n >= 1 && n <= 5) {
-      let reply, sentiment;
-      if (n === 5) { reply = `🎉 Amazing — thank you! See you next time!`; sentiment = 'excellent'; }
-      else if (n === 4) { reply = `😊 Thanks! Glad you're happy with the result.`; sentiment = 'good'; }
-      else if (n === 3) { reply = `🙏 Thank you. We'll do better next time!`; sentiment = 'okay'; }
-      else { reply = `😔 So sorry to hear that. What went wrong? We want to fix it.`; sentiment = 'poor'; }
-      ratingsLog.unshift({
-        ts: nowStr(), date: todayStr(), phone: displayPhone(from),
-        jobId: sessJobId(session) || '—', score: n, sentiment, comment: '',
-        files: [...(readyOrder?.confirmedFiles || [])],
-      });
-      session.ratingGiven = true;
-      audit('RATING', from, `${n}/5 — ${sentiment} | Job:${sessJobId(session)||'—'}`);
-      if (n <= 2) await alertOwner(`⭐ *BAD RATING*\nCustomer ...${last4(from)} — ${n}/5 | Job: ${sessJobId(session)||'—'}`);
-      clearTimers(from); sessions.delete(from);
-      return reply;
-    }
-    const lastRating = ratingsLog.find(r => r.phone === displayPhone(from));
-    if (lastRating && !lastRating.comment) {
-      lastRating.comment = msg;
-      return `Thank you for letting us know. We take all feedback seriously. 🙏`;
-    }
-    const d0 = await gptDecide(msg, session);
-    return d0.reply || null;
-  }
+// ── v81: staff command system — short codes, sender-gated ─────────────────
+// Owner/shop number can run everything; a registered worker (by phone) can run cash only.
+// Commands also work when typed INTO a customer chat from the shop phone (fromMe, in-chat),
+// where the customer is the implicit target so no last-4 is needed.
+function staffRole(from) {
+  const f9 = (from || '').replace(/\D/g, '').slice(-9);
+  if (!f9) return null;
+  if (f9 === OWNER_NUMBER.replace(/\D/g, '').slice(-9) || f9 === SHOP_NUMBER.replace(/\D/g, '').slice(-9)) return 'owner';
+  for (const [id, w] of workers) if (w.phone && String(w.phone).replace(/\D/g, '').slice(-9) === f9) return 'worker:' + id;
   return null;
+}
+
+function helpText() {
+  return [
+    '🛠 *Migo commands*', '',
+    '`bo` / `boff` — bot on / off',
+    '`breset` — restart bot',
+    '`to 1234` — take over a chat',
+    '`bc 1234` — hand back to bot',
+    '`cp 1234` — confirm MoMo payment',
+    '`rd 1234` — mark ready & notify',
+    '`m 1234 text` — message customer',
+    '`bill 1234 25` — set/override bill',
+    '`os 1234` — order status',
+    '`cash 25 W03 1914` — (typed in the customer chat) record cash',
+    '`wadd W03 0241234567 Kofi` — add worker',
+    '`wid W03 W07` — change worker ID',
+    '`wname W03 Kojo` — rename · `wphone W03 024…` — phone',
+    '`wdel W03` — remove · `ws` — list workers',
+    '', '_In a customer\'s chat you can drop the 1234 — just type `cp`, `rd`, `m text`, etc._',
+  ].join('\n');
+}
+
+function workerAdmin(cmd, args, from) {
+  const id = (args[0] || '').toUpperCase();
+  if (cmd === 'wadd') {
+    const phone = (args[1] || '').replace(/\D/g, '');
+    const name  = args.slice(2).join(' ');
+    if (!/^W\d{1,2}$/.test(id) || !phone || !name) return '❌ Usage: wadd W03 0241234567 Kofi';
+    if (workers.has(id)) return `❌ ${id} already exists. Use \`wid\` to change an ID, or \`wdel ${id}\` first.`;
+    workers.set(id, { name, phone, pin: null, addedBy: 'owner', addedAt: nowStr() });
+    audit('WORKER_ADDED', from, `${id}: ${name} (${phone})`); saveState();
+    return `✅ Added *${id}* · ${name} · ${phone}`;
+  }
+  if (cmd === 'wid') {
+    const newId = (args[1] || '').toUpperCase();
+    if (!workers.has(id)) return `❌ ${id} not found.`;
+    if (!/^W\d{1,2}$/.test(newId)) return '❌ New ID must look like W07.';
+    if (workers.has(newId)) return `❌ ${newId} is already in use.`;
+    const rec = workers.get(id); workers.delete(id); workers.set(newId, rec);
+    audit('WORKER_ID', from, `${id}→${newId}`); saveState();
+    return `✅ *${id}* is now *${newId}*.`;
+  }
+  if (cmd === 'wname') {
+    const name = args.slice(1).join(' ');
+    if (!workers.has(id)) return `❌ ${id} not found.`;
+    if (!name) return '❌ Usage: wname W03 Kojo';
+    workers.get(id).name = name; saveState();
+    return `✅ ${id} renamed to *${name}*.`;
+  }
+  if (cmd === 'wphone') {
+    const phone = (args[1] || '').replace(/\D/g, '');
+    if (!workers.has(id)) return `❌ ${id} not found.`;
+    if (!phone) return '❌ Usage: wphone W03 0247654321';
+    workers.get(id).phone = phone; saveState();
+    return `✅ ${id} phone updated to ${phone}.`;
+  }
+  if (cmd === 'wdel') {
+    if (!workers.has(id)) return `❌ ${id} not found.`;
+    const w = workers.get(id); workers.delete(id);
+    audit('WORKER_REMOVED', from, `${id}: ${w.name}`); saveState();
+    return `✅ Removed ${id} (${w.name}).`;
+  }
+  return '❌ Unknown worker command.';
+}
+
+// Returns NOT_CMD if the message isn't a recognised command (so normal handling continues),
+// otherwise performs the action and returns a reply string (DM) or null (in-chat → owner noted).
+async function handleStaffCommand(from, msg, inChatTarget, role) {
+  const tokens = (msg || '').trim().split(/\s+/);
+  const t0 = (tokens[0] || '').toLowerCase();
+  const rest = tokens.slice(1);
+  const isOwner = role === 'owner';
+  // DM → reply to sender; in-chat → send the result to the owner so the customer never sees it.
+  const reply = (s) => { if (inChatTarget) { alertOwner(s).catch(() => {}); return null; } return s; };
+  const tgt4 = inChatTarget ? last4(inChatTarget) : (rest[0] || '');
+
+  switch (t0) {
+    case 'help': case '?': return reply(helpText());
+
+    case 'bo':     if (tokens.length !== 1 || !isOwner) return NOT_CMD; botActive = true;  botCrashed = false; saveState(); return reply('🟢 Bot is ON.');
+    case 'boff':   if (tokens.length !== 1 || !isOwner) return NOT_CMD; botActive = false;                    saveState(); return reply('🔴 Bot is OFF.');
+    case 'breset': if (tokens.length !== 1 || !isOwner) return NOT_CMD; botActive = true;  botCrashed = false; saveState(); return reply('🟢 Bot restarted.');
+
+    case 'ws': case 'workers': {
+      if (!isOwner || tokens.length !== 1) return NOT_CMD;
+      const list = [...workers.entries()].map(([id, w]) => `${id} · ${w.name || '—'} · ${w.phone || '—'}`).join('\n') || 'No workers yet.';
+      return reply('👷 *Workers*\n' + list);
+    }
+
+    case 'to': case 'bc': case 'cp': case 'rd': case 'os': {
+      if (!isOwner) return NOT_CMD;
+      if (inChatTarget) { if (tokens.length !== 1) return NOT_CMD; }
+      else { if (!/^\d{4}$/.test(rest[0] || '')) return NOT_CMD; }
+      const f = findByLast4(tgt4);
+      if (!f) return reply(`❌ No active chat for …${tgt4}.`);
+      if (t0 === 'to') { f.session.handsoff = true; f.session.paused = true; f.session.pausedAt = Date.now(); f.session.pauseUntil = null; clearTimers(f.key); audit('TAKEOVER', f.key, 'cmd'); saveState(); return reply(`🤫 You have …${tgt4}. Bot silent until you hand back (\`bc ${tgt4}\`).`); }
+      if (t0 === 'bc') { f.session.handsoff = false; f.session.paused = false; f.session.pausedAt = null; f.session.pauseUntil = null; f.session.silenceNoticeSent = false; audit('HANDBACK', f.key, 'cmd'); saveState(); return reply(`🤖 Bot is back on …${tgt4}.`); }
+      if (t0 === 'os') { const o = getActiveOrder(f.session); return reply(`ℹ️ …${tgt4}: ${o?.state || '—'} · GHS ${(o?.totalBill || 0).toFixed(2)} · paused: ${f.session.handsoff ? 'yes' : 'no'}`); }
+      if (t0 === 'rd') { const o = f.session.orders?.find(x => x.state === 'processing') || getActiveOrder(f.session); if (!o || !o.jobId) return reply(`❌ …${tgt4} has no job to mark ready.`); o.state = 'ready'; clearTimers(f.key); await sendMsg(f.key, buildReadyMsg(o.jobId)).catch(() => {}); f.session.ratingAsked = false; f.session.ratingGiven = false; saveState(); return reply(`📦 …${tgt4} marked ready (${o.jobId}).`); }
+      if (t0 === 'cp') { const o = f.session.orders?.find(x => x.state === 'awaiting_payment'); if (!o) return reply(`❌ …${tgt4} has no order awaiting payment.`); const bal = Math.max(0, (o.totalBill || 0) - (o.paymentReceived || 0)); const r = await processPayment(f.key, bal || o.totalBill || 0, 'momo', 'owner-confirm'); return reply(r.status === 'confirmed' ? `✅ …${tgt4} confirmed (${r.jobId}).` : `✅ …${tgt4}: ${r.status}.`); }
+      return NOT_CMD;
+    }
+
+    case 'm': {
+      if (!isOwner) return NOT_CMD;
+      let text, t4;
+      if (inChatTarget) { t4 = tgt4; text = rest.join(' '); if (!text) return NOT_CMD; }
+      else { if (!/^\d{4}$/.test(rest[0] || '') || rest.length < 2) return NOT_CMD; t4 = rest[0]; text = rest.slice(1).join(' '); }
+      const f = findByLast4(t4); if (!f) return reply(`❌ No chat for …${t4}.`);
+      await sendMsg(f.key, text); audit('OWNER_MSG', f.key, text.slice(0, 50)); return reply(`✍️ Sent to …${t4}.`);
+    }
+
+    case 'bill': {
+      if (!isOwner) return NOT_CMD;
+      let amt, t4;
+      if (inChatTarget) { t4 = tgt4; amt = parseFloat(rest[0]); if (isNaN(amt)) return NOT_CMD; }
+      else { if (!/^\d{4}$/.test(rest[0] || '')) return NOT_CMD; t4 = rest[0]; amt = parseFloat(rest[1]); if (isNaN(amt)) return reply('❌ Usage: bill 1234 25'); }
+      const f = findByLast4(t4); if (!f) return reply(`❌ No chat for …${t4}.`);
+      const o = getActiveOrder(f.session); if (!o) return reply(`❌ …${t4} has no active order.`);
+      o.totalBill = amt; o.state = 'awaiting_payment'; o.billSentAt = Date.now();
+      await sendMsg(f.key, [`📋 *Your bill*`, ``, `💰 Total: GHS ${amt.toFixed(2)}`, ``, `🟡 MoMo: *0552719245* · Kow Habib Baisie`, `Printing starts after payment is confirmed. 🙏`].join('\n')).catch(() => {});
+      saveStateNow(); return reply(`💰 …${t4} billed GHS ${amt.toFixed(2)}.`);
+    }
+
+    case 'cash': {
+      // in-chat only: cash <amount> <workerID> <PIN>  (worker is inside the customer's chat)
+      if (!inChatTarget) return reply('❌ Type *cash* inside the customer\'s chat: `cash 25 W03 1914`');
+      const amt = parseFloat(rest[0]); const wid = (rest[1] || '').toUpperCase(); const pin = rest[2] || '';
+      if (isNaN(amt) || !/^W\d{1,2}$/.test(wid) || !pin) return NOT_CMD;
+      const res = await handleAdmin(inChatTarget, `admin ${wid} cash ${last4(inChatTarget)} ${amt} ${pin}`);
+      return reply(res);
+    }
+
+    case 'wadd': case 'wid': case 'wname': case 'wphone': case 'wdel':
+      if (!isOwner) return NOT_CMD;
+      return reply(workerAdmin(t0, rest, from));
+
+    default: return NOT_CMD;
+  }
 }
 
 // ── Admin handler ─────────────────────────────────────────────
@@ -2821,15 +3209,15 @@ async function handleAdmin(from, msg) {
   if (cmd === 'pause') {
     const found = findByLast4(args[0]);
     if (!found) return `❌ No session for ...${args[0]}`;
-    found.session.paused = true; found.session.servedBy = workerId;
-    await sendMsg(found.key, `A member of our team will assist you shortly. 🙏`);
+    found.session.handsoff = true; found.session.paused = true; found.session.pausedAt = Date.now(); found.session.pauseUntil = null;
+    found.session.servedBy = workerId; clearTimers(found.key);
     audit('PAUSE', found.key, `By ${workerName}`, false, workerId);
-    return `✅ Bot paused for ...${args[0]}.`;
+    return `✅ Bot paused for ...${args[0]} (stays paused until you resume).`;
   }
   if (cmd === 'resume') {
     const found = findByLast4(args[0]);
     if (!found) return `❌ No session for ...${args[0]}`;
-    found.session.paused = false;
+    found.session.handsoff = false; found.session.paused = false; found.session.pausedAt = null; found.session.pauseUntil = null; found.session.silenceNoticeSent = false;
     audit('RESUME', found.key, `By ${workerName}`, false, workerId);
     return `✅ Bot resumed for ...${args[0]}.`;
   }
@@ -3532,9 +3920,15 @@ app.post('/webhook', async (req, res) => {
     const rjid = keyObj.cleanedRemoteJid || keyObj.remoteJid || keyObj.cleanedRecipientPn || keyObj.recipientPn || '';
     const custPn = String(rjid).replace(/@.*/, '').replace(/\D/g, '');
     const cust = custPn ? custPn + '@s.whatsapp.net' : '';
-    if (cust && !custPn.includes(_shop9) && outText && !botSentRecently(outText)) {
-      humanTakeover(getSession(cust), cust);
-      console.log(`🙋 Human typed to ${cust.slice(0,18)} — bot paused ${Math.round(HUMAN_PAUSE_MS/60000)} min`);
+    if (cust && !custPn.includes(_shop9) && outText) {
+      // v81: a command typed into the customer's chat (e.g. "cash 25 W03 1914", "cp", "rd") is
+      // run against that chat — it must NOT be mistaken for human chatter that pauses the bot.
+      const cmdRes = await handleStaffCommand(SHOP_NUMBER + '@s.whatsapp.net', outText, cust, 'owner');
+      if (cmdRes !== NOT_CMD) { return; }          // handled as a command
+      if (!botSentRecently(outText)) {
+        humanTakeover(getSession(cust), cust);
+        console.log(`🙋 Human typed to ${cust.slice(0,18)} — bot handed off`);
+      }
     }
     return; // never treat our own/human outbound as an incoming customer message
   }
@@ -3608,6 +4002,139 @@ app.post('/momo', async (req, res) => {
   if (text) { const r = await handleMomoEvent(parseMomoSMS(text), 'sms'); return res.json(r); }
   if (amount && phone) { const r = await processPayment(toWaId(phone), amount, 'momo', 'direct'); return res.json(r); }
   res.json({ status: 'ignored' });
+});
+
+// ── v80: one-tap admin actions (tap a link in any alert — no typing, no remembering) ──
+function actionPage(title, msg, ok = true) {
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Migo — ${title}</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
+<style>body{margin:0;font-family:'Space Grotesk',system-ui,sans-serif;background:#f4f4f6;color:#17171c;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px}
+.card{background:#fff;border-radius:18px;padding:30px 24px;max-width:420px;width:100%;box-shadow:0 6px 24px rgba(0,0,0,.08);text-align:center}
+.ic{font-size:46px}.h{font-size:20px;font-weight:700;margin:12px 0 6px}.p{color:#73737d;font-size:14.5px;line-height:1.5}
+a.b,button.b{display:inline-block;margin-top:18px;background:linear-gradient(135deg,#4E9E25,#3B7D17);color:#fff;text-decoration:none;border:0;border-radius:12px;padding:13px 22px;font-size:15px;font-weight:700;font-family:inherit;cursor:pointer}
+input,textarea{width:100%;box-sizing:border-box;font-family:inherit;font-size:16px;padding:12px;border:1.5px solid #ececed;border-radius:12px;margin-top:14px}</style></head>
+<body><div class="card"><div class="ic">${ok ? '✅' : '⚠️'}</div><div class="h">${title}</div><div class="p">${msg}</div></div></body></html>`;
+}
+
+app.get('/a/:action/:last4', async (req, res) => {
+  const { action, last4 } = req.params;
+  if (!verifyAction(action, last4, req.query.t)) return res.status(403).send(actionPage('Link expired', 'This action link is invalid. Open the latest alert and tap again.', false));
+  const found = findByLast4(last4);
+  if (!found && action !== 'help') return res.send(actionPage('No active chat', `No active order for …${last4}. It may already be done.`, false));
+  const { key, session } = found || {};
+  const name = session?.customerName || '';
+
+  // Forms (need extra input) — render a tiny page that POSTs back
+  if (action === 'message' || action === 'billset') {
+    const label = action === 'message' ? 'Message to customer' : 'New bill amount (GHS)';
+    const ph    = action === 'message' ? 'Type your message…' : 'e.g. 25';
+    const tag   = action === 'message' ? `<textarea name="v" rows="3" placeholder="${ph}" autofocus></textarea>` : `<input name="v" inputmode="decimal" placeholder="${ph}" autofocus>`;
+    return res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
+<style>body{margin:0;font-family:'Space Grotesk',sans-serif;background:#f4f4f6;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px}
+.card{background:#fff;border-radius:18px;padding:26px 22px;max-width:440px;width:100%;box-shadow:0 6px 24px rgba(0,0,0,.08)}
+.h{font-size:18px;font-weight:700}.s{color:#73737d;font-size:13px;margin:4px 0 8px}
+input,textarea{width:100%;box-sizing:border-box;font-family:inherit;font-size:16px;padding:12px;border:1.5px solid #ececed;border-radius:12px;margin-top:10px}
+button{margin-top:14px;width:100%;background:linear-gradient(135deg,#4E9E25,#3B7D17);color:#fff;border:0;border-radius:12px;padding:14px;font-size:15px;font-weight:700;font-family:inherit}</style></head>
+<body><div class="card"><div class="h">${ACTION_LABELS[action]?.label || action}</div><div class="s">…${last4}${name ? ' · ' + name : ''}</div>
+<form method="POST"><input type="hidden" name="t" value="${req.query.t}">${tag}<button>Send</button></form></div></body></html>`);
+  }
+
+  try {
+    if (action === 'takeover') {
+      session.handsoff = true; session.paused = true; session.pausedAt = Date.now(); session.pauseUntil = null;
+      clearTimers(key); audit('TAKEOVER', key, 'via one-tap'); saveState();
+      return res.send(actionPage('You have the chat', `The bot is now silent with …${last4}. Tap “Hand to bot” in the alert when you're done.`));
+    }
+    if (action === 'handback') {
+      session.handsoff = false; session.paused = false; session.pausedAt = null; session.pauseUntil = null; session.silenceNoticeSent = false;
+      audit('HANDBACK', key, 'via one-tap'); saveState();
+      return res.send(actionPage('Bot resumed', `The bot is handling …${last4} again.`));
+    }
+    if (action === 'confirm') {
+      const order = session.orders?.find(o => o.state === 'awaiting_payment');
+      if (!order) return res.send(actionPage('Nothing to confirm', `No order is awaiting payment for …${last4}.`, false));
+      const bal = Math.max(0, (order.totalBill || 0) - (order.paymentReceived || 0));
+      const r = await processPayment(key, bal || order.totalBill || 0, 'momo', 'owner-tap');
+      return res.send(actionPage('Payment confirmed', `…${last4} confirmed${r.jobId ? ` · Job ${r.jobId}` : ''}. Customer notified.`));
+    }
+    if (action === 'ready') {
+      const order = session.orders?.find(o => o.state === 'processing') || getActiveOrder(session);
+      if (!order || !order.jobId) return res.send(actionPage('Not ready yet', `…${last4} has no processing job to mark ready.`, false));
+      order.state = 'ready'; clearTimers(key);
+      await sendMsg(key, buildReadyMsg(order.jobId)).catch(() => {});
+      session.ratingAsked = false; session.ratingGiven = false; saveState();
+      return res.send(actionPage('Marked ready', `…${last4} notified with pickup code ${order.jobId}.`));
+    }
+    if (action === 'status') {
+      const o = getActiveOrder(session);
+      return res.send(actionPage(`Status …${last4}`, `State: ${o?.state || '—'} · Bill: GHS ${(o?.totalBill || 0).toFixed(2)} · Paused: ${session.handsoff ? 'yes' : 'no'}`));
+    }
+    return res.send(actionPage('Unknown action', action, false));
+  } catch (e) {
+    return res.send(actionPage('Something went wrong', e.message, false));
+  }
+});
+
+app.post('/a/:action/:last4', async (req, res) => {
+  const { action, last4 } = req.params;
+  const t = (req.body && req.body.t) || req.query.t;
+  if (!verifyAction(action, last4, t)) return res.status(403).send(actionPage('Link expired', 'Open the latest alert and tap again.', false));
+  const found = findByLast4(last4);
+  if (!found) return res.send(actionPage('No active chat', `No active order for …${last4}.`, false));
+  const { key, session } = found;
+  const v = ((req.body && req.body.v) || '').trim();
+  if (!v) return res.send(actionPage('Nothing entered', 'Go back and type a value.', false));
+  try {
+    if (action === 'message') {
+      await sendMsg(key, v);
+      audit('OWNER_MSG', key, v.slice(0, 60)); saveState();
+      return res.send(actionPage('Message sent', `Delivered to …${last4}.`));
+    }
+    if (action === 'billset') {
+      const amt = parseFloat(v);
+      if (isNaN(amt) || amt <= 0) return res.send(actionPage('Bad amount', 'Enter a number like 25.', false));
+      const order = getActiveOrder(session);
+      order.totalBill = amt; order.state = 'awaiting_payment'; order.billSentAt = Date.now();
+      await sendMsg(key, [`📋 *Your bill*`, ``, `💰 Total: GHS ${amt.toFixed(2)}`, ``, `🟡 MoMo: *0552719245* · Kow Habib Baisie`, `Printing starts after payment is confirmed. 🙏`].join('\n')).catch(() => {});
+      saveStateNow();
+      return res.send(actionPage('Bill sent', `…${last4} billed GHS ${amt.toFixed(2)}.`));
+    }
+    return res.send(actionPage('Unknown action', action, false));
+  } catch (e) {
+    return res.send(actionPage('Something went wrong', e.message, false));
+  }
+});
+
+// ── v80: Action Centre — one page listing every chat that needs a decision ──
+app.get('/actions', (req, res) => {
+  if ((req.query.pw || '') !== ADMIN_DASH_PW) {
+    return res.send(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:system-ui;background:#f4f4f6;display:flex;min-height:100vh;align-items:center;justify-content:center"><form style="background:#fff;padding:24px;border-radius:16px"><input name="pw" type="password" placeholder="Password" style="font-size:16px;padding:12px;border:1.5px solid #ddd;border-radius:10px"><button style="margin-left:8px;padding:12px 18px;border:0;border-radius:10px;background:#4E9E25;color:#fff;font-weight:700">Open</button></form></body>`);
+  }
+  const rows = [];
+  for (const [key, s] of sessions.entries()) {
+    const o = getActiveOrder(s) || {};
+    const awaiting = s.orders?.find(x => x.state === 'awaiting_payment');
+    const proc = s.orders?.find(x => x.state === 'processing');
+    let need = '';
+    if (s.handsoff) need = '🤫 You are handling';
+    else if (awaiting) need = `💰 Awaiting payment — GHS ${(awaiting.totalBill || 0).toFixed(2)}`;
+    else if (proc) need = '🖨 Printing';
+    if (!need) continue;
+    const l4 = last4(key); const nm = s.customerName || '';
+    const btn = (a) => `<a href="${actionLink(a, key)}" style="display:inline-block;margin:3px 4px 0 0;padding:7px 11px;border-radius:9px;background:#eef7e0;color:#3B7D17;text-decoration:none;font-size:13px;font-weight:600">${ACTION_LABELS[a].emoji} ${ACTION_LABELS[a].label}</a>`;
+    const acts = [s.handsoff ? 'handback' : 'takeover', 'message', ...(awaiting ? ['confirm'] : []), ...(proc ? ['ready'] : [])].map(btn).join('');
+    rows.push(`<div style="background:#fff;border:1px solid #ececed;border-radius:14px;padding:14px;margin-bottom:10px">
+      <div style="font-weight:700">…${l4}${nm ? ' · ' + nm : ''}</div>
+      <div style="color:#73737d;font-size:13px;margin:2px 0 6px">${need}</div>
+      <a href="${chatLink(key, nm)}" style="color:#4E9E25;font-size:13px;font-weight:600;text-decoration:none">💬 Open chat</a>
+      <div>${acts}</div></div>`);
+  }
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Migo — Action Centre</title><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
+<style>body{margin:0;font-family:'Space Grotesk',sans-serif;background:#f4f4f6;color:#17171c;padding:16px;max-width:560px;margin:0 auto}h1{font-size:20px}</style></head>
+<body><h1>🔔 Action Centre</h1>${rows.join('') || '<p style="color:#73737d">Nothing needs you right now. 🎉</p>'}</body></html>`);
 });
 
 // ── Customer order form (tap to choose sizes & copies) ────────
@@ -5066,6 +5593,18 @@ process.on('unhandledRejection', async (reason) => {
 // ── Start ──────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', version: BOT_VERSION, model: MODEL, uptime: Math.floor((Date.now()-BOT_START)/1000)+'s' }));
 const PORT = process.env.PORT || 3000;
+
+// v80: when loaded by the test harness, export internals and skip the live server.
+if (process.env.MIGO_TEST) {
+  module.exports = {
+    parseMomoSMS, momoDirection, smartMatchPayment, signAction, verifyAction,
+    actionLink, chatLink, isComplaint, isBotSilenced, humanTakeover,
+    handleMomoEvent, _processedMomoTx, processPayment,
+    receivedSms, findReceivedByTxId, handleReceipt, handleStaffCommand,
+    staffRole, workerAdmin, workers, NOT_CMD,
+    sessions, makeOrder, getSession,
+  };
+} else {
 app.listen(PORT, async () => {
   console.log(`🚀 MIGO Print Bot ${BOT_VERSION} — port ${PORT}`);
   console.log(`   WasenderAPI : ${WASENDER_KEY ? '✅ set' : 'NOT SET ❌'}`);
@@ -5106,3 +5645,4 @@ app.listen(PORT, async () => {
     `⚙️ All systems running.`,
   ].join('\n'));
 });
+}
